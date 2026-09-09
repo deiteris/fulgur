@@ -1104,6 +1104,7 @@ pub(crate) fn dispatch_fragment(
             y_pt,
             frag,
             &geom.fragments,
+            &geom.line_boundaries,
             page_index,
             is_split,
             drawables,
@@ -1163,6 +1164,7 @@ pub(crate) fn dispatch_fragment(
                 y_pt,
                 frag,
                 &geom.fragments,
+                &geom.line_boundaries,
                 page_index,
                 is_split,
                 drawables,
@@ -1225,6 +1227,7 @@ pub(crate) fn dispatch_fragment(
             x_pt,
             y_pt,
             &geom.fragments,
+            &geom.line_boundaries,
             page_index,
             is_split,
             drawables,
@@ -1931,6 +1934,7 @@ fn draw_under_clip(
                 inner_x,
                 inner_y,
                 &geom.fragments,
+                &geom.line_boundaries,
                 page_index,
                 is_split,
                 drawables,
@@ -2305,6 +2309,7 @@ fn draw_under_opacity(
                     inner_x,
                     inner_y,
                     &geom.fragments,
+                    &geom.line_boundaries,
                     page_index,
                     is_split,
                     drawables,
@@ -3161,6 +3166,7 @@ fn draw_block_with_inner_content(
     y: f32,
     frag: &crate::pagination_layout::Fragment,
     fragments: &[crate::pagination_layout::Fragment],
+    line_boundaries: &[usize],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3191,6 +3197,7 @@ fn draw_block_with_inner_content(
                 inner_x,
                 inner_y,
                 fragments,
+                line_boundaries,
                 page_index,
                 is_split,
                 drawables,
@@ -3232,6 +3239,7 @@ fn draw_list_item_with_block(
     y: f32,
     frag: &crate::pagination_layout::Fragment,
     fragments: &[crate::pagination_layout::Fragment],
+    line_boundaries: &[usize],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3273,6 +3281,7 @@ fn draw_list_item_with_block(
                 inner_x,
                 inner_y,
                 fragments,
+                line_boundaries,
                 page_index,
                 is_split,
                 drawables,
@@ -3376,6 +3385,7 @@ fn draw_paragraph_v2(
     x: f32,
     y: f32,
     fragments: &[crate::pagination_layout::Fragment],
+    line_boundaries: &[usize],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3391,6 +3401,7 @@ fn draw_paragraph_v2(
             x,
             y,
             fragments,
+            line_boundaries,
             page_index,
             is_split,
             drawables,
@@ -3413,6 +3424,7 @@ fn draw_paragraph_inner_paint(
     x: f32,
     y: f32,
     fragments: &[crate::pagination_layout::Fragment],
+    line_boundaries: &[usize],
     page_index: u32,
     is_split: bool,
     drawables: &Drawables,
@@ -3423,8 +3435,13 @@ fn draw_paragraph_inner_paint(
     if !entry.visible {
         return;
     }
-    let Some(slice) = paragraph_lines_for_page(&entry.lines, fragments, page_index, is_split)
-    else {
+    let Some(slice) = paragraph_lines_for_page(
+        &entry.lines,
+        fragments,
+        line_boundaries,
+        page_index,
+        is_split,
+    ) else {
         return;
     };
     // PR 8g: build an InlineBoxRenderCtx so `draw_shaped_lines` can
@@ -3457,6 +3474,7 @@ fn draw_paragraph_inner_paint(
 fn paragraph_lines_for_page(
     all_lines: &[crate::paragraph::ShapedLine],
     fragments: &[crate::pagination_layout::Fragment],
+    line_boundaries: &[usize],
     page_index: u32,
     is_split: bool,
 ) -> Option<Vec<crate::paragraph::ShapedLine>> {
@@ -3466,35 +3484,37 @@ fn paragraph_lines_for_page(
         return Some(all_lines.to_vec());
     }
 
-    let target_h = fragments[target_pos].height.in_pt();
-    let consumed: crate::units::Pt = fragments[..target_pos]
+    // Preferred path: the fragmenter published the partition it actually
+    // chose, so use it verbatim instead of re-deriving it from fragment
+    // heights in a different unit (see
+    // `PaginationGeometry::line_boundaries`).
+    //
+    // The guards prove both sides are talking about the same line vector:
+    // one boundary per fragment plus a terminator, and that terminator
+    // equal to the number of lines held here. Anything else falls back to
+    // the reconstruction rather than slicing with indices that mean
+    // something else.
+    let published = if line_boundaries.len() == fragments.len() + 1
+        && line_boundaries.last() == Some(&all_lines.len())
+    {
+        let start = line_boundaries[target_pos];
+        Some((start, line_boundaries[target_pos + 1].max(start)))
+    } else {
+        None
+    };
+
+    let (start_idx, end_idx) = match published {
+        Some(range) => range,
+        None => reconstruct_line_partition(all_lines, fragments, target_pos),
+    };
+
+    // Rebase by the lines actually left behind, not by the outgoing
+    // fragments' height budgets: when the two disagree the continuation is
+    // lifted off its fragment's content top by the difference.
+    let consumed: crate::units::Pt = all_lines[..start_idx.min(all_lines.len())]
         .iter()
-        .map(|f| f.height)
-        .sum::<crate::units::Px>()
-        .in_pt();
-
-    let eps = 0.01_f32.as_pt();
-    let mut line_top = crate::units::Pt::ZERO;
-    let mut start_idx = 0usize;
-    while start_idx < all_lines.len() {
-        let next_top = line_top + all_lines[start_idx].height;
-        if next_top > consumed + eps {
-            break;
-        }
-        line_top = next_top;
-        start_idx += 1;
-    }
-
-    let mut end_idx = start_idx;
-    let mut accum = crate::units::Pt::ZERO;
-    while end_idx < all_lines.len() {
-        let line_h = all_lines[end_idx].height;
-        if accum + line_h > target_h + eps {
-            break;
-        }
-        accum += line_h;
-        end_idx += 1;
-    }
+        .map(|l| l.height)
+        .sum();
 
     if end_idx <= start_idx {
         return None;
@@ -3517,6 +3537,58 @@ fn paragraph_lines_for_page(
         })
         .collect();
     Some(sliced)
+}
+
+/// Reconstruct which lines belong to fragment `target_pos` from the
+/// fragment heights alone, for producers that publish no partition (a
+/// paragraph strip-sliced whole rather than split at line boundaries).
+///
+/// Best-effort, not a source of truth: it measures lines in a different
+/// unit than the fragmenter did, so it can under-count. The last fragment
+/// therefore absorbs every remaining line — css-break-3 §4.4, "the UA may
+/// break anywhere in order to avoid losing content off the edge of the
+/// fragmentainer": overflowing a fragment is a layout blemish, while
+/// dropping the tail is content loss with no later fragment to recover it
+/// from.
+fn reconstruct_line_partition(
+    all_lines: &[crate::paragraph::ShapedLine],
+    fragments: &[crate::pagination_layout::Fragment],
+    target_pos: usize,
+) -> (usize, usize) {
+    let target_h = fragments[target_pos].height.in_pt();
+    let consumed: crate::units::Pt = fragments[..target_pos]
+        .iter()
+        .map(|f| f.height)
+        .sum::<crate::units::Px>()
+        .in_pt();
+
+    let eps = 0.01_f32.as_pt();
+    let mut line_top = crate::units::Pt::ZERO;
+    let mut start_idx = 0usize;
+    while start_idx < all_lines.len() {
+        let next_top = line_top + all_lines[start_idx].height;
+        if next_top > consumed + eps {
+            break;
+        }
+        line_top = next_top;
+        start_idx += 1;
+    }
+
+    if target_pos == fragments.len() - 1 {
+        return (start_idx, all_lines.len());
+    }
+
+    let mut end_idx = start_idx;
+    let mut accum = crate::units::Pt::ZERO;
+    while end_idx < all_lines.len() {
+        let line_h = all_lines[end_idx].height;
+        if accum + line_h > target_h + eps {
+            break;
+        }
+        accum += line_h;
+        end_idx += 1;
+    }
+    (start_idx, end_idx)
 }
 
 /// Build krilla Metadata from Config.
@@ -5006,7 +5078,7 @@ mod tests {
         let lines = vec![make_line(16.0, 12.0)];
         let fragments = vec![make_fragment(0, 16.0)];
         // Ask for page 1, which has no fragment.
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, false);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, false);
         assert!(result.is_none());
     }
 
@@ -5020,7 +5092,7 @@ mod tests {
             make_line(16.0, 44.0),
         ];
         let fragments = vec![make_fragment(0, 64.0)];
-        let result = paragraph_lines_for_page(&lines, &fragments, 0, false);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 0, false);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 3);
@@ -5040,7 +5112,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px = 12pt → first line
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 0, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 0, true);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "page 0 should contain exactly one line");
@@ -5059,7 +5131,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px = 12pt → first line
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, true);
         assert!(result.is_some());
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "page 1 should contain exactly one line");
@@ -5077,7 +5149,7 @@ mod tests {
             make_fragment(0, 100.0), // page 0 gets the line
             make_fragment(1, 0.0),   // page 1 has zero height
         ];
-        let result = paragraph_lines_for_page(&lines, &fragments, 1, true);
+        let result = paragraph_lines_for_page(&lines, &fragments, &[], 1, true);
         assert!(result.is_none());
     }
 
@@ -5292,6 +5364,7 @@ mod tests {
         let geom = crate::pagination_layout::PaginationGeometry {
             fragments: vec![frag.clone()],
             is_repeat: false,
+            line_boundaries: Vec::new(),
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 120.0).abs() < 0.001, "width from layout_size");
@@ -5312,6 +5385,7 @@ mod tests {
         let geom = crate::pagination_layout::PaginationGeometry {
             fragments: vec![frag.clone(), continuation],
             is_repeat: false,
+            line_boundaries: Vec::new(),
         };
         let (_, h) = table_box_size(&entry, &geom, &frag);
         assert!((h - 30.0).abs() < 0.01, "height = frag.height.in_pt()");
@@ -5325,6 +5399,7 @@ mod tests {
         let geom = crate::pagination_layout::PaginationGeometry {
             fragments: vec![frag.clone()],
             is_repeat: false,
+            line_boundaries: Vec::new(),
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
@@ -5348,6 +5423,7 @@ mod tests {
         let geom = crate::pagination_layout::PaginationGeometry {
             fragments: vec![frag.clone(), continuation],
             is_repeat: false,
+            line_boundaries: Vec::new(),
         };
         let (_, h) = table_box_size(&entry, &geom, &frag);
         assert!(
@@ -5365,6 +5441,7 @@ mod tests {
         let geom = crate::pagination_layout::PaginationGeometry {
             fragments: vec![frag.clone()],
             is_repeat: false,
+            line_boundaries: Vec::new(),
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
@@ -5681,7 +5758,7 @@ mod tests {
             make_fragment(0, 16.0), // 16px → 12pt
             make_fragment(1, 16.0),
         ];
-        let result = paragraph_lines_for_page(&[line0, line1], &fragments, 1, true);
+        let result = paragraph_lines_for_page(&[line0, line1], &fragments, &[], 1, true);
         assert!(result.is_some(), "page 1 should yield Some");
         let sliced = result.unwrap();
         assert_eq!(sliced.len(), 1, "one line on page 1");
