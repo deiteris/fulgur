@@ -768,6 +768,13 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.page_height_px,
                     &line_metrics,
                 );
+                record_inline_root_descendants(
+                    &mut self.geometry,
+                    self.doc,
+                    child_id,
+                    &line_metrics,
+                    frag_count,
+                );
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
                 emitted += frag_count;
@@ -1348,6 +1355,14 @@ fn record_subtree_descendants(
 /// cursor on the current page. `page_h_px` lets the simulator detect
 /// grandchildren taller than a full page (which would themselves
 /// recurse and therefore split, regardless of `available_h`).
+///
+/// An inline root (a paragraph whose children are text runs and atomic
+/// inlines such as `<img>`) never splits here: its inline children are not
+/// break points. Their boxes sit inside line boxes, so a line holding an
+/// image that overflows the strip would otherwise be cut at the image and
+/// leave the line on the current page, past its edge. Line boundaries are the
+/// only break points of an inline root, handled by `fragment_inline_root`;
+/// a single line that does not fit moves whole to the next page.
 fn would_split_block_subtree(
     doc: &BaseDocument,
     parent_id: usize,
@@ -1361,6 +1376,12 @@ fn would_split_block_subtree(
     let Some(parent) = doc.get_node(parent_id) else {
         return false;
     };
+    if parent
+        .element_data()
+        .is_some_and(|e| e.inline_layout_data.is_some())
+    {
+        return false;
+    }
     let mut cursor: f32 = 0.0;
     let mut prev_bottom: f32 = 0.0;
     // fulgur-yb27: walk `layout_children` so anonymous block wrappers
@@ -2841,7 +2862,7 @@ fn fragment_block_subtree_inner(
             // previous sibling's row bottom while `child_page_y` is
             // this cell's row-local start (fulgur-u0p0, mirrored from
             // the recursion branch below).
-            let (new_page_index, new_cursor_y, _emitted) = fragment_inline_root(
+            let (new_page_index, new_cursor_y, split_frag_count) = fragment_inline_root(
                 geometry,
                 child_id,
                 child_x_in_body,
@@ -2850,6 +2871,13 @@ fn fragment_block_subtree_inner(
                 page_index,
                 page_height_px,
                 &line_metrics,
+            );
+            record_inline_root_descendants(
+                geometry,
+                doc,
+                child_id,
+                &line_metrics,
+                split_frag_count,
             );
             // Same shape as the recursion branch's fulgur-oc51 fix
             // below: without a parent fragment per page the split
@@ -3540,6 +3568,124 @@ fn fragment_inline_root(
 
     let cursor_y = paragraph_top_in_body + frag_h;
     (page_index, cursor_y, emitted)
+}
+
+/// Record geometry for the atomic inlines (`<img>`, `inline-block`) and
+/// inline elements under a multi-line inline root, after
+/// [`fragment_inline_root`] split it into `frag_count` fragments.
+///
+/// A single-line inline root takes the whole-block path, whose
+/// [`record_subtree_descendants`] gives every descendant a fragment. The
+/// line-aware path emitted fragments for the root only, so an `<img>` inside
+/// a paragraph of several lines had no geometry and the renderer skipped it.
+/// Each descendant lands on the fragment whose lines hold its vertical
+/// centre, at its offset from that fragment's first line.
+fn record_inline_root_descendants(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    root_id: usize,
+    line_metrics: &[(f32, f32)],
+    frag_count: usize,
+) {
+    let Some(root_frags) = geometry.get(&root_id).map(|g| {
+        let from = g.fragments.len().saturating_sub(frag_count);
+        g.fragments[from..].to_vec()
+    }) else {
+        return;
+    };
+    // Paragraph-local `(top, bottom)` of the lines each fragment holds.
+    let mut spans: Vec<(f32, f32)> = Vec::with_capacity(root_frags.len());
+    let mut next_line = 0usize;
+    for frag in &root_frags {
+        let Some(&(top, _)) = line_metrics.get(next_line) else {
+            break;
+        };
+        let bottom = top + frag.height.to_f32();
+        spans.push((top, bottom));
+        next_line += line_metrics[next_line..]
+            .iter()
+            .take_while(|l| l.0 < bottom - 0.01)
+            .count()
+            .max(1);
+    }
+    if spans.is_empty() {
+        return;
+    }
+    walk_inline_root_descendants(geometry, doc, root_id, 0.0, 0.0, &root_frags, &spans, 0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_inline_root_descendants(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    parent_id: usize,
+    parent_local_x: f32,
+    parent_local_y: f32,
+    root_frags: &[Fragment],
+    spans: &[(f32, f32)],
+    depth: usize,
+) {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(parent) = doc.get_node(parent_id) else {
+        return;
+    };
+    let layout_children_borrow = parent.layout_children.borrow();
+    let walk_children: &[usize] = layout_children_borrow
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&parent.children);
+    for &child_id in walk_children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        let layout = child.final_layout;
+        let (w, h) = (layout.size.width, layout.size.height);
+        let local_x = parent_local_x + layout.location.x;
+        let local_y = parent_local_y + layout.location.y;
+        if h <= 0.0 && w <= 0.0 {
+            walk_inline_root_descendants(
+                geometry,
+                doc,
+                child_id,
+                local_x,
+                local_y,
+                root_frags,
+                spans,
+                depth + 1,
+            );
+            continue;
+        }
+        let centre = local_y + h / 2.0;
+        let k = spans
+            .iter()
+            .position(|&(_, bottom)| centre < bottom)
+            .unwrap_or(spans.len() - 1);
+        let frag = &root_frags[k];
+        let page_x = frag.x.to_f32() + local_x;
+        let page_y = frag.y.to_f32() + (local_y - spans[k].0);
+        geometry
+            .entry(child_id)
+            .or_default()
+            .fragments
+            .push(Fragment {
+                page_index: frag.page_index,
+                x: page_x.as_px(),
+                y: page_y.as_px(),
+                width: w.as_px(),
+                height: h.as_px(),
+            });
+        record_subtree_descendants(
+            geometry,
+            doc,
+            child_id,
+            frag.page_index,
+            page_y,
+            page_x,
+            depth + 1,
+        );
+    }
 }
 
 /// Per-page state for a named string emitted by `string-set:`.
@@ -5178,6 +5324,56 @@ mod tests {
             );
             assert_eq!(geom.fragments[0].page_index, 0);
         }
+    }
+
+    /// A one-line paragraph whose line box holds an `<img>` and does not fit
+    /// the rest of the page moves whole to the next page, like a text line.
+    #[test]
+    fn line_box_with_an_inline_image_that_does_not_fit_moves_to_the_next_page() {
+        let html = r#"
+            <html><body style="margin:0">
+              <div style="height: 770px"></div>
+              <p id="img" style="margin:0">S: <img width="100" height="50"> end</p>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let table = run_pass(&mut doc, 800.0);
+        let id = find_by_id(&doc, "img").expect("paragraph");
+        let frags = &table[&id].fragments;
+        assert_eq!(frags.len(), 1, "{frags:?}");
+        assert_eq!(frags[0].page_index, 1, "{frags:?}");
+        assert!(
+            frags[0].y.to_f32().abs() < 0.5,
+            "starts at the page top: {frags:?}"
+        );
+    }
+
+    /// An `<img>` in a paragraph of several lines has geometry on the page
+    /// and at the offset of the line that holds it, also when the paragraph
+    /// splits across pages.
+    #[test]
+    fn inline_image_in_a_split_paragraph_follows_its_line() {
+        let html = r#"
+            <html><body style="margin:0;font-size:20px;line-height:20px">
+              <p id="p" style="margin:0;width:100px">aa bb cc dd ee ff gg hh ii jj kk ll mm <img id="im" width="10" height="20"> nn oo pp qq</p>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let table = run_pass(&mut doc, 60.0);
+        let p = &table[&find_by_id(&doc, "p").expect("paragraph")].fragments;
+        let im = &table[&find_by_id(&doc, "im").expect("image")].fragments;
+        assert_eq!(p.len(), 2, "the paragraph splits: {p:?}");
+        assert_eq!(im.len(), 1, "{im:?}");
+        let frag = p
+            .iter()
+            .find(|f| f.page_index == im[0].page_index)
+            .expect("the image is on a page the paragraph occupies");
+        let (top, bottom) = (frag.y.to_f32(), (frag.y + frag.height).to_f32());
+        let y = im[0].y.to_f32();
+        assert!(
+            y >= top - 0.5 && y + 20.0 <= bottom + 0.5,
+            "image y {y} lies inside its fragment {top}..{bottom}"
+        );
     }
 
     #[test]
