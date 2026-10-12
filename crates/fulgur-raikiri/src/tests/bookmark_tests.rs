@@ -304,3 +304,61 @@ fn bookmark_bundle_defaults_yield_to_author_style() {
     assert_eq!(children.len(), 1);
     assert_eq!(title(children[0]), "Bundle");
 }
+
+// A heading moved by a transform is bookmarked where it is drawn.
+#[test]
+fn bookmark_follows_a_transformed_heading() {
+    let (_dir, path) = input(&format!(
+        "{BOOK_CSS}<h1 style='transform:translate(10px,20px)'>A</h1>"
+    ));
+    let bytes = render(&path, &Config::builder().bookmarks(true).build()).unwrap();
+    let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+    let items = outline_children(&pdf, outline_root(&pdf));
+    let dest = outline_destination(&pdf, items[0]);
+    assert_eq!(dest[2].as_float().unwrap(), 7.5);
+    assert_eq!(dest[3].as_float().unwrap(), 135.0);
+}
+
+#[test]
+fn bookmark_open_state_keeps_cross_reference_offsets_valid() {
+    let (_dir, path) = input(&format!(
+        "{BOOK_CSS}<h1>A</h1><h2>A1</h2><h3>A1a</h3><h2>A2</h2>\
+         <h1 style='break-before:page'>B</h1><h2>B1</h2><p>text</p>"
+    ));
+    let bytes = render(&path, &Config::builder().bookmarks(true).build()).unwrap();
+
+    let tail = &bytes[bytes.len() - 64..];
+    let keyword = tail.windows(9).rposition(|w| w == b"startxref").unwrap();
+    let table: usize = std::str::from_utf8(&tail[keyword + 9..])
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(bytes[table..].starts_with(b"xref"));
+
+    let document = flpdf::Pdf::open(std::io::Cursor::new(bytes.clone())).unwrap();
+    assert!(document.repair_diagnostics().is_empty());
+    let mut checked = 0;
+    for (id, entry) in document.get_xref_table() {
+        if let flpdf::XrefEntry::Uncompressed { offset } = entry {
+            let header = format!("{} {} obj", id.number, id.generation);
+            assert!(
+                bytes[offset as usize..].starts_with(header.as_bytes()),
+                "{header} is not at {offset}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 10);
+
+    let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+    let root = outline_root(&pdf);
+    assert_eq!(count(root), Some(6));
+    let items = outline_children(&pdf, root);
+    assert_eq!(
+        items.iter().map(|item| count(item)).collect::<Vec<_>>(),
+        [Some(3), Some(1)]
+    );
+}

@@ -229,7 +229,8 @@ impl<'a> PdfSink<'a, '_> {
             extra_pages.push(index as u32);
         }
         let pdf = painter.finish(self.lang)?;
-        // Before the merge, whose object streams this rewrite would drop.
+        // Before the merge, which writes object streams and a cross-reference
+        // stream that this in-place rewrite does not handle.
         let pdf = bookmarks::apply_open_state(pdf, &open)?;
         if extra_pages.is_empty() {
             return Ok(pdf);

@@ -13,6 +13,8 @@ use raikiri_traits::{
 };
 use std::collections::HashMap;
 
+mod raw;
+
 #[derive(Default)]
 struct Heading {
     source_order: u32,
@@ -139,9 +141,18 @@ impl OutlineBuilder {
             {
                 continue;
             }
+            // The heading is where the painter draws it, after relative
+            // offsets and transforms.
+            let Some(point) = page
+                .paint_transform(node)
+                .map(|transform| transform.apply((rect.x, rect.y)))
+                .filter(|point| point.0.is_finite() && point.1.is_finite())
+            else {
+                continue;
+            };
             let position = XyzDestination::new(
                 page.index() as usize,
-                Point::from_xy(rect.x * PX_TO_PT, rect.y * PX_TO_PT),
+                Point::from_xy(point.0 * PX_TO_PT, point.1 * PX_TO_PT),
             );
             self.positions
                 .entry(node)
@@ -228,61 +239,78 @@ impl OutlineBuilder {
 /// of visible descendants and a closed entry's as the negated number that
 /// would be visible if it were opened; the outline root counts every visible
 /// entry. A document with no open parent entry is returned unchanged.
+///
+/// Only the outline dictionaries are read, through the cross-reference
+/// table, and the counts are patched in place (see [`raw`]); the rest of
+/// the document is neither parsed nor copied.
 pub(super) fn apply_open_state(pdf: Vec<u8>, open: &[bool]) -> Result<Vec<u8>> {
     if !open.contains(&true) {
         return Ok(pdf);
     }
-    let error = |error: lopdf::Error| Error::PdfGeneration(format!("outline state: {error}"));
-    let mut document = lopdf::Document::load_mem(&pdf).map_err(error)?;
-    let root = document
-        .catalog()
-        .and_then(|catalog| catalog.get(b"Outlines"))
-        .and_then(lopdf::Object::as_reference)
-        .map_err(error)?;
-    let mut states = open.iter().copied();
-    let mut counts = Vec::new();
-    let visible = visible_descendants(&document, root, &mut states, &mut counts).map_err(error)?;
-    let changed = counts.iter().any(|(_, count)| *count > 0);
-    if !changed {
+    let malformed = || Error::PdfGeneration("outline state: unexpected PDF structure".into());
+    let (layout, edits) = {
+        let raw = raw::RawPdf::new(&pdf).ok_or_else(malformed)?;
+        let catalog = raw.dictionary(raw.root).ok_or_else(malformed)?;
+        let Some(raw::Value::Reference(root)) = raw::get(&catalog, b"Outlines") else {
+            return Err(malformed());
+        };
+        let root = *root;
+        let mut states = open.iter().copied();
+        let mut counts = Vec::new();
+        let visible =
+            visible_descendants(&raw, root, &mut states, &mut counts).ok_or_else(malformed)?;
+        counts.push((root, visible));
+        let mut edits = Vec::new();
+        for (number, count) in counts {
+            let dictionary = raw.dictionary(number).ok_or_else(malformed)?;
+            let Some(entry) = raw::entry(&dictionary, b"Count") else {
+                return Err(malformed());
+            };
+            if entry.value != raw::Value::Integer(count) {
+                edits.push((entry.span.clone(), format!("/Count {count}").into_bytes()));
+            }
+        }
+        (raw.layout(), edits)
+    };
+    if edits.is_empty() {
         return Ok(pdf);
     }
-    counts.push((root, visible));
-    for (id, count) in counts {
-        document
-            .get_dictionary_mut(id)
-            .map_err(error)?
-            .set("Count", count);
-    }
-    let mut bytes = Vec::with_capacity(pdf.len());
-    document.save_to(&mut bytes).map_err(Error::Io)?;
-    Ok(bytes)
+    raw::patch(pdf, layout, edits).ok_or_else(malformed)
 }
 
 /// Count the entries below `parent` that are visible when it is open, and
 /// record the `/Count` of every child that has children of its own.
+///
+/// Running out of `states` means the outline is not the one that was
+/// written, which also bounds the walk.
 fn visible_descendants(
-    document: &lopdf::Document,
-    parent: lopdf::ObjectId,
+    pdf: &raw::RawPdf<'_>,
+    parent: u32,
     states: &mut impl Iterator<Item = bool>,
-    counts: &mut Vec<(lopdf::ObjectId, i64)>,
-) -> lopdf::Result<i64> {
+    counts: &mut Vec<(u32, i64)>,
+) -> Option<i64> {
     let mut visible = 0;
-    let mut next = document.get_dictionary(parent)?.get(b"First").ok().cloned();
+    let mut next = match raw::get(&pdf.dictionary(parent)?, b"First") {
+        Some(raw::Value::Reference(first)) => Some(*first),
+        _ => None,
+    };
     while let Some(child) = next {
-        let child = child.as_reference()?;
-        let open = states.next().unwrap_or(false);
-        let entry = document.get_dictionary(child)?;
-        let below = if entry.has(b"First") {
-            let below = visible_descendants(document, child, states, counts)?;
+        let open = states.next()?;
+        let entry = pdf.dictionary(child)?;
+        let below = if raw::get(&entry, b"First").is_some() {
+            let below = visible_descendants(pdf, child, states, counts)?;
             counts.push((child, if open { below } else { -below }));
             below
         } else {
             0
         };
         visible += 1 + if open { below } else { 0 };
-        next = document.get_dictionary(child)?.get(b"Next").ok().cloned();
+        next = match raw::get(&entry, b"Next") {
+            Some(raw::Value::Reference(next)) => Some(*next),
+            _ => None,
+        };
     }
-    Ok(visible)
+    Some(visible)
 }
 
 fn visible(page: &Page<'_>, node: NodeId) -> bool {

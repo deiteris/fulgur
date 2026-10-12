@@ -167,7 +167,63 @@ fn streamed_bookmarks_match_the_batch_outline() {
     });
     let config = Config::builder().bookmarks(true).build();
     let (batch, streamed) = both(&html, &config);
-    assert_eq!(batch, streamed);
+    let batch = lopdf::Document::load_mem(&batch).unwrap();
+    let streamed = lopdf::Document::load_mem(&streamed).unwrap();
+    assert_eq!(batch.get_pages().len(), streamed.get_pages().len());
+    let batch = outline_entries(&batch);
+    let streamed = outline_entries(&streamed);
+    assert_eq!(batch.len(), 5);
+    assert_eq!(batch.len(), streamed.len());
+    // A layout that resumes after delivered pages computes the same
+    // positions in another order, so they can differ in the last bits.
+    for (batch, streamed) in batch.iter().zip(&streamed) {
+        assert_eq!(
+            (batch.0, &batch.1, batch.2),
+            (streamed.0, &streamed.1, streamed.2)
+        );
+        assert!(
+            (batch.3.0 - streamed.3.0).abs() < 1e-3 && (batch.3.1 - streamed.3.1).abs() < 1e-3,
+            "{batch:?} != {streamed:?}"
+        );
+    }
+}
+
+/// The outline entries in order: depth, title, page number and position.
+fn outline_entries(pdf: &lopdf::Document) -> Vec<(usize, String, u32, (f32, f32))> {
+    let pages: std::collections::HashMap<_, _> = pdf
+        .get_pages()
+        .into_iter()
+        .map(|(number, id)| (id, number))
+        .collect();
+    let root = pdf
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let mut entries = Vec::new();
+    let mut stack = vec![(0, pdf.get_dictionary(root).unwrap().get(b"First").ok())];
+    while let Some((depth, next)) = stack.pop() {
+        let Some(id) = next else {
+            continue;
+        };
+        let item = pdf.get_dictionary(id.as_reference().unwrap()).unwrap();
+        let dest = pdf
+            .get_object(item.get(b"Dest").unwrap().as_reference().unwrap())
+            .unwrap()
+            .as_array()
+            .unwrap();
+        entries.push((
+            depth,
+            lopdf::decode_text_string(item.get(b"Title").unwrap()).unwrap(),
+            pages[&dest[0].as_reference().unwrap()],
+            (dest[2].as_float().unwrap(), dest[3].as_float().unwrap()),
+        ));
+        stack.push((depth, item.get(b"Next").ok()));
+        stack.push((depth + 1, item.get(b"First").ok()));
+    }
+    entries
 }
 
 #[test]

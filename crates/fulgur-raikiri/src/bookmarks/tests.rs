@@ -82,3 +82,47 @@ fn missing_resolved_label_omits_outline_without_losing_text() {
         ["Title"]
     );
 }
+
+#[test]
+fn open_state_rejects_unexpected_pdf_structure() {
+    let pdf = |objects: &[&str]| raw::tests::pdf_with(objects, "/Root 1 0 R");
+    let outline = [
+        "<</Type/Catalog/Outlines 2 0 R>>",
+        "<</First 3 0 R/Last 3 0 R/Count 1>>",
+        "<</Title(x)/Parent 2 0 R/First 4 0 R/Last 4 0 R/Count -1>>",
+        "<</Title(y)/Parent 3 0 R>>",
+    ];
+    // Opening the parent rewrites both counts.
+    let patched = apply_open_state(pdf(&outline), &[true, false]).unwrap();
+    let raw = raw::RawPdf::new(&patched).unwrap();
+    assert_eq!(
+        raw::get(&raw.dictionary(2).unwrap(), b"Count"),
+        Some(&raw::Value::Integer(2))
+    );
+    assert_eq!(
+        raw::get(&raw.dictionary(3).unwrap(), b"Count"),
+        Some(&raw::Value::Integer(1))
+    );
+    // Counts already right leave the bytes alone.
+    assert_eq!(
+        apply_open_state(patched.clone(), &[true, false]).unwrap(),
+        patched
+    );
+
+    let mut no_outline = outline;
+    no_outline[0] = "<</Type/Catalog>>";
+    let mut no_count = outline;
+    no_count[2] = "<</Title(x)/Parent 2 0 R/First 4 0 R/Last 4 0 R>>";
+    let mut dangling = outline;
+    dangling[3] = "<</Title(y)/Parent 3 0 R/Next 9 0 R>>";
+    for (bytes, open) in [
+        (b"not a pdf".to_vec(), &[true, false][..]),
+        (pdf(&no_outline), &[true, false]),
+        (pdf(&no_count), &[true, false]),
+        (pdf(&dangling), &[true, false, true]),
+        // Fewer states than entries: not the outline that was written.
+        (pdf(&outline), &[true]),
+    ] {
+        assert!(apply_open_state(bytes, open).is_err());
+    }
+}

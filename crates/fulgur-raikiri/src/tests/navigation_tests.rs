@@ -293,3 +293,65 @@ fn links_of_running_elements_to_missing_anchors_are_dropped() {
     let pdf = lopdf::Document::load_mem(&bytes).unwrap();
     assert!(annotations(&pdf, 1).is_empty());
 }
+
+// spec: https://www.w3.org/TR/css-transforms-1/#transform-rendering
+// Link areas and destinations follow the transform that moves the painted
+// boxes.
+#[test]
+fn navigation_follows_transforms() {
+    let (_dir, path) = input(&format!(
+        "{NAV_CSS}<style>a, #target {{transform:translate(10px,20px)}}</style>\
+         <div id=target></div><a href='https://example.com/'></a><a href='#target'></a>"
+    ));
+    let bytes = render(&path, &Config::default()).unwrap();
+    let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+    let links = annotations(&pdf, 1);
+    assert_eq!(links.len(), 2);
+    for link in &links {
+        let rect = link.get(b"Rect").unwrap().as_array().unwrap();
+        let values: [f32; 4] = std::array::from_fn(|i| rect[i].as_float().unwrap());
+        assert_eq!(values, [22.5, 97.5, 52.5, 105.0]);
+    }
+    let internal = links
+        .iter()
+        .find(|a| {
+            a.get(b"A")
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"S")
+                .unwrap()
+                .as_name()
+                .unwrap()
+                == b"GoTo"
+        })
+        .unwrap();
+    let dest = destination(&pdf, internal);
+    assert_eq!(dest[2].as_float().unwrap(), 22.5);
+    assert_eq!(dest[3].as_float().unwrap(), 105.0);
+}
+
+// A rotation off the page axes gives the link a quadrilateral area.
+#[test]
+fn navigation_rotated_link_uses_quad_points() {
+    let (_dir, path) = input(&format!(
+        "{NAV_CSS}<style>a {{transform:rotate(45deg)}}</style><a href='https://example.com/'></a>"
+    ));
+    let bytes = render(&path, &Config::default()).unwrap();
+    let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+    let links = annotations(&pdf, 1);
+    assert_eq!(links.len(), 1);
+    let points: Vec<f32> = links[0]
+        .get(b"QuadPoints")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|point| point.as_float().unwrap())
+        .collect();
+    assert_eq!(points.len(), 8);
+    let mut xs: Vec<i32> = points.iter().step_by(2).map(|x| x.round() as i32).collect();
+    xs.sort();
+    xs.dedup();
+    assert!(xs.len() > 2, "rotated corners: {points:?}");
+}

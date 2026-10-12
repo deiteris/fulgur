@@ -3173,7 +3173,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "raikiri-dom"
 version = "0.1.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "bitflags 2.11.0",
  "raikiri-style",
@@ -3191,7 +3191,7 @@ dependencies = [
 [[package]]
 name = "raikiri-html"
 version = "0.1.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "cssparser 0.37.0",
  "data-url",
@@ -3212,7 +3212,7 @@ dependencies = [
 [[package]]
 name = "raikiri-net"
 version = "0.1.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "data-url",
  "image",
@@ -3224,19 +3224,20 @@ dependencies = [
 [[package]]
 name = "raikiri-style"
 version = "0.1.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "cssparser 0.37.0",
  "precomputed-hash",
  "rustc-hash",
  "selectors 0.40.0",
  "smol_str 0.3.6",
+ "triomphe",
 ]
 
 [[package]]
 name = "raikiri-svg"
 version = "0.1.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "cssparser 0.37.0",
  "raikiri-traits",
@@ -3250,7 +3251,7 @@ dependencies = [
 [[package]]
 name = "raikiri-traits"
 version = "0.2.0"
-source = "git+https://github.com/fulgur-rs/raikiri?rev=26568f873eedf42fdf9701fbc625ab1f20af8e08#26568f873eedf42fdf9701fbc625ab1f20af8e08"
+source = "git+https://github.com/fulgur-rs/raikiri?rev=cf15746c3b9033fc3628ba7423ad06ce5fe94a91#cf15746c3b9033fc3628ba7423ad06ce5fe94a91"
 dependencies = [
  "bytes",
  "libc",
@@ -4728,6 +4729,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "triomphe"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
+dependencies = [
+ "serde",
+ "stable_deref_trait",
 ]
 
 [[package]]
