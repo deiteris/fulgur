@@ -85,3 +85,38 @@ fn test_img_no_assets_no_error() {
     let pdf = engine.render(html).unwrap();
     assert!(pdf.starts_with(b"%PDF"));
 }
+
+#[test]
+fn test_inline_img_wider_than_its_line_is_painted() {
+    // A4 with a 72pt margin leaves a 451pt column; 700px is 525pt. An atomic
+    // inline wider than its line overflows the line (as in a browser) and
+    // is still painted.
+    let engine = build_engine_with_image("wide.png");
+    let html = r#"<html><body><p><img src="wide.png" width="700" height="350"></p></body></html>"#;
+    let pdf = engine.render(html).unwrap();
+
+    let pdf_no_img = build_engine_no_assets().render(html).unwrap();
+    assert!(
+        pdf.len() > pdf_no_img.len(),
+        "PDF with the wide inline image ({} bytes) should be larger than without ({} bytes)",
+        pdf.len(),
+        pdf_no_img.len()
+    );
+}
+
+#[test]
+fn test_inline_img_in_a_wrapped_paragraph_is_painted() {
+    // The paragraph wraps to two lines (the 450pt image does not fit beside
+    // the text); the image still needs a place on the page.
+    let engine = build_engine_with_image("shot.png");
+    let html = r#"<html><body><p>Step one: <img src="shot.png" width="600" height="300"> then continue</p></body></html>"#;
+    let pdf = engine.render(html).unwrap();
+
+    let pdf_no_img = build_engine_no_assets().render(html).unwrap();
+    assert!(
+        pdf.len() > pdf_no_img.len(),
+        "PDF with the wrapped inline image ({} bytes) should be larger than without ({} bytes)",
+        pdf.len(),
+        pdf_no_img.len()
+    );
+}
