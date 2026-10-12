@@ -29,11 +29,13 @@ fn legacy_pages_keep_inline_svg_root_opacity() {
     paint_legacy(
         &mut surface,
         &page,
+        &page.paint_order(),
         &page.text_runs(),
         &mut fonts,
         &mut svg,
         &mut raster,
         &mut crate::tagging::Tags::disabled(),
+        None,
     )
     .unwrap();
     surface.finish();
@@ -74,11 +76,13 @@ fn legacy_pages_keep_inline_svg_vectors() {
     paint_legacy(
         &mut surface,
         &page,
+        &page.paint_order(),
         &page.text_runs(),
         &mut fonts,
         &mut svg,
         &mut raster,
         &mut crate::tagging::Tags::disabled(),
+        None,
     )
     .unwrap();
     surface.finish();
@@ -157,6 +161,7 @@ fn producer_fragmentainer_clip_is_applied_before_its_opacity_group() {
         &mut svg::SvgCache::new(crate::RenderOptions::default()),
         &mut raster::RasterCache::for_tests(resources.image_pixel_source_ref()),
         &mut crate::tagging::Tags::disabled(),
+        None,
     )
     .unwrap();
     surface.finish();
@@ -234,4 +239,83 @@ fn producer_fragmentainer_clip_is_applied_before_its_opacity_group() {
             .filter(|operation| operation.operator == "Q")
             .count()
     );
+}
+
+#[test]
+fn legacy_pages_skip_the_background_given_to_the_canvas() {
+    let resources = RenderResources::new();
+    let document = raikiri_html::parse_html_with_resources(
+        &b"<style>@page{size:100px 100px;margin:0}body{margin:0;height:50px;background:rgb(0,128,0)}</style>"[..],
+        &resources,
+    )
+    .unwrap();
+    let LayoutStatus::Completed(layout) = raikiri_html::layout(
+        &document,
+        PageDefaults::default(),
+        LayoutConfig::default(),
+        LayoutOptions::new(),
+    )
+    .unwrap() else {
+        panic!("expected completed layout")
+    };
+    let page = layout.page(0).unwrap();
+    let owner = canvas::owner(&page).map(|(owner, _)| owner);
+    assert!(owner.is_some());
+    // The body paints its own box only when it did not give its background
+    // to the canvas.
+    let fill_count = |canvas_owner: Option<NodeId>| {
+        let mut pdf = krilla::Document::new();
+        let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
+        let mut surface = pdf_page.surface();
+        let mut fonts = FontCache::default();
+        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut raster = raster::RasterCache::for_tests(resources.image_pixel_source_ref());
+        paint_legacy(
+            &mut surface,
+            &page,
+            &page.paint_order(),
+            &page.text_runs(),
+            &mut fonts,
+            &mut svg,
+            &mut raster,
+            &mut crate::tagging::Tags::disabled(),
+            canvas_owner,
+        )
+        .unwrap();
+        surface.finish();
+        pdf_page.finish();
+        let parsed = lopdf::Document::load_mem(&pdf.finish().unwrap()).unwrap();
+        let id = *parsed.get_pages().get(&1).unwrap();
+        lopdf::content::Content::decode(&parsed.get_page_content(id).unwrap())
+            .unwrap()
+            .operations
+            .iter()
+            .filter(|op| op.operator == "f")
+            .count()
+    };
+    assert_eq!(fill_count(None), 1);
+    assert_eq!(fill_count(owner), 0);
+}
+
+#[test]
+fn a_root_without_a_box_gives_no_canvas() {
+    // CSS Backgrounds 3 §2.11: a `display: none` root leaves the canvas
+    // transparent, and its body does not take over.
+    let resources = RenderResources::new();
+    let document = raikiri_html::parse_html_with_resources(
+        &b"<html style='display:none'><body style='background:rgb(0,128,0)'>x</body></html>"[..],
+        &resources,
+    )
+    .unwrap();
+    let LayoutStatus::Completed(layout) = raikiri_html::layout(
+        &document,
+        PageDefaults::default(),
+        LayoutConfig::default(),
+        LayoutOptions::new(),
+    )
+    .unwrap() else {
+        panic!("expected completed layout")
+    };
+    let page = layout.page(0).expect("a page");
+    assert!(canvas::owner(&page).is_none());
 }

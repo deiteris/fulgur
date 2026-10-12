@@ -130,6 +130,7 @@ fn paint_box(
             svg,
             raster,
             &mut Tags::disabled(),
+            None,
         );
         surface.pop();
         surface.pop();

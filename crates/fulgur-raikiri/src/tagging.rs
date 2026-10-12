@@ -18,8 +18,8 @@ use krilla::tagging::{
 };
 use raikiri_html::computed::{ComputedDisplay, ComputedListStyleType, ComputedVisibility};
 use raikiri_html::{
-    DocumentLayout, DomView, GeneratedKind, NodeId, NodeKind, Page, PageMarginBoxSlot,
-    PositionedGlyphRun, RunSource,
+    DocumentLayout, DomView, GeneratedImageId, GeneratedKind, NodeId, NodeKind, Page,
+    PageMarginBoxSlot, PositionedGlyphRun, RunSource,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -35,6 +35,8 @@ pub(crate) enum Target<'r, 'a> {
     Replaced(NodeId),
     /// The image marker of a list item.
     MarkerImage(NodeId),
+    /// An image of `::before` or `::after` content.
+    GeneratedImage(GeneratedImageId),
     /// Drawing that is not part of the document's content.
     Artifact(ArtifactType),
 }
@@ -362,6 +364,10 @@ impl Structure {
         for child in dom.children(node) {
             self.walk(page, dom, child, child_parent, depth + 1, counter);
         }
+        // The last position belongs to the node alone: `::after` content
+        // is keyed there, after every descendant, whatever order the
+        // painter draws them in.
+        *counter += 1;
         self.order.insert(node, (order, *counter - 1));
     }
 
@@ -576,23 +582,7 @@ impl Tagger {
             Target::Artifact(kind) => return Mark::Artifact(kind),
             Target::Run(run) => match run.source {
                 RunSource::Text(text) => (text, dom.parent(text)),
-                RunSource::Generated(owner, kind) => {
-                    if self.is_repeat_copy(dom, owner) {
-                        return Mark::Artifact(ArtifactType::Other);
-                    }
-                    let (order, end) = self.order(owner);
-                    if kind == GeneratedKind::Marker
-                        && let Some(&label) = self.structure.labels.get(&owner)
-                    {
-                        return self.content(label, order);
-                    }
-                    let key = if kind == GeneratedKind::After {
-                        end
-                    } else {
-                        order
-                    };
-                    return self.content_at(dom, owner, Some(owner), key);
-                }
+                RunSource::Generated(owner, kind) => return self.generated(dom, owner, kind),
                 // Ellipses and anything else stand in for content that is
                 // already in the structure, or decorate it.
                 _ => return Mark::Artifact(ArtifactType::Other),
@@ -601,6 +591,8 @@ impl Tagger {
                 return Mark::Artifact(ArtifactType::Other);
             }
             Target::Replaced(node) => (node, Some(node)),
+            // Content images sit in their pseudo-element's line like its text.
+            Target::GeneratedImage(image) => return self.generated(dom, image.owner, image.kind),
             Target::MarkerImage(owner) => {
                 if self.is_repeat_copy(dom, owner) {
                     return Mark::Artifact(ArtifactType::Other);
@@ -619,6 +611,27 @@ impl Tagger {
         }
         let key = self.order(source).0;
         self.content_at(dom, source, element, key)
+    }
+
+    /// Content generated for `owner`: a list marker belongs to the item's
+    /// label, `::before` content precedes the element's own content and
+    /// `::after` content follows it.
+    fn generated(&mut self, dom: DomView<'_>, owner: NodeId, kind: GeneratedKind) -> Mark {
+        if self.is_repeat_copy(dom, owner) {
+            return Mark::Artifact(ArtifactType::Other);
+        }
+        let (order, end) = self.order(owner);
+        if kind == GeneratedKind::Marker
+            && let Some(&label) = self.structure.labels.get(&owner)
+        {
+            return self.content(label, order);
+        }
+        let key = if kind == GeneratedKind::After {
+            end
+        } else {
+            order
+        };
+        self.content_at(dom, owner, Some(owner), key)
     }
 
     fn order(&self, node: NodeId) -> (u32, u32) {

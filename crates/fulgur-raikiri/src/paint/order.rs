@@ -50,6 +50,7 @@ pub(super) fn supported(
             | PaintEvent::Box(_)
             | PaintEvent::Replaced(_)
             | PaintEvent::MarkerImage(_)
+            | PaintEvent::GeneratedImage(_)
             | PaintEvent::GeneratedBox(_)
             | PaintEvent::PushClip(_, _)
             | PaintEvent::PopClip

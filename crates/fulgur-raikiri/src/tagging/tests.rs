@@ -561,6 +561,88 @@ fn generated_content_and_marker_images_are_tagged() {
 }
 
 #[test]
+fn generated_content_images_are_tagged_in_reading_order() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    let pdf = tagged_pdf(
+        &format!(
+            "<style>p::before{{content:{image}}} p::after{{content:{image}}}</style>\
+             <p>Body</p>"
+        ),
+        &tagged(),
+    );
+    assert_eq!(outline(&pdf), "Document[P[# # #]]");
+}
+
+/// What the marked content of each MCID on the first page draws: `T` for
+/// text, `I` for an image, whether an XObject or filled vector paths.
+fn mcid_kinds(pdf: &Document) -> std::collections::HashMap<i64, char> {
+    let page_id = *pdf.get_pages().values().next().unwrap();
+    let content = lopdf::content::Content::decode(&pdf.get_page_content(page_id).unwrap()).unwrap();
+    let mut kinds = std::collections::HashMap::new();
+    let mut open: Vec<Option<i64>> = Vec::new();
+    for operation in &content.operations {
+        match operation.operator.as_str() {
+            "BDC" => open.push(
+                operation
+                    .operands
+                    .get(1)
+                    .and_then(|properties| match properties {
+                        Object::Dictionary(dict) => dict.get(b"MCID").ok(),
+                        _ => None,
+                    })
+                    .and_then(|mcid| mcid.as_i64().ok()),
+            ),
+            "BMC" => open.push(None),
+            "EMC" => {
+                open.pop();
+            }
+            operator @ ("Do" | "f" | "f*" | "Tj" | "TJ") => {
+                if let Some(&Some(mcid)) = open.iter().rev().find(|mcid| mcid.is_some()) {
+                    let kind = if operator.starts_with('T') { 'T' } else { 'I' };
+                    // Text wins over the paths of its own decorations.
+                    if kinds.get(&mcid) != Some(&'T') {
+                        kinds.insert(mcid, kind);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    kinds
+}
+
+/// The content of the first `P` element in reading order, as `mcid_kinds`.
+fn paragraph_leaves(pdf: &Document) -> String {
+    let kinds = mcid_kinds(pdf);
+    let paragraph = elements(pdf, b"P")[0];
+    let mcid = |object: &Object| match resolve(pdf, object) {
+        Object::Integer(mcid) => *mcid,
+        Object::Dictionary(dict) => dict.get(b"MCID").unwrap().as_i64().unwrap(),
+        other => panic!("unexpected paragraph kid {other:?}"),
+    };
+    let leaves: Vec<i64> = match resolve(pdf, paragraph.get(b"K").unwrap()) {
+        Object::Array(items) => items.iter().map(mcid).collect(),
+        single => vec![mcid(single)],
+    };
+    leaves.iter().map(|mcid| kinds[mcid]).collect()
+}
+
+#[test]
+fn after_images_follow_the_element_text() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    let pdf = tagged_pdf(
+        &format!(
+            "<style>p::before{{content:{image}}} p::after{{content:{image}}}</style>\
+             <p>Body</p>"
+        ),
+        &tagged(),
+    );
+    assert_eq!(paragraph_leaves(&pdf), "ITI");
+}
+
+#[test]
 fn links_are_named_by_nested_image_alt_text() {
     let pdf = tagged_pdf(
         "<p><a href='https://example.com/'><span> \

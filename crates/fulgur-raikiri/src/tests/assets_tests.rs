@@ -101,6 +101,8 @@ fn bundled_images_resolve_by_path_relative_to_the_input() {
         "<img src='./img/dot.png'>",
         "<div style='width:8px;height:8px;background-image:url(img/dot.png)'></div>",
         "<ul><li style='list-style-image:url(img/dot.png)'>item</li></ul>",
+        "<style>p::before{content:url(img/dot.png)}</style><p>item</p>",
+        "<style>p::after{content:'a' url(img/dot.png) 'b'}</style><p>item</p>",
     ] {
         assert!(
             drawn_images(&format!("{PAGE}{html}"), &bundle) > 0,

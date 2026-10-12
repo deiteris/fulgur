@@ -1,7 +1,6 @@
 /* ── Running elements ─────────────────────────── */
 
 .pageHeader { position: running(pageHeader); }
-.pageFooter { position: running(pageFooter); }
 
 /* ── Page margin boxes (GCPM) ────────────────── */
 
@@ -9,8 +8,12 @@
   @top-center {
     content: element(pageHeader);
   }
+  /* element() must be the whole value (CSS GCPM 3 §1.2.1), so a footer
+     that mixes text with counters uses plain strings, styled here. */
   @bottom-center {
-    content: element(pageFooter) " — " counter(page) " / " counter(pages);
+    content: "Confidential — " counter(page) " / " counter(pages);
+    font-size: 8px;
+    color: #999;
   }
 }
 
@@ -34,11 +37,6 @@ body {
   font-size: 8px;
   color: #999;
   margin-top: 12px;
-}
-
-.pageFooter {
-  font-size: 8px;
-  color: #999;
 }
 
 h1 {

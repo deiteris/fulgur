@@ -14,7 +14,7 @@ use raikiri_html::computed::{
     ComputedBackgroundRepeat, ComputedBackgroundSize, ComputedCssPosition,
 };
 use raikiri_html::image_geometry::{background_image_dimensions, background_tiles};
-use raikiri_html::{Fragment, NodeId, Page, PaintRect, RasterImage};
+use raikiri_html::{Fragment, GeneratedImageId, NodeId, Page, PaintRect, RasterImage};
 use raikiri_traits::{DecodedImage, ImageIntrinsicSize, ImagePixelSource, ImageRasterSize};
 use url::Url;
 
@@ -133,6 +133,16 @@ impl<'a> RasterCache<'a> {
 
     pub(super) fn marker(&self, page: &Page<'_>, owner: NodeId) -> Option<RasterImage> {
         page.raster_marker(owner, self.source?)
+    }
+
+    /// The raster pixels and rectangle of an image of `::before` or
+    /// `::after` content, as laid out on `page`.
+    pub(super) fn generated_image(
+        &self,
+        page: &Page<'_>,
+        image: GeneratedImageId,
+    ) -> Option<RasterImage> {
+        page.raster_generated_image(image, self.source?)
     }
 
     pub(super) fn paint_placement(

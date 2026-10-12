@@ -9,6 +9,7 @@
 mod border;
 mod border_image;
 mod box_shadow;
+mod canvas;
 mod clip;
 mod decoration;
 mod gradient;
@@ -40,8 +41,9 @@ use raikiri_html::computed::{
     ComputedVisibility, ComputedVisualBox, CssColor,
 };
 use raikiri_html::{
-    AnchorIndex, DocumentLayout, FontId, FragmentKind, MarginBox, NodeId, NodeKind, Page,
-    PaintEvent, PaintRect, PaintTransform, PositionedGlyphRun, RunSource, TextShadow,
+    AnchorIndex, DocumentLayout, FontId, FragmentKind, GeneratedImageId, MarginBox, NodeId,
+    NodeKind, Page, PaintEvent, PaintRect, PaintTransform, PositionedGlyphRun, RunSource,
+    TextShadow,
 };
 use shape::{Edges, RoundedRect, Slice};
 use std::collections::HashMap;
@@ -207,6 +209,15 @@ impl<'a> Painter<'a> {
         surface.push_transform(&Transform::from_scale(PX_TO_PT, PX_TO_PT));
 
         tags.begin_page(page);
+        // The canvas goes under everything else on the page. A root that
+        // fades instead takes the canvas into its group with the page body,
+        // so the two fade together, and that group follows the margin boxes
+        // like the body does.
+        let group = canvas::root_opacity(page);
+        let mut canvas_owner = None;
+        if group.is_none() {
+            canvas_owner = canvas::paint_page(&mut surface, tags, raster, page)?;
+        }
         // The margin boxes are drawn before the page body.
         let running = margin::paint(
             &mut surface,
@@ -217,7 +228,14 @@ impl<'a> Painter<'a> {
             raster,
             tags,
         )?;
-        paint_body(&mut surface, page, fonts, svg, raster, tags)?;
+        if let Some(alpha) = group {
+            surface.push_opacity(alpha);
+            canvas_owner = canvas::paint_page(&mut surface, tags, raster, page)?;
+        }
+        paint_body(&mut surface, page, fonts, svg, raster, tags, canvas_owner)?;
+        if group.is_some() {
+            surface.pop();
+        }
 
         surface.pop();
         surface.finish();
@@ -308,6 +326,8 @@ fn start_page(pdf: &mut krilla::Document, page_box: PaintRect) -> Result<krilla:
 
 /// Draw the boxes, text and replaced content of `page`, without its margin
 /// boxes. A running element laid out for a margin box is drawn the same way.
+/// `canvas_owner` is the element whose background was painted as the canvas
+/// background, which its own box does not paint again.
 fn paint_body(
     surface: &mut Surface<'_>,
     page: &Page<'_>,
@@ -315,24 +335,39 @@ fn paint_body(
     svg: &mut svg::SvgCache<'_>,
     raster: &mut raster::RasterCache<'_>,
     tags: &mut Tags,
+    canvas_owner: Option<NodeId>,
 ) -> Result<()> {
     let runs = page.text_runs();
     let events = page.paint_order_for_text_runs(&runs);
-    if order::supported(&events, &runs, |run| page.text_run_opacity_group(run)) {
-        paint_ordered(surface, page, &events, &runs, fonts, svg, raster, tags)
+    let paint = if order::supported(&events, &runs, |run| page.text_run_opacity_group(run)) {
+        paint_ordered
     } else {
-        paint_legacy(surface, page, &runs, fonts, svg, raster, tags)
-    }
+        paint_legacy
+    };
+    paint(
+        surface,
+        page,
+        &events,
+        &runs,
+        fonts,
+        svg,
+        raster,
+        tags,
+        canvas_owner,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_legacy(
     surface: &mut Surface<'_>,
     page: &Page<'_>,
+    events: &[PaintEvent<'_>],
     runs: &[PositionedGlyphRun<'_>],
     fonts: &mut FontCache,
     svg: &mut svg::SvgCache<'_>,
     raster: &mut raster::RasterCache<'_>,
     tags: &mut Tags,
+    canvas_owner: Option<NodeId>,
 ) -> Result<()> {
     let clips = ClipMap::new(page);
     let mut active = ClipStack::default();
@@ -347,6 +382,13 @@ fn paint_legacy(
     boxes.sort_by_key(|fragment| (fragment.node(), fragment.fragment_index()));
     for fragment in boxes {
         if let Some(style) = page.computed(fragment.node()) {
+            let canvas_style;
+            let style = if Some(fragment.node()) == canvas_owner {
+                canvas_style = canvas::without_background(style);
+                &canvas_style
+            } else {
+                style
+            };
             // A box's own overflow clips its content, not its decorations.
             let chain = clips.chain(page, dom.parent(fragment.node()), fragment.paint_rect());
             active.apply(surface, &clips, &chain);
@@ -376,6 +418,17 @@ fn paint_legacy(
         // This painter has no opacity groups, so the SVG keeps its root opacity.
         paint_replaced(surface, page, &fragment, svg, raster, tags, false)?;
     }
+    // Content images are replaced content of their pseudo-element, so they
+    // go with the other replaced content, below the text.
+    for event in events {
+        if let PaintEvent::GeneratedImage(image) = event
+            && let Some(placement) = raster.generated_image(page, *image)
+        {
+            let chain = clips.chain(page, placement.clip_owner, placement.rect);
+            active.apply(surface, &clips, &chain);
+            paint_content_image(surface, page, raster, tags, *image, &placement, false)?;
+        }
+    }
     // Text goes above every block background and border.
     let text: Vec<_> = runs.iter().collect();
     // This painter draws boxes where layout put them, and text where the
@@ -404,6 +457,7 @@ fn paint_ordered(
     svg: &mut svg::SvgCache<'_>,
     raster: &mut raster::RasterCache<'_>,
     tags: &mut Tags,
+    canvas_owner: Option<NodeId>,
 ) -> Result<()> {
     // Ordered painting consumes every producer clip directly. The legacy
     // DOM-based clip lookup would apply the same shape twice and cannot
@@ -464,6 +518,13 @@ fn paint_ordered(
         match event {
             PaintEvent::Box(fragment) => {
                 if let Some(style) = page.computed(fragment.node()) {
+                    let canvas_style;
+                    let style = if Some(fragment.node()) == canvas_owner {
+                        canvas_style = canvas::without_background(style);
+                        &canvas_style
+                    } else {
+                        style
+                    };
                     let chain =
                         clips.chain(page, dom.parent(fragment.node()), fragment.paint_rect());
                     active.apply(surface, &clips, &chain);
@@ -532,6 +593,13 @@ fn paint_ordered(
                     })?;
                 }
             }
+            PaintEvent::GeneratedImage(image) => {
+                if let Some(placement) = raster.generated_image(page, *image) {
+                    let chain = clips.chain(page, placement.clip_owner, placement.rect);
+                    active.apply(surface, &clips, &chain);
+                    paint_content_image(surface, page, raster, tags, *image, &placement, true)?;
+                }
+            }
             PaintEvent::PushClip(shape, _) => {
                 // The producer owns column placement and clipping geometry.
                 // An open axis extends over the page, wherever the enclosing
@@ -592,6 +660,24 @@ fn paint_ordered(
     );
     active.clear(surface);
     Ok(())
+}
+
+/// An image of `::before` or `::after` content (CSS Content 3 §2.2), at the
+/// rectangle layout gave it in its line, marked as its pseudo-element's
+/// content. `host_group` tells whether the paint order already drew the
+/// owner's opacity group.
+fn paint_content_image(
+    surface: &mut Surface<'_>,
+    page: &Page<'_>,
+    raster: &mut raster::RasterCache<'_>,
+    tags: &mut Tags,
+    image: GeneratedImageId,
+    placement: &raikiri_html::RasterImage,
+    host_group: bool,
+) -> Result<()> {
+    tags.mark(surface, page, Target::GeneratedImage(image), |surface| {
+        raster.paint_placement(surface, page, placement, host_group)
+    })
 }
 
 /// The content of a replaced element, marked as that element's content.
