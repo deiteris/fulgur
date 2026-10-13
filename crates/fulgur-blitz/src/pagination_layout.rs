@@ -4639,6 +4639,11 @@ fn record_subtree_fragments_at_offset(
         }
 
         let mut monolithic_y_adjust = 0.0;
+        // Bottom edge, in `node`-local px, of the in-flow children walked so
+        // far. A `display: none` running child has a zero-size box at the
+        // parent's origin, so its source position is this cursor rather than
+        // `final_layout.location`. Margin collapsing is not modelled.
+        let mut flow_bottom = 0.0_f32;
         for child_id in children {
             let Some(child) = doc.get_node(child_id) else {
                 continue;
@@ -4661,26 +4666,28 @@ fn record_subtree_fragments_at_offset(
             // into it (it has no flow content of its own to lay out).
             if running_store.is_some_and(|s| s.instance_for_node(child_id).is_some()) {
                 if child.element_data().is_some() && page_h_px > 0.0 {
-                    let child_y_for_paging =
-                        root_xy_for_paging.1 + offset_in_subtree.1 + child.final_layout.location.y;
+                    // `max` keeps the real position of a running element an
+                    // author re-displayed (it then has a box of its own).
+                    let child_y_for_paging = root_xy_for_paging.1
+                        + offset_in_subtree.1
+                        + child.final_layout.location.y.max(flow_bottom)
+                        - monolithic_y_adjust;
                     let page_index = (child_y_for_paging / page_h_px).max(0.0).floor() as u32;
-                    let page_index = page_index.min(total_pages.saturating_sub(1));
+                    let page_index = page_index.min(descendant_total_pages.saturating_sub(1));
                     let stored_x =
                         root_xy_for_paging.0 + offset_in_subtree.0 + child.final_layout.location.x
                             - body_offset.0;
                     let stored_y =
                         child_y_for_paging - (page_index as f32) * page_h_px - body_offset.1;
-                    geometry
-                        .entry(child_id)
-                        .or_default()
-                        .fragments
-                        .push(Fragment {
-                            page_index,
-                            x: stored_x.as_px(),
-                            y: stored_y.as_px(),
-                            width: 0.0_f32.as_px(),
-                            height: 0.0_f32.as_px(),
-                        });
+                    let entry = geometry.entry(child_id).or_default();
+                    entry.fragments.clear();
+                    entry.fragments.push(Fragment {
+                        page_index,
+                        x: stored_x.as_px(),
+                        y: stored_y.as_px(),
+                        width: 0.0_f32.as_px(),
+                        height: 0.0_f32.as_px(),
+                    });
                 }
                 continue;
             }
@@ -4791,6 +4798,8 @@ fn record_subtree_fragments_at_offset(
                 emitted,
                 running_store,
             );
+            flow_bottom =
+                flow_bottom.max(child.final_layout.location.y + child.final_layout.size.height);
             if has_contain_size(child) {
                 monolithic_y_adjust += (child.final_layout.size.height - page_h_px).max(0.0);
             }
@@ -7010,6 +7019,113 @@ h2 { string-set: chapter-title content(text); }
             .get("top-center")
             .expect("top-center running instance must be recorded for page 0");
         assert_eq!(entry.instance_ids.len(), 1);
+    }
+
+    /// Parse `html`, inject the `display: none` rewrite of `css`, collect
+    /// running elements, and resolve layout — the setup shared by the
+    /// absolute-subtree running-element tests.
+    fn absolute_running_fixture(
+        html: &str,
+        css: &str,
+    ) -> (
+        blitz_html::HtmlDocument,
+        crate::gcpm::running::RunningElementStore,
+    ) {
+        use crate::blitz_adapter;
+        use crate::gcpm::parser::parse_gcpm;
+        use std::sync::Arc;
+
+        let gcpm = parse_gcpm(css);
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = blitz_adapter::parse(html, 600.0, &fonts);
+        let pass_ctx = blitz_adapter::PassContext { font_data: &fonts };
+        let inject = blitz_adapter::InjectCssPass {
+            css: gcpm.cleaned_css.clone(),
+        };
+        blitz_adapter::apply_single_pass(&inject, &mut doc, &pass_ctx);
+        let running_pass = blitz_adapter::RunningElementPass::new(gcpm.running_mappings.clone());
+        blitz_adapter::apply_single_pass(&running_pass, &mut doc, &pass_ctx);
+        let store = running_pass.into_running_store();
+        blitz_adapter::resolve(&mut doc);
+        (doc, store)
+    }
+
+    const ABSOLUTE_RUNNING_CSS: &str = r#"
+        .absolute { position: absolute; }
+        #late { position: running(late); }
+    "#;
+
+    /// A `display: none` running element has a zero-size box at its
+    /// parent's origin, so `final_layout.location.y` is 0 rather than its
+    /// source position. Inside an absolute wrapper the marker must follow
+    /// the flow cursor past the preceding in-flow sibling (1000px, taller
+    /// than the 800px page), landing on page 1 — not on the wrapper's start
+    /// page — and the page budget must grow to hold it.
+    #[test]
+    fn running_element_in_absolute_subtree_is_placed_after_preceding_flow() {
+        use std::ops::DerefMut;
+
+        let html = r#"<!DOCTYPE html>
+<html><body>
+  <div class="absolute">
+    <div style="height: 1000px">tall</div>
+    <div id="late">LATE</div>
+  </div>
+</body></html>"#;
+        let (mut doc, store) = absolute_running_fixture(html, ABSOLUTE_RUNNING_CSS);
+
+        let mut geometry = PaginationGeometryTable::new();
+        append_position_absolute_body_direct_fragments(
+            &mut geometry,
+            doc.deref_mut(),
+            1,
+            600.0,
+            800.0,
+            Some(&store),
+        );
+
+        let fragments: Vec<_> = geometry
+            .iter()
+            .filter(|(id, _)| store.instance_for_node(**id).is_some())
+            .flat_map(|(_, g)| g.fragments.iter())
+            .collect();
+        assert_eq!(fragments.len(), 1, "one marker for the running element");
+        assert_eq!(
+            fragments[0].page_index, 1,
+            "marker sits where the flow cursor lands, not at the wrapper start"
+        );
+    }
+
+    /// The marker replaces, not extends, whatever an earlier pass stored for
+    /// the running node, like every other fragment this walk records.
+    #[test]
+    fn running_element_marker_in_absolute_subtree_replaces_stale_fragments() {
+        use std::ops::DerefMut;
+
+        let html = r#"<!DOCTYPE html>
+<html><body>
+  <div class="absolute"><div id="late">LATE</div></div>
+</body></html>"#;
+        let (mut doc, store) = absolute_running_fixture(html, ABSOLUTE_RUNNING_CSS);
+
+        let mut geometry = PaginationGeometryTable::new();
+        for _ in 0..2 {
+            append_position_absolute_body_direct_fragments(
+                &mut geometry,
+                doc.deref_mut(),
+                1,
+                600.0,
+                800.0,
+                Some(&store),
+            );
+        }
+
+        let counts: Vec<usize> = geometry
+            .iter()
+            .filter(|(id, _)| store.instance_for_node(**id).is_some())
+            .map(|(_, g)| g.fragments.len())
+            .collect();
+        assert_eq!(counts, vec![1], "a second pass must not stack markers");
     }
 
     /// fulgur-6tco: synthesize a geometry table + string_set_by_node
