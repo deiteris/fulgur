@@ -152,18 +152,119 @@ pub fn parse_and_layout(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
 ) -> HtmlDocument {
+    parse_and_layout_with_fonts(
+        html,
+        viewport_width,
+        viewport_height,
+        &RenderFonts::new(font_data, system_fonts),
+    )
+}
+
+/// [`parse_and_layout`] against the font context of one render, so the
+/// document neither enumerates the system fonts nor loads the font files
+/// again.
+pub fn parse_and_layout_with_fonts(
+    html: &str,
+    viewport_width: crate::units::Px,
+    viewport_height: crate::units::Px,
+    fonts: &RenderFonts,
+) -> HtmlDocument {
     let mut doc = parse_inner(
         html,
         viewport_width.to_f32(),
         viewport_height.to_f32() as u32,
-        font_data,
-        system_fonts,
+        fonts,
         None,
         None,
     );
     resolve(&mut doc);
     relayout_position_fixed(&mut doc, viewport_width.to_f32(), viewport_height.to_f32());
     doc
+}
+
+/// The fonts of one render: the system fonts, when allowed, and the fonts
+/// bundled with the engine.
+///
+/// A render parses many documents: the main one, and a measure and a render
+/// document for each distinct margin box (a page-number footer differs on
+/// every page). Blitz gives each document its own font context unless it is
+/// handed one, and a new context enumerates the system fonts and maps the
+/// font files again, at addresses that defeat every cache keyed by font
+/// data. Cloning a `RenderFonts` into each document shares the collection
+/// and the source cache instead. It is owned by one render, so fonts
+/// registered by one engine never reach another.
+#[derive(Clone)]
+pub struct RenderFonts(FontContext);
+
+impl RenderFonts {
+    pub fn new(font_data: &[Arc<Vec<u8>>], system_fonts: bool) -> Self {
+        let mut ctx = FontContext {
+            collection: parley::fontique::Collection::new(parley::fontique::CollectionOptions {
+                shared: true,
+                system_fonts,
+            }),
+            source_cache: parley::fontique::SourceCache::new_shared(),
+        };
+        for data in font_data {
+            let blob: parley::fontique::Blob<u8> = (**data).clone().into();
+            ctx.collection.register_fonts(blob, None);
+        }
+        // Without bundled fonts Blitz builds its default context, which
+        // carries the font its list markers are shaped with. Keep that.
+        if font_data.is_empty()
+            && system_fonts
+            && let Some(bullet) = blitz_bullet_font()
+        {
+            ctx.collection.register_fonts(bullet.clone(), None);
+        }
+        Self(ctx)
+    }
+}
+
+/// The font Blitz shapes `disc`, `circle` and `square` list markers with.
+/// Blitz registers it only in the context it builds itself and keeps its
+/// bytes private, so read it from the marker of a default document. The
+/// bytes are fixed, so one read serves the process.
+fn blitz_bullet_font() -> Option<&'static parley::fontique::Blob<u8>> {
+    static BULLET: std::sync::OnceLock<Option<parley::fontique::Blob<u8>>> =
+        std::sync::OnceLock::new();
+    BULLET
+        .get_or_init(|| {
+            // The doctype keeps the HTML parser from printing a quirks-mode
+            // error to stdout.
+            let mut doc = HtmlDocument::from_html(
+                "<!DOCTYPE html><html><body><ul><li>x</li></ul></body></html>",
+                DocumentConfig {
+                    viewport: Some(Viewport::new(200, 200, 1.0, ColorScheme::Light)),
+                    ..DocumentConfig::default()
+                },
+            );
+            resolve(&mut doc);
+            let blob = first_list_marker_font(&doc)?.data;
+            // Only the bullet font, not whatever the marker fell back to.
+            let mut probe =
+                parley::fontique::Collection::new(parley::fontique::CollectionOptions {
+                    shared: false,
+                    system_fonts: false,
+                });
+            probe.register_fonts(blob.clone(), None);
+            probe.family_id("Bullet")?;
+            Some(blob)
+        })
+        .as_ref()
+}
+
+/// The font of the first glyph run of the first list marker in `doc`.
+pub(crate) fn first_list_marker_font(doc: &HtmlDocument) -> Option<parley::FontData> {
+    doc.tree()
+        .iter()
+        .filter_map(|(_, node)| node.element_data()?.list_item_data.as_ref())
+        .find_map(|item| {
+            let layout = list_position_outside_layout(&item.position)?;
+            layout
+                .lines()
+                .find_map(|line| line.runs().next().map(|run| run.font().clone()))
+        })
 }
 
 /// Context available to each DOM pass.
@@ -183,7 +284,14 @@ pub trait DomPass {
 /// [`parse_html_with_local_resources`] instead, which wires fulgur's
 /// own [`crate::net::FulgurNetProvider`] into Blitz.
 pub fn parse(html: &str, viewport_width: f32, font_data: &[Arc<Vec<u8>>]) -> HtmlDocument {
-    parse_inner(html, viewport_width, 10000, font_data, true, None, None)
+    parse_inner(
+        html,
+        viewport_width,
+        10000,
+        &RenderFonts::new(font_data, true),
+        None,
+        None,
+    )
 }
 
 /// Parse HTML and load any `<link rel="stylesheet">` / `@import` files
@@ -303,6 +411,24 @@ pub(crate) fn parse_html_with_local_resources_with_link_nodes(
     system_fonts: bool,
     base_path: Option<&Path>,
 ) -> ParsedWithLocalResources {
+    parse_html_with_local_resources_and_fonts(
+        html,
+        viewport_width,
+        viewport_height_px,
+        &RenderFonts::new(font_data, system_fonts),
+        base_path,
+    )
+}
+
+/// [`parse_html_with_local_resources_with_link_nodes`] against the font
+/// context of one render.
+pub(crate) fn parse_html_with_local_resources_and_fonts(
+    html: &str,
+    viewport_width: f32,
+    viewport_height_px: u32,
+    fonts: &RenderFonts,
+    base_path: Option<&Path>,
+) -> ParsedWithLocalResources {
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -316,8 +442,7 @@ pub(crate) fn parse_html_with_local_resources_with_link_nodes(
         html,
         viewport_width,
         viewport_height_px,
-        font_data,
-        system_fonts,
+        fonts,
         Some(provider),
         base_url,
     );
@@ -416,8 +541,7 @@ fn parse_inner(
     html: &str,
     viewport_width: f32,
     viewport_height_px: u32,
-    font_data: &[Arc<Vec<u8>>],
-    system_fonts: bool,
+    fonts: &RenderFonts,
     net_provider: Option<Arc<dyn NetProvider<Resource>>>,
     base_url: Option<String>,
 ) -> HtmlDocument {
@@ -428,25 +552,7 @@ fn parse_inner(
         ColorScheme::Light,
     );
 
-    let font_ctx = if font_data.is_empty() && system_fonts {
-        // No bundled fonts and system fonts allowed: let Blitz use its own
-        // default FontContext (system fonts enabled).
-        None
-    } else {
-        let collection = parley::fontique::Collection::new(parley::fontique::CollectionOptions {
-            system_fonts,
-            ..Default::default()
-        });
-        let mut ctx = FontContext {
-            collection,
-            source_cache: parley::fontique::SourceCache::new(Default::default()),
-        };
-        for data in font_data {
-            let blob: parley::fontique::Blob<u8> = (**data).clone().into();
-            ctx.collection.register_fonts(blob, None);
-        }
-        Some(ctx)
-    };
+    let font_ctx = Some(fonts.0.clone());
 
     let config = DocumentConfig {
         viewport: Some(viewport),
@@ -9572,5 +9678,76 @@ mod extract_html_title_tests {
             &[],
         );
         assert_eq!(super::extract_html_title(&doc), None);
+    }
+}
+
+#[cfg(test)]
+mod render_fonts_tests {
+    use super::*;
+    use crate::units::F32Units;
+
+    fn layout_doc(html: &str, fonts: &[Arc<Vec<u8>>], system_fonts: bool) -> HtmlDocument {
+        parse_and_layout(
+            html,
+            400.0_f32.as_px(),
+            200.0_f32.as_px(),
+            fonts,
+            system_fonts,
+        )
+    }
+
+    fn layout_with(html: &str, fonts: &RenderFonts) -> HtmlDocument {
+        parse_and_layout_with_fonts(html, 400.0_f32.as_px(), 200.0_f32.as_px(), fonts)
+    }
+
+    /// The font data of the first glyph run of the first paragraph.
+    fn first_text_font(doc: &HtmlDocument) -> parley::FontData {
+        doc.tree()
+            .iter()
+            .filter_map(|(_, node)| node.element_data()?.inline_layout_data.as_ref())
+            .find_map(|inline| {
+                inline
+                    .layout
+                    .lines()
+                    .find_map(|line| line.runs().next().map(|run| run.font().clone()))
+            })
+            .expect("the document has a text run")
+    }
+
+    /// The font data of the marker of the first list item.
+    fn marker_font(doc: &HtmlDocument) -> parley::FontData {
+        first_list_marker_font(doc).expect("the document has a list marker with a text run")
+    }
+
+    const PAGE: &str =
+        "<!DOCTYPE html><html><body style=\"font-family:'Noto Sans'\"><p>Page</p></body></html>";
+
+    #[test]
+    fn documents_parsed_for_one_render_resolve_text_to_one_font_blob() {
+        let noto = crate::test_fonts::noto_sans_regular_ttf();
+        let fonts = RenderFonts::new(std::slice::from_ref(&noto), false);
+        let first = first_text_font(&layout_with(PAGE, &fonts));
+        let second = first_text_font(&layout_with(PAGE, &fonts));
+        assert_eq!(
+            first.data.id(),
+            second.data.id(),
+            "each document loaded its own copy of the font"
+        );
+    }
+
+    #[test]
+    fn list_markers_use_blitzs_bullet_font() {
+        let html = "<!DOCTYPE html><html><body><ul><li>x</li></ul></body></html>";
+        let ours = marker_font(&layout_doc(html, &[], true));
+        // Blitz's own context, which `RenderFonts` replaces, registers the bullet font.
+        let mut blitz = HtmlDocument::from_html(html, DocumentConfig::default());
+        resolve(&mut blitz);
+        let blitzs = marker_font(&blitz);
+        assert!(
+            ours.data.data() == blitzs.data.data(),
+            "the marker was shaped with {} bytes of font, Blitz's bullet font has {}",
+            ours.data.data().len(),
+            blitzs.data.data().len()
+        );
     }
 }

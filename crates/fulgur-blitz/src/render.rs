@@ -12,7 +12,6 @@ use krilla::SerializeSettings;
 use krilla::configure::{Configuration, Validator};
 use krilla::tagging::{Identifier, Node, TagGroup, TagTree};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 /// Geometry-driven page render.
 ///
@@ -27,8 +26,7 @@ pub fn render_v2(
     drawables: &Drawables,
     gcpm: &GcpmContext,
     running_store: &RunningElementStore,
-    font_data: &[Arc<Vec<u8>>],
-    system_fonts: bool,
+    fonts: &crate::blitz_adapter::RenderFonts,
     string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
     counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
     html_title: Option<String>,
@@ -136,8 +134,7 @@ pub fn render_v2(
     let mut margin_box_renderer = MarginBoxRenderer::new(
         gcpm,
         running_store,
-        font_data,
-        system_fonts,
+        fonts,
         geometry,
         string_set_by_node,
         counter_ops_by_node,
@@ -3618,8 +3615,8 @@ fn width_key(w: f32) -> u32 {
 pub(crate) struct MarginBoxRenderer<'a> {
     pub gcpm: &'a GcpmContext,
     pub running_store: &'a RunningElementStore,
-    pub font_data: &'a [Arc<Vec<u8>>],
-    pub system_fonts: bool,
+    /// The font context of the render; every margin-box document clones it.
+    pub fonts: &'a crate::blitz_adapter::RenderFonts,
     pub margin_css: String,
     pub string_set_states: Vec<BTreeMap<String, crate::pagination_layout::StringSetPageState>>,
     pub running_states: Vec<BTreeMap<String, crate::pagination_layout::PageRunningState>>,
@@ -3641,8 +3638,7 @@ impl<'a> MarginBoxRenderer<'a> {
     pub(crate) fn new(
         gcpm: &'a GcpmContext,
         running_store: &'a RunningElementStore,
-        font_data: &'a [Arc<Vec<u8>>],
-        system_fonts: bool,
+        fonts: &'a crate::blitz_adapter::RenderFonts,
         pagination_geometry: &crate::pagination_layout::PaginationGeometryTable,
         string_set_by_node: &HashMap<usize, Vec<(String, String)>>,
         counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
@@ -3678,8 +3674,7 @@ impl<'a> MarginBoxRenderer<'a> {
         Self {
             gcpm,
             running_store,
-            font_data,
-            system_fonts,
+            fonts,
             margin_css: strip_display_none(&gcpm.cleaned_css),
             string_set_states,
             running_states,
@@ -3829,12 +3824,11 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
                     self.margin_css, html
                 );
-                let measure_doc = crate::blitz_adapter::parse_and_layout(
+                let measure_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
                     &measure_html,
                     content_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
-                    self.font_data,
-                    self.system_fonts,
+                    self.fonts,
                 );
                 get_body_child_dimension(&measure_doc, true)
             });
@@ -3864,12 +3858,11 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
                     self.margin_css, html
                 );
-                let measure_doc = crate::blitz_adapter::parse_and_layout(
+                let measure_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
                     &measure_html,
                     fixed_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
-                    self.font_data,
-                    self.system_fonts,
+                    self.fonts,
                 );
                 get_body_child_dimension(&measure_doc, false)
             });
@@ -3936,12 +3929,11 @@ impl<'a> MarginBoxRenderer<'a> {
                     "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
                     self.margin_css, html
                 );
-                let mut render_doc = crate::blitz_adapter::parse_and_layout(
+                let mut render_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
                     &render_html,
                     rect.width.in_px(),
                     rect.height.in_px(),
-                    self.font_data,
-                    self.system_fonts,
+                    self.fonts,
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
@@ -4231,6 +4223,7 @@ fn build_tag_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // --- escape_attr ---
 
@@ -5935,8 +5928,7 @@ mod tests {
         let _mbr = MarginBoxRenderer::new(
             &gcpm,
             &store,
-            &[],
-            false,
+            &crate::blitz_adapter::RenderFonts::new(&[], false),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -5962,8 +5954,7 @@ mod tests {
         let _mbr = MarginBoxRenderer::new(
             &gcpm,
             &store,
-            &[],
-            false,
+            &crate::blitz_adapter::RenderFonts::new(&[], false),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
@@ -5992,8 +5983,7 @@ mod tests {
         let _mbr = MarginBoxRenderer::new(
             &gcpm,
             &store,
-            &[],
-            false,
+            &crate::blitz_adapter::RenderFonts::new(&[], false),
             &geom,
             &HashMap::new(),
             &BTreeMap::new(),
