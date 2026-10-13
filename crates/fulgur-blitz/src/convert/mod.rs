@@ -156,8 +156,8 @@ impl ConvertContext<'_> {
 /// byte before two fonts share a copy.
 type InternKey = (usize, u32, u64);
 
-/// Live copies that share an [`InternKey`], normally one.
-type InternTable = HashMap<InternKey, Vec<std::sync::Weak<Vec<u8>>>>;
+/// Fewest keys the intern table holds before it sweeps out dead ones.
+const MIN_SWEEP_LEN: usize = 32;
 
 /// One shared copy of each distinct font's bytes across documents.
 ///
@@ -168,33 +168,71 @@ type InternTable = HashMap<InternKey, Vec<std::sync::Weak<Vec<u8>>>>;
 /// and without this each page kept a private ~1 MB copy of every font it used
 /// until the PDF was finished. The table holds `Weak` references, so a font
 /// is freed with its last user.
-fn intern_font(bytes: &[u8], index: u32) -> Arc<Vec<u8>> {
-    use std::hash::{Hash, Hasher};
-    use std::sync::{Mutex, OnceLock, Weak};
-    static INTERNED: OnceLock<Mutex<InternTable>> = OnceLock::new();
+#[derive(Default)]
+struct FontInterner {
+    table: std::sync::Mutex<InternTable>,
+}
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes[..bytes.len().min(4096)].hash(&mut hasher);
-    bytes[bytes.len().saturating_sub(4096)..].hash(&mut hasher);
-    let key = (bytes.len(), index, hasher.finish());
+#[derive(Default)]
+struct InternTable {
+    /// Live copies that share a key, normally one.
+    by_key: HashMap<InternKey, Vec<std::sync::Weak<Vec<u8>>>>,
+    /// Number of keys after the last sweep.
+    swept_len: usize,
+}
 
-    // The table only caches; a panic elsewhere cannot leave it inconsistent.
-    let mut table = INTERNED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let candidates = table.entry(key).or_default();
-    candidates.retain(|weak| weak.strong_count() > 0);
-    if let Some(shared) = candidates
-        .iter()
-        .filter_map(Weak::upgrade)
-        .find(|candidate| candidate.as_slice() == bytes)
-    {
-        return shared;
+impl FontInterner {
+    fn intern(&self, bytes: &[u8], index: u32) -> Arc<Vec<u8>> {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes[..bytes.len().min(4096)].hash(&mut hasher);
+        bytes[bytes.len().saturating_sub(4096)..].hash(&mut hasher);
+        let key = (bytes.len(), index, hasher.finish());
+
+        // The table only caches; a panic elsewhere cannot leave it inconsistent.
+        let mut table = self
+            .table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(candidates) = table.by_key.get_mut(&key) {
+            candidates.retain(|weak| weak.strong_count() > 0);
+            if let Some(shared) = candidates
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|candidate| candidate.as_slice() == bytes)
+            {
+                return shared;
+            }
+        }
+        // A key whose copies are all gone is never looked up again unless
+        // the same font returns, so sweep once the table has doubled.
+        if table.by_key.len() > MIN_SWEEP_LEN.max(2 * table.swept_len) {
+            table
+                .by_key
+                .retain(|_, copies| copies.iter().any(|weak| weak.strong_count() > 0));
+            table.swept_len = table.by_key.len();
+        }
+        let copy = Arc::new(bytes.to_vec());
+        table
+            .by_key
+            .entry(key)
+            .or_default()
+            .push(Arc::downgrade(&copy));
+        copy
     }
-    let copy = Arc::new(bytes.to_vec());
-    candidates.push(Arc::downgrade(&copy));
-    copy
+
+    /// Number of `Weak` entries held, live or dead.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        let table = self.table.lock().unwrap();
+        table.by_key.values().map(Vec::len).sum()
+    }
+}
+
+fn intern_font(bytes: &[u8], index: u32) -> Arc<Vec<u8>> {
+    static INTERNER: std::sync::OnceLock<FontInterner> = std::sync::OnceLock::new();
+    INTERNER.get_or_init(Default::default).intern(bytes, index)
 }
 
 /// Phase 4 (fulgur-9t3z) + PR 8i: convert a resolved Blitz document into a
@@ -2410,6 +2448,60 @@ mod font_sharing_tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "each document kept its own copy of the same font"
+        );
+    }
+
+    /// 20 000 bytes whose first and last 4 KiB are the same for every
+    /// `middle`, so only a byte comparison tells two of them apart.
+    fn font_bytes(middle: u8) -> Vec<u8> {
+        let mut bytes = vec![1u8; 20_000];
+        bytes[8_000..12_000].fill(middle);
+        bytes
+    }
+
+    #[test]
+    fn interning_fonts_that_differ_only_in_the_middle_keeps_them_apart() {
+        let interner = super::FontInterner::default();
+        let a = interner.intern(&font_bytes(2), 0);
+        let b = interner.intern(&font_bytes(3), 0);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(a.as_slice(), font_bytes(2).as_slice());
+        assert_eq!(b.as_slice(), font_bytes(3).as_slice());
+        assert!(Arc::ptr_eq(&a, &interner.intern(&font_bytes(2), 0)));
+    }
+
+    #[test]
+    fn interning_equal_buffers_returns_one_arc_per_face_index() {
+        let interner = super::FontInterner::default();
+        let first = interner.intern(&font_bytes(2), 0);
+        let second = interner.intern(&font_bytes(2), 0);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other_face = interner.intern(&font_bytes(2), 1);
+        assert!(!Arc::ptr_eq(&first, &other_face));
+    }
+
+    #[test]
+    fn a_font_is_copied_again_once_its_last_arc_is_dropped() {
+        let interner = super::FontInterner::default();
+        drop(interner.intern(&font_bytes(2), 0));
+        assert_eq!(interner.entries(), 1, "the dead entry is still held");
+        let fresh = interner.intern(&font_bytes(2), 0);
+        assert_eq!(Arc::strong_count(&fresh), 1);
+        assert_eq!(interner.entries(), 1, "the dead entry was not pruned");
+    }
+
+    #[test]
+    fn the_table_sweeps_the_keys_of_dropped_fonts() {
+        let interner = super::FontInterner::default();
+        for i in 0..200usize {
+            let mut bytes = font_bytes(2);
+            bytes.extend_from_slice(&i.to_le_bytes());
+            drop(interner.intern(&bytes, 0));
+        }
+        assert!(
+            interner.entries() <= 2 * super::MIN_SWEEP_LEN,
+            "{} entries remain for 200 dropped fonts",
+            interner.entries()
         );
     }
 }

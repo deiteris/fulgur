@@ -163,7 +163,7 @@ pub fn parse_and_layout(
 /// [`parse_and_layout`] against the font context of one render, so the
 /// document neither enumerates the system fonts nor loads the font files
 /// again.
-pub fn parse_and_layout_with_fonts(
+pub(crate) fn parse_and_layout_with_fonts(
     html: &str,
     viewport_width: crate::units::Px,
     viewport_height: crate::units::Px,
@@ -219,6 +219,18 @@ impl RenderFonts {
         }
         Self(ctx)
     }
+
+    /// Number of faces registered under the family `name`.
+    #[cfg(test)]
+    pub(crate) fn faces(&self, name: &str) -> usize {
+        let mut collection = self.0.collection.clone();
+        let Some(id) = collection.family_id(name) else {
+            return 0;
+        };
+        collection
+            .family(id)
+            .map_or(0, |family| family.fonts().len())
+    }
 }
 
 /// The font Blitz shapes `disc`, `circle` and `square` list markers with.
@@ -228,7 +240,7 @@ impl RenderFonts {
 fn blitz_bullet_font() -> Option<&'static parley::fontique::Blob<u8>> {
     static BULLET: std::sync::OnceLock<Option<parley::fontique::Blob<u8>>> =
         std::sync::OnceLock::new();
-    BULLET
+    let bullet = BULLET
         .get_or_init(|| {
             // The doctype keeps the HTML parser from printing a quirks-mode
             // error to stdout.
@@ -251,7 +263,13 @@ fn blitz_bullet_font() -> Option<&'static parley::fontique::Blob<u8>> {
             probe.family_id("Bullet")?;
             Some(blob)
         })
-        .as_ref()
+        .as_ref();
+    if bullet.is_none() {
+        // Markers then fall back to the "monospace, sans-serif" the font
+        // stack names after "Bullet", so their glyphs differ from Blitz's.
+        log::warn!("could not read Blitz's list marker font; list markers use a fallback font");
+    }
+    bullet
 }
 
 /// The font of the first glyph run of the first list marker in `doc`.
@@ -9970,6 +9988,28 @@ mod render_fonts_tests {
             "the marker was shaped with {} bytes of font, Blitz's bullet font has {}",
             ours.data.data().len(),
             blitzs.data.data().len()
+        );
+    }
+
+    #[test]
+    fn a_font_the_main_document_loads_is_visible_to_the_margin_box_documents() {
+        let fonts = RenderFonts::new(&[], false);
+        let mut main = layout_with("<!DOCTYPE html><html><body>Main</body></html>", &fonts);
+        assert_eq!(fonts.faces("Noto Sans"), 0);
+        // The way Blitz registers a font a stylesheet fetched (`@font-face`).
+        let ttf = crate::test_fonts::noto_sans_regular_ttf();
+        main.load_resource(Resource::Font(ttf.as_ref().clone().into()));
+        assert_eq!(fonts.faces("Noto Sans"), 1);
+        // A margin-box document has no `@font-face` of its own; it names the
+        // family the main document registered.
+        let margin = layout_with(
+            "<!DOCTYPE html><html><body><p style=\"font-family:'Noto Sans'\">Page</p></body></html>",
+            &fonts,
+        );
+        assert_eq!(
+            first_text_font(&margin).data.data(),
+            ttf.as_slice(),
+            "the margin-box document did not resolve the main document's font"
         );
     }
 }
