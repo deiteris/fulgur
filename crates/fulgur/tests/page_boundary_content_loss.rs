@@ -217,3 +217,46 @@ fn a_nested_paragraph_split_across_pages_keeps_every_line() {
         );
     }
 }
+
+/// A paragraph in a body cell of a table with a repeating `<thead>` must keep
+/// every line when the table breaks across pages.
+///
+/// `fragment_repeating_table` fragments the body on its own and merges the
+/// result into the table's geometry. The merge carried the fragments over but
+/// not the line partition the fragmenter chose for a split paragraph, so the
+/// renderer re-derived it from fractional line heights and lost lines (the
+/// same divergence as `a_paragraph_split_across_pages_keeps_every_line`).
+///
+/// The header cell is empty and only has a height, so the repeated header
+/// paints no glyphs and the tall and short renders must agree exactly.
+#[test]
+fn a_paragraph_in_a_table_with_a_repeating_header_keeps_every_line() {
+    for (font_px, line_height, n, page_h) in [
+        (13.0, 1.3, 500usize, 300u32),
+        (9.0, 1.7, 600, 250),
+        (12.0, 1.45, 700, 320),
+        (10.0, 1.33, 800, 260),
+    ] {
+        let words = probe_words(n);
+        let style = format!(
+            "body {{ margin: 0; font-size: {font_px}px; line-height: {line_height}; }} \
+             table {{ border-collapse: collapse; width: 100%; }} \
+             td, th {{ padding: 0; vertical-align: top; }}"
+        );
+        let body = format!(
+            r#"<table>
+  <thead><tr><th style="height:20px"></th></tr></thead>
+  <tbody>
+    <tr><td><div style="height:40px"></div></td></tr>
+    <tr><td><p style="margin:0">{words}</p></td></tr>
+  </tbody>
+</table>"#
+        );
+        assert_pagination_loses_nothing(
+            &style,
+            &body,
+            page_h,
+            &format!("thead font={font_px}px lh={line_height} page-height={page_h}px"),
+        );
+    }
+}

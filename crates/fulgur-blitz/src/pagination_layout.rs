@@ -2284,6 +2284,11 @@ fn fragment_repeating_table(
 
     let mut table_pages = BTreeMap::<u32, f32>::new();
     for (node_id, mut source) in body_geometry {
+        let pages_before_sort: Vec<u32> = source
+            .fragments
+            .iter()
+            .map(|fragment| fragment.page_index)
+            .collect();
         source.fragments.sort_by_key(|fragment| fragment.page_index);
         if node_id == header.table_id {
             // Keep a zero-height slice only where body content shares the page
@@ -2316,6 +2321,20 @@ fn fragment_repeating_table(
         }
         let target = geometry.entry(node_id).or_default();
         target.is_repeat |= source.is_repeat;
+        // `line_boundaries` indexes `fragments` by position, so it survives
+        // only when the list it was published for is the one that is kept:
+        // nothing before it in the target, and no fragment reordered or
+        // dropped above. Otherwise it stays empty and the renderer
+        // re-derives the partition.
+        let fragments_unchanged = target.fragments.is_empty()
+            && source
+                .fragments
+                .iter()
+                .map(|fragment| fragment.page_index)
+                .eq(pages_before_sort.iter().copied());
+        if fragments_unchanged {
+            target.line_boundaries = std::mem::take(&mut source.line_boundaries);
+        }
         target.fragments.extend(source.fragments);
     }
 
