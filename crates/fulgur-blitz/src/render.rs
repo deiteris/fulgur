@@ -3605,6 +3605,53 @@ fn width_key(w: f32) -> u32 {
     w.to_bits()
 }
 
+/// The stylesheet of the margin-box documents of one render.
+///
+/// The text is parsed once, on the first document, into a
+/// [`SharedSheet`](crate::blitz_adapter::SharedSheet) that every document then
+/// takes a copy of; a render without margin boxes parses nothing. `shared` is
+/// `Some(None)` when the text is empty or cannot be shared; each document then
+/// embeds the text. The renderer owns the sheet, so the document that holds
+/// the parsed rules lives as long as the documents using them.
+pub(crate) struct MarginSheet {
+    css: String,
+    shared: std::cell::OnceCell<Option<crate::blitz_adapter::SharedSheet>>,
+}
+
+impl MarginSheet {
+    fn new(css: String) -> Self {
+        Self {
+            css,
+            shared: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Parse and lay out one margin-box document: this stylesheet, then
+    /// `body`, a `<body>` element, at the given viewport.
+    fn document(
+        &self,
+        fonts: &crate::blitz_adapter::RenderFonts,
+        body: &str,
+        viewport_width: crate::units::Px,
+        viewport_height: crate::units::Px,
+    ) -> blitz_html::HtmlDocument {
+        let shared = self
+            .shared
+            .get_or_init(|| crate::blitz_adapter::SharedSheet::parse(&self.css, fonts))
+            .as_ref();
+        // The shared sheet is attached to an empty `<style>` element.
+        let css = if shared.is_some() { "" } else { &self.css };
+        let html = format!("<!DOCTYPE html><html><head><style>{css}</style></head>{body}</html>");
+        crate::blitz_adapter::parse_and_layout_with_sheet(
+            shared,
+            &html,
+            viewport_width,
+            viewport_height,
+            fonts,
+        )
+    }
+}
+
 /// Per-page state and caches required to render `@page` margin boxes
 /// (`@top-center`, `@bottom-center`, `@left-middle`, etc.). Built once
 /// per render and reused across pages so measure / layout passes for
@@ -3617,7 +3664,7 @@ pub(crate) struct MarginBoxRenderer<'a> {
     pub running_store: &'a RunningElementStore,
     /// The font context of the render; every margin-box document clones it.
     pub fonts: &'a crate::blitz_adapter::RenderFonts,
-    pub margin_css: String,
+    pub margin_sheet: MarginSheet,
     pub string_set_states: Vec<BTreeMap<String, crate::pagination_layout::StringSetPageState>>,
     pub running_states: Vec<BTreeMap<String, crate::pagination_layout::PageRunningState>>,
     pub counter_states: Vec<BTreeMap<String, i32>>,
@@ -3671,11 +3718,12 @@ impl<'a> MarginBoxRenderer<'a> {
                     counter_ops_by_node,
                 )
             };
+        let margin_sheet = MarginSheet::new(strip_display_none(&gcpm.cleaned_css));
         Self {
             gcpm,
             running_store,
             fonts,
-            margin_css: strip_display_none(&gcpm.cleaned_css),
+            margin_sheet,
             string_set_states,
             running_states,
             counter_states,
@@ -3820,15 +3868,13 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(content_width),
             );
             self.measure_cache.entry(measure_key).or_insert_with(|| {
-                let measure_html = format!(
-                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
-                    self.margin_css, html
-                );
-                let measure_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
-                    &measure_html,
+                let measure_doc = self.margin_sheet.document(
+                    self.fonts,
+                    &format!(
+                        "<body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{html}</div></body>"
+                    ),
                     content_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
-                    self.fonts,
                 );
                 get_body_child_dimension(&measure_doc, true)
             });
@@ -3854,15 +3900,11 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(page_size.height),
             );
             self.height_cache.entry(hc_key).or_insert_with(|| {
-                let measure_html = format!(
-                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
-                    self.margin_css, html
-                );
-                let measure_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
-                    &measure_html,
+                let measure_doc = self.margin_sheet.document(
+                    self.fonts,
+                    &format!("<body style=\"margin:0;padding:0;\"><div>{html}</div></body>"),
                     fixed_width.as_pt().in_px(),
                     page_size.height.as_pt().in_px(),
-                    self.fonts,
                 );
                 get_body_child_dimension(&measure_doc, false)
             });
@@ -3925,15 +3967,11 @@ impl<'a> MarginBoxRenderer<'a> {
                 width_key(rect.height.to_f32()),
             );
             if !self.render_cache.contains_key(&cache_key) {
-                let render_html = format!(
-                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
-                    self.margin_css, html
-                );
-                let mut render_doc = crate::blitz_adapter::parse_and_layout_with_fonts(
-                    &render_html,
+                let mut render_doc = self.margin_sheet.document(
+                    self.fonts,
+                    &format!("<body style=\"margin:0;padding:0;\">{html}</body>"),
                     rect.width.in_px(),
                     rect.height.in_px(),
-                    self.fonts,
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
@@ -3975,7 +4013,7 @@ impl<'a> MarginBoxRenderer<'a> {
                 }
                 // `body_offset_pt` is (0, 0) here because the wrapper HTML fixes
                 // `body { margin: 0; padding: 0; }` via an inline style, which
-                // takes higher specificity than `self.margin_css`. No adjustment
+                // takes higher specificity than `self.margin_sheet`. No adjustment
                 // needed unlike `render_v2`.
                 let (txd, cd, owd) = build_page_skip_sets(drawables);
                 // Margin-box content is always single-page (page 0).
@@ -5989,6 +6027,197 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+        );
+    }
+
+    // --- MarginBoxRenderer::margin_document: one parse of the margin stylesheet ---
+
+    /// A margin stylesheet with the rule kinds a margin box can meet. The
+    /// class and `@media screen` rules style the test document; `@font-face`,
+    /// `@page` and `@media print` style no element and only cover copying
+    /// those rules onto another lock.
+    const MARGIN_CSS: &str = "@font-face { font-family: Face; src: local(Face); }        @page { margin: 1cm; }        .big { font-size: 30px; color: #123456; background-image: url(bg.png); }        @media screen { p { font-size: 11px; } }        @media print { p { font-size: 40px; } }";
+
+    const MARGIN_BODY: &str = "<body style=\"margin:0\">        <div class=\"big\" style=\"padding:2px\">Hello</div><p>page 1</p></body>";
+
+    fn with_margin_css(css: &str, check: impl FnOnce(&MarginBoxRenderer<'_>)) {
+        let gcpm = crate::gcpm::GcpmContext {
+            cleaned_css: css.to_string(),
+            ..Default::default()
+        };
+        let store = RunningElementStore::default();
+        let geom = empty_geometry();
+        let implicit: BTreeMap<usize, String> = BTreeMap::new();
+        let fonts = crate::blitz_adapter::RenderFonts::new(&[], false);
+        let renderer = MarginBoxRenderer::new(
+            &gcpm,
+            &store,
+            &fonts,
+            &geom,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            1,
+            &implicit,
+        );
+        check(&renderer);
+    }
+
+    /// Whether the renderer parsed a sheet to share (after its first document).
+    fn is_shared(renderer: &MarginBoxRenderer<'_>) -> bool {
+        renderer
+            .margin_sheet
+            .shared
+            .get()
+            .is_some_and(Option::is_some)
+    }
+
+    #[test]
+    fn a_render_without_margin_documents_parses_no_margin_stylesheet() {
+        crate::blitz_adapter::STYLE_TEXT_PARSES.with(|n| n.set(0));
+        with_margin_css(MARGIN_CSS, |_| {});
+        assert_eq!(crate::blitz_adapter::STYLE_TEXT_PARSES.with(|n| n.get()), 0);
+    }
+
+    #[test]
+    fn media_queries_of_a_shared_margin_stylesheet_follow_each_documents_width() {
+        let css = ".big { color: #123456; } @media (min-width: 300px) { .big { color: #654321; } }";
+        let fonts = crate::blitz_adapter::RenderFonts::new(&[], false);
+        let embedded = |width: f32| {
+            element_styles(&crate::blitz_adapter::parse_and_layout_with_fonts(
+                &format!(
+                    "<!DOCTYPE html><html><head><style>{css}</style></head>{MARGIN_BODY}</html>"
+                ),
+                width.as_px(),
+                100.0_f32.as_px(),
+                &fonts,
+            ))
+        };
+        let (narrow, wide) = (embedded(200.0), embedded(400.0));
+        assert_ne!(
+            narrow, wide,
+            "the media query matches only the wide document"
+        );
+        with_margin_css(css, |renderer| {
+            for (width, expected) in [(200.0_f32, &narrow), (400.0, &wide)] {
+                let doc = renderer.margin_sheet.document(
+                    &fonts,
+                    MARGIN_BODY,
+                    width.as_px(),
+                    100.0_f32.as_px(),
+                );
+                assert_eq!(&element_styles(&doc), expected, "width {width}");
+            }
+            assert!(is_shared(renderer));
+        });
+    }
+
+    #[test]
+    fn margin_documents_of_a_render_parse_the_margin_stylesheet_once() {
+        crate::blitz_adapter::STYLE_TEXT_PARSES.with(|n| n.set(0));
+        with_margin_css(MARGIN_CSS, |renderer| {
+            for page in 1..=5 {
+                let body = MARGIN_BODY.replace("page 1", &format!("page {page}"));
+                renderer.margin_sheet.document(
+                    &crate::blitz_adapter::RenderFonts::new(&[], false),
+                    &body,
+                    400.0_f32.as_px(),
+                    100.0_f32.as_px(),
+                );
+            }
+        });
+        assert_eq!(
+            crate::blitz_adapter::STYLE_TEXT_PARSES.with(|n| n.get()),
+            1,
+            "five margin documents and the template parse the stylesheet text once"
+        );
+    }
+
+    /// Per element: the box, the computed colour and font size, and the
+    /// computed background.
+    fn element_styles(doc: &blitz_html::HtmlDocument) -> Vec<String> {
+        doc.tree()
+            .iter()
+            .filter(|(_, node)| node.element_data().is_some())
+            .filter_map(|(_, node)| {
+                let style = node.primary_styles()?;
+                Some(format!(
+                    "{:?} {:?} {:?} {:?} {:?}",
+                    node.final_layout.size,
+                    node.final_layout.location,
+                    style.get_inherited_text().color,
+                    style.clone_font_size().computed_size().px(),
+                    style.get_background().background_image,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shared_margin_stylesheet_styles_a_document_as_the_embedded_text_does() {
+        let embedded = format!(
+            "<!DOCTYPE html><html><head><style>{MARGIN_CSS}</style></head>{MARGIN_BODY}</html>"
+        );
+        let fonts = crate::blitz_adapter::RenderFonts::new(&[], false);
+        let expected = element_styles(&crate::blitz_adapter::parse_and_layout_with_fonts(
+            &embedded,
+            400.0_f32.as_px(),
+            100.0_f32.as_px(),
+            &fonts,
+        ));
+        assert!(
+            expected.iter().any(|s| s.contains("30.0")),
+            "the class rule applies in the reference document: {expected:?}"
+        );
+        with_margin_css(MARGIN_CSS, |renderer| {
+            let doc = renderer.margin_sheet.document(
+                &crate::blitz_adapter::RenderFonts::new(&[], false),
+                MARGIN_BODY,
+                400.0_f32.as_px(),
+                100.0_f32.as_px(),
+            );
+            assert!(is_shared(renderer));
+            assert_eq!(element_styles(&doc), expected);
+        });
+    }
+
+    #[test]
+    fn a_margin_stylesheet_that_imports_is_embedded_in_each_document() {
+        // Stylo's copy of an `@import` keeps the imported sheet on the lock of
+        // the template document, which the copy's document would then assert on.
+        let css = format!("@import url(other.css);{MARGIN_CSS}");
+        let fonts = crate::blitz_adapter::RenderFonts::new(&[], false);
+        let expected = element_styles(&crate::blitz_adapter::parse_and_layout_with_fonts(
+            &format!("<!DOCTYPE html><html><head><style>{css}</style></head>{MARGIN_BODY}</html>"),
+            400.0_f32.as_px(),
+            100.0_f32.as_px(),
+            &fonts,
+        ));
+        with_margin_css(&css, |renderer| {
+            let doc = renderer.margin_sheet.document(
+                &fonts,
+                MARGIN_BODY,
+                400.0_f32.as_px(),
+                100.0_f32.as_px(),
+            );
+            assert!(!is_shared(renderer));
+            assert_eq!(element_styles(&doc), expected);
+        });
+    }
+
+    #[test]
+    fn a_margin_document_without_margin_css_has_no_shared_sheet() {
+        with_margin_css(
+            "  
+",
+            |renderer| {
+                renderer.margin_sheet.document(
+                    &crate::blitz_adapter::RenderFonts::new(&[], false),
+                    MARGIN_BODY,
+                    400.0_f32.as_px(),
+                    100.0_f32.as_px(),
+                );
+                assert!(!is_shared(renderer));
+            },
         );
     }
 
