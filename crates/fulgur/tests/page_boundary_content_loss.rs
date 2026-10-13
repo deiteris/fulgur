@@ -73,13 +73,17 @@ fn assert_pagination_loses_nothing_at(
     );
 }
 
-/// A paragraph whose first line cannot fit the remaining strip must move to
-/// the next page rather than emit a fragment into a gap too small for it.
+/// No fragment of a multi-line paragraph may run past the page's content
+/// strip: the paragraph either moves to the next page or splits after the
+/// last line that fits.
 ///
-/// `fragment_inline_root`'s only split rule is "this line overflows", and
-/// its orphan guard refuses to close a first fragment shorter than
-/// `ORPHANS_MIN` — so with a 10px gap and 28px lines it accumulated and
-/// emitted a 56px two-line fragment into that 10px gap.
+/// `fragment_inline_root` used to close a fragment at the first overflowing
+/// line, and skip that split when it would leave fewer than `ORPHANS_MIN`
+/// lines in the head or `WIDOWS_MIN` in the tail. It then accumulated more
+/// lines and later accepted a split without checking that the fragment it
+/// closed still fit, so with a 10px gap and 28px lines it emitted a 56px
+/// two-line fragment into that 10px gap, and with a filler a few lines
+/// shorter it emitted a fragment up to 28px too tall.
 ///
 /// This one asserts on **geometry**, not glyph counts, because here the
 /// lost lines *are* emitted into the content stream — just painted below
@@ -91,7 +95,7 @@ fn assert_pagination_loses_nothing_at(
 /// The sweep matters: only offsets where the box actually straddles the
 /// boundary reproduce it, so a single filler value can pass by luck.
 #[test]
-fn paragraph_that_cannot_fit_its_first_line_moves_to_the_next_page() {
+fn no_fragment_of_a_split_paragraph_runs_past_the_page_strip() {
     const PAGE_H: f32 = 1690.0;
     const MARGIN_TOP: f32 = 190.0;
     const MARGIN_BOTTOM: f32 = 80.0;
@@ -101,7 +105,13 @@ fn paragraph_that_cannot_fit_its_first_line_moves_to_the_next_page() {
     const TOLERANCE: f32 = 1.0;
 
     let words = probe_words(300);
-    for filler in [0u32, 1200, 1380, 1400, 1410, 1415, 1420, 1425, 1430] {
+    // The spot checks keep the original reported offsets; the sweep covers
+    // every offset where the paragraph's first fragment is closed by the
+    // orphan / widow minimum rather than by the first overflowing line.
+    for filler in [0u32, 1200, 1380, 1400, 1410, 1415, 1420, 1425, 1430]
+        .into_iter()
+        .chain((1300..=1420).step_by(2))
+    {
         let html = format!(
             r#"<!DOCTYPE html>
 <style>
