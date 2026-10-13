@@ -12,13 +12,17 @@
 //!
 //! `blitz-html` prints `println!("ERROR: {error}")` in its `TreeSink::finish`
 //! implementation for every non-fatal html5ever parse error (unclosed tags,
-//! unexpected tokens, etc.). fulgur does *not* suppress these at the library
-//! level because doing so required manipulating process-wide fd 1, which is
-//! fundamentally racy in multi-threaded contexts. Callers that need clean
-//! stdout (notably `fulgur-cli` when rendering to stdout with `-o -`) must
-//! redirect fd 1 at their own call site where single-threaded execution is
-//! guaranteed. See `docs/plans/2026-04-11-blitz-thread-safety-investigation.md`
-//! for the full investigation and rationale.
+//! unexpected tokens, a missing doctype, etc.). fulgur does *not* suppress
+//! these at the library level because doing so required manipulating
+//! process-wide fd 1, which is fundamentally racy in multi-threaded contexts.
+//! Instead, the HTML fulgur builds itself (the page-margin box documents)
+//! is well formed and starts with a doctype, so a render of a well-formed
+//! document prints nothing. Errors in the caller's own HTML still print;
+//! callers that need clean stdout for malformed input (notably `fulgur-cli`
+//! when rendering to stdout with `-o -`) must redirect fd 1 at their own call
+//! site where single-threaded execution is guaranteed. See
+//! `docs/plans/2026-04-11-blitz-thread-safety-investigation.md` for the full
+//! investigation and rationale.
 
 use blitz_dom::DocumentConfig;
 use blitz_dom::net::Resource;
@@ -452,7 +456,9 @@ fn parse_inner(
         ..DocumentConfig::default()
     };
 
-    HtmlDocument::from_html(html, config)
+    let mut doc = HtmlDocument::from_html(html, config);
+    crate::svg_sandbox::sandbox_inline_svg(&mut doc);
+    doc
 }
 
 /// Apply a sequence of DOM passes to a parsed document.

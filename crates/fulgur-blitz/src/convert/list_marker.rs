@@ -86,7 +86,7 @@ pub(super) fn resolve_list_marker(
             })
         }
         AssetKind::Svg => {
-            let tree = usvg::Tree::from_data(data, &usvg::Options::default()).ok()?;
+            let tree = usvg::Tree::from_data(data, &crate::svg_sandbox::options()).ok()?;
             let size = tree.size();
             let intrinsic_w = size.width().as_px().in_pt();
             let intrinsic_h = size.height().as_px().in_pt();

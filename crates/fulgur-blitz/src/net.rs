@@ -200,6 +200,9 @@ impl NetProvider<Resource> for FulgurNetProvider {
         let Ok(raw_bytes) = std::fs::read(&canonical_path) else {
             return;
         };
+        // An SVG served to Blitz is parsed by usvg, which would read any
+        // file its `<image>` hrefs name; keep only `data:` references.
+        let raw_bytes = crate::svg_sandbox::sandbox_svg_bytes(&raw_bytes).unwrap_or(raw_bytes);
 
         // For CSS, hand Blitz the *cleaned* body so its style engine
         // never sees `@page` / `position: running(...)` constructs.
@@ -509,5 +512,30 @@ mod tests {
             provider.drain_gcpm_by_link_node().is_empty(),
             "a rejected fetch must not register a node-id-tagged GCPM entry either"
         );
+    }
+
+    #[test]
+    fn fetch_serves_an_svg_without_its_file_hrefs() {
+        let dir = tempfile::tempdir().unwrap();
+        let svg_path = dir.path().join("pic.svg");
+        fs::write(
+            &svg_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><image href="C:/secret.png"/></svg>"#,
+        )
+        .unwrap();
+        let provider = FulgurNetProvider::new(Some(dir.path().to_path_buf()));
+        let recorded = Arc::new(Mutex::new(None));
+        let handler = Box::new(RecordingHandler {
+            bytes: recorded.clone(),
+        });
+        provider.fetch(
+            0,
+            Request::get(Url::from_file_path(&svg_path).unwrap()),
+            handler,
+        );
+
+        let served = String::from_utf8(recorded.lock().unwrap().clone().unwrap()).unwrap();
+        assert!(!served.contains("secret.png"), "served: {served}");
+        assert!(served.contains("<image"), "served: {served}");
     }
 }

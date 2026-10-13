@@ -63,7 +63,7 @@ pub(super) fn apply_to(style: &mut BlockStyle, ctx: &StyleContext<'_>) {
                             ))
                         }
                         AssetKind::Svg => {
-                            let opts = usvg::Options::default();
+                            let opts = crate::svg_sandbox::options();
                             match usvg::Tree::from_data(data, &opts) {
                                 Ok(tree) => {
                                     let svg_size = tree.size();

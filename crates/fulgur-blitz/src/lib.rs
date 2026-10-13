@@ -333,6 +333,7 @@ pub mod paragraph;
 pub mod render;
 pub mod schema;
 pub mod svg;
+pub mod svg_sandbox;
 pub mod tagging;
 pub mod template;
 #[cfg(test)]

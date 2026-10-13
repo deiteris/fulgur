@@ -3826,7 +3826,7 @@ impl<'a> MarginBoxRenderer<'a> {
             );
             self.measure_cache.entry(measure_key).or_insert_with(|| {
                 let measure_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
+                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div style=\"display:inline-block\">{}</div></body></html>",
                     self.margin_css, html
                 );
                 let measure_doc = crate::blitz_adapter::parse_and_layout(
@@ -3861,7 +3861,7 @@ impl<'a> MarginBoxRenderer<'a> {
             );
             self.height_cache.entry(hc_key).or_insert_with(|| {
                 let measure_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
+                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\"><div>{}</div></body></html>",
                     self.margin_css, html
                 );
                 let measure_doc = crate::blitz_adapter::parse_and_layout(
@@ -3933,7 +3933,7 @@ impl<'a> MarginBoxRenderer<'a> {
             );
             if !self.render_cache.contains_key(&cache_key) {
                 let render_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
+                    "<!DOCTYPE html><html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
                     self.margin_css, html
                 );
                 let mut render_doc = crate::blitz_adapter::parse_and_layout(
