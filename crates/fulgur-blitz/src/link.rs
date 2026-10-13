@@ -55,7 +55,7 @@ pub(crate) fn clip_body_occurrences_to_content_area(
 ///
 /// `occurrences` must already be filtered to the page represented by `page`.
 /// Internal anchors that cannot be resolved in `registry` are logged via
-/// `eprintln!` and skipped; rendering continues.
+/// logged with `log::warn!` and skipped; rendering continues.
 ///
 /// When `wired_span_ptrs` is `Some`, `add_tagged_annotation` is used for
 /// occurrences whose `span_ptr` is in the set (meaning a corresponding
@@ -88,7 +88,7 @@ pub(crate) fn emit_link_annotations(
                     Target::Destination(Destination::Xyz(dest))
                 }
                 None => {
-                    eprintln!("fulgur: unresolved internal anchor #{id}");
+                    log::warn!("unresolved internal anchor #{id}");
                     continue;
                 }
             },
@@ -285,7 +285,7 @@ mod tests {
             let mut page = doc.start_page_with(page_settings());
             let registry = DestinationRegistry::new(); // "missing" is not registered
             let occ = int_occ("missing", vec![make_quad(0.0, 0.0, 50.0, 12.0)]);
-            // eprintln! log is emitted; the occurrence must be skipped entirely.
+            // a warning is logged; the occurrence must be skipped entirely.
             emit_link_annotations(&mut page, &[occ], &registry, None);
         }
         assert_eq!(page0_annotation_count(doc), 0);
