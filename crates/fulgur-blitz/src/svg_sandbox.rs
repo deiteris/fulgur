@@ -31,13 +31,12 @@ fn is_image_element(name: &str) -> bool {
     name == "image" || name == "feImage"
 }
 
-/// Whether `usvg` may be handed this `href`: a `data:` URL, or nothing.
+/// Whether `usvg` may be handed this `href`: a well-formed `data:` URL, or
+/// nothing. `usvg` reads the string as a file path when it does not parse as
+/// a data URL, so a malformed `data:` prefix (`data:/x`) is not enough.
 fn is_allowed_href(href: &str) -> bool {
     let href = href.trim_start();
-    href.is_empty()
-        || href
-            .get(..5)
-            .is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+    href.is_empty() || data_url::DataUrl::process(href).is_ok()
 }
 
 /// Remove every `href` / `xlink:href` on an `<image>` or `<feImage>` of an
@@ -183,6 +182,36 @@ mod tests {
     fn inline_svg_image_with_a_file_href_reads_nothing() {
         let (_dir, href) = file_png();
         assert_eq!(inline_svg_images(&href), 0);
+    }
+
+    #[test]
+    fn inline_svg_image_with_a_malformed_data_href_reads_nothing() {
+        assert_eq!(inline_svg_images("data:/secret.png"), 0);
+        assert!(!is_allowed_href("data:/secret.png"));
+        assert!(!is_allowed_href("data:image/png;base64"));
+        assert!(is_allowed_href(&data_url()));
+    }
+
+    #[test]
+    fn inline_svg_image_with_an_xlink_file_href_reads_nothing() {
+        let (_dir, href) = file_png();
+        let html = format!(
+            "<!DOCTYPE html><html><body><svg width=\"20\" height=\"20\"              xmlns:xlink=\"http://www.w3.org/1999/xlink\">             <image xlink:href=\"{href}\" width=\"20\" height=\"20\"/></svg></body></html>"
+        );
+        let doc = crate::blitz_adapter::parse_and_layout(
+            &html,
+            200.0_f32.as_px(),
+            200.0_f32.as_px(),
+            &[],
+            true,
+        );
+        let n: usize = doc
+            .tree()
+            .iter()
+            .filter_map(|(_, n)| n.element_data()?.svg_data())
+            .map(|t| count_images(t.root()))
+            .sum();
+        assert_eq!(n, 0);
     }
 
     #[test]
