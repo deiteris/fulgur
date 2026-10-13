@@ -136,20 +136,45 @@ impl Engine {
         // Pass 1 does NOT invoke `render_v2` — its PDF output would be
         // discarded on the 2-pass path (fulgur-6vl0). Mirrors `layout()`'s
         // 2-pass loop; the final PDF serialization happens exactly once.
-        let render_fonts = self.render_fonts();
-        let pass1 = self.layout_to_drawables(html, None, &render_fonts)?;
+        let (artifacts, anchor_map, render_fonts) = self.layout_passes(html)?;
+        self.render_artifacts(artifacts, anchor_map.as_ref(), &render_fonts)
+    }
+
+    /// Lay out `html` in one pass, or in two when it holds `target-*`
+    /// cross-references, and return the final artifacts, the pass-1
+    /// [`AnchorMap`] they were laid out with (`None` after a single pass),
+    /// and the font context of the final pass.
+    ///
+    /// Every pass gets a font context of its own, because a pass registers
+    /// the fonts its stylesheets fetch (`@font-face`) into it: sharing one
+    /// across passes would register each fetched font twice. Pass 2's
+    /// context is the one `render_v2` hands to the margin boxes.
+    fn layout_passes(
+        &self,
+        html: &str,
+    ) -> Result<(
+        LayoutArtifacts,
+        Option<AnchorMap>,
+        crate::blitz_adapter::RenderFonts,
+    )> {
+        let fonts1 = self.render_fonts();
+        let pass1 = self.layout_to_drawables(html, None, &fonts1)?;
         if !pass1.needs_pass_two {
-            return self.render_artifacts(pass1, None, &render_fonts);
+            return Ok((pass1, None, fonts1));
         }
         // Pass 2: re-lay-out with the pass-1 AnchorMap so `target-*` resolvers
-        // substitute resolved values instead of fixed-width placeholders, then
-        // serialize once.
+        // substitute resolved values instead of fixed-width placeholders.
+        // Retain only the AnchorMap: destructuring `pass1` frees its
+        // drawables, geometry, and GCPM stores before pass 2 allocates, so
+        // peak memory stays single-pass-sized.
         let LayoutArtifacts {
             collected_anchor_map: anchor_map,
             ..
         } = pass1;
-        let pass2 = self.layout_to_drawables(html, Some(&anchor_map), &render_fonts)?;
-        self.render_artifacts(pass2, Some(&anchor_map), &render_fonts)
+        drop(fonts1);
+        let fonts2 = self.render_fonts();
+        let pass2 = self.layout_to_drawables(html, Some(&anchor_map), &fonts2)?;
+        Ok((pass2, Some(anchor_map), fonts2))
     }
 
     /// Run the full parse → style → layout → convert pipeline for a single
@@ -852,26 +877,8 @@ impl Engine {
     /// rasterizer or OCR-label generator can consume [`LayoutOutput`] without
     /// pulling PDF serialization into core.
     pub fn layout(&self, html: &str) -> Result<LayoutOutput> {
-        // Mirror `render`'s 2-pass loop: pass 1 always runs; when it reports
-        // `target-*` cross-references, pass 2 re-lays-out with the pass-1
-        // AnchorMap so those resolve. Project the final artifacts once.
-        let render_fonts = self.render_fonts();
-        let pass1 = self.layout_to_drawables(html, None, &render_fonts)?;
-        let artifacts = if pass1.needs_pass_two {
-            // Retain only the AnchorMap across passes (as `render`'s loop
-            // does — its pass-1 drawables/geometry are dropped when only
-            // `collected_anchor_map` is destructured out). Destructure
-            // `pass1` so its drawables, geometry, and GCPM stores are freed
-            // before pass 2 allocates, keeping peak memory single-pass-sized
-            // for large raster/OCR inputs.
-            let LayoutArtifacts {
-                collected_anchor_map,
-                ..
-            } = pass1;
-            self.layout_to_drawables(html, Some(&collected_anchor_map), &render_fonts)?
-        } else {
-            pass1
-        };
+        // The same 2-pass loop as `render`; project the final artifacts once.
+        let (artifacts, _, _) = self.layout_passes(html)?;
         Ok(LayoutOutput {
             drawables: artifacts.drawables,
             geometry: artifacts.pagination_geometry,
