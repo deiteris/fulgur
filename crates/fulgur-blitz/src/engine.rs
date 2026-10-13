@@ -57,8 +57,8 @@ pub struct LayoutOutput {
 
 /// Full per-pass output of [`Engine::layout_to_drawables`] — a superset of the
 /// public [`LayoutOutput`] holding every side-channel `render::render_v2`
-/// needs. `fonts` / `system_fonts` are intentionally absent: both are re-derived
-/// from `&self` at the render call site, byte-identically to the old inline path.
+/// needs. The font context is intentionally absent: the caller owns the one
+/// context of the render and hands it to both layout and serialization.
 struct LayoutArtifacts {
     drawables: crate::drawables::Drawables,
     pagination_geometry: crate::pagination_layout::PaginationGeometryTable,
@@ -108,6 +108,11 @@ impl Engine {
             .unwrap_or(&[])
     }
 
+    /// The font context of one render, shared by every document it parses.
+    fn render_fonts(&self) -> crate::blitz_adapter::RenderFonts {
+        crate::blitz_adapter::RenderFonts::new(self.fonts(), self.system_fonts)
+    }
+
     /// Render HTML string to PDF bytes.
     /// If an AssetBundle is set, its CSS will be injected as a <style> block.
     /// When GCPM constructs (margin boxes, running elements) are detected in the CSS,
@@ -131,9 +136,10 @@ impl Engine {
         // Pass 1 does NOT invoke `render_v2` — its PDF output would be
         // discarded on the 2-pass path (fulgur-6vl0). Mirrors `layout()`'s
         // 2-pass loop; the final PDF serialization happens exactly once.
-        let pass1 = self.layout_to_drawables(html, None)?;
+        let render_fonts = self.render_fonts();
+        let pass1 = self.layout_to_drawables(html, None, &render_fonts)?;
         if !pass1.needs_pass_two {
-            return self.render_artifacts(pass1, None);
+            return self.render_artifacts(pass1, None, &render_fonts);
         }
         // Pass 2: re-lay-out with the pass-1 AnchorMap so `target-*` resolvers
         // substitute resolved values instead of fixed-width placeholders, then
@@ -142,8 +148,8 @@ impl Engine {
             collected_anchor_map: anchor_map,
             ..
         } = pass1;
-        let pass2 = self.layout_to_drawables(html, Some(&anchor_map))?;
-        self.render_artifacts(pass2, Some(&anchor_map))
+        let pass2 = self.layout_to_drawables(html, Some(&anchor_map), &render_fonts)?;
+        self.render_artifacts(pass2, Some(&anchor_map), &render_fonts)
     }
 
     /// Run the full parse → style → layout → convert pipeline for a single
@@ -166,6 +172,7 @@ impl Engine {
         &self,
         html: &str,
         anchor_map: Option<&AnchorMap>,
+        render_fonts: &crate::blitz_adapter::RenderFonts,
     ) -> Result<LayoutArtifacts> {
         // Reject non-finite/non-positive page size or margin values before
         // they reach Blitz parsing below — an unvalidated f32 here can
@@ -201,12 +208,11 @@ impl Engine {
         // default browser styles even though their content resolved
         // correctly.
         let (mut doc, link_gcpm, link_column_css, link_gcpm_by_node) =
-            crate::blitz_adapter::parse_html_with_local_resources_with_link_nodes(
+            crate::blitz_adapter::parse_html_with_local_resources_and_fonts(
                 &html,
                 self.config.content_width().as_pt().in_px().to_f32(),
                 self.config.page_height().as_pt().in_px().to_f32() as u32,
-                fonts,
-                self.system_fonts,
+                render_fonts,
                 self.base_path.as_deref(),
             );
         gcpm.extend_from(link_gcpm);
@@ -767,6 +773,7 @@ impl Engine {
         &self,
         artifacts: LayoutArtifacts,
         anchor_map: Option<&AnchorMap>,
+        render_fonts: &crate::blitz_adapter::RenderFonts,
     ) -> Result<Vec<u8>> {
         let LayoutArtifacts {
             drawables,
@@ -805,18 +812,13 @@ impl Engine {
             ));
         }
 
-        // Re-derive fonts / system_fonts from `&self` — byte-identical to the
-        // value `layout_to_drawables` used for parsing.
-        let fonts = self.fonts();
-
         crate::render::render_v2(
             &config,
             &pagination_geometry,
             &drawables,
             &gcpm,
             &running_store,
-            fonts,
-            self.system_fonts,
+            render_fonts,
             &string_set_for_render,
             &counter_ops_for_render,
             html_title,
@@ -853,7 +855,8 @@ impl Engine {
         // Mirror `render`'s 2-pass loop: pass 1 always runs; when it reports
         // `target-*` cross-references, pass 2 re-lays-out with the pass-1
         // AnchorMap so those resolve. Project the final artifacts once.
-        let pass1 = self.layout_to_drawables(html, None)?;
+        let render_fonts = self.render_fonts();
+        let pass1 = self.layout_to_drawables(html, None, &render_fonts)?;
         let artifacts = if pass1.needs_pass_two {
             // Retain only the AnchorMap across passes (as `render`'s loop
             // does — its pass-1 drawables/geometry are dropped when only
@@ -865,7 +868,7 @@ impl Engine {
                 collected_anchor_map,
                 ..
             } = pass1;
-            self.layout_to_drawables(html, Some(&collected_anchor_map))?
+            self.layout_to_drawables(html, Some(&collected_anchor_map), &render_fonts)?
         } else {
             pass1
         };
