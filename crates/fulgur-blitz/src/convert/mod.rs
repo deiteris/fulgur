@@ -134,6 +134,8 @@ pub struct ConvertContext<'a> {
 
 impl ConvertContext<'_> {
     /// Return a shared Arc for the given font data, caching by data pointer + index.
+    /// A pointer miss falls back to [`intern_font`], so a font that another
+    /// document already copied is not copied again.
     ///
     /// Safety assumption: Parley font data pointers remain stable for the lifetime of
     /// this ConvertContext (scoped to a single `dom_to_drawables` call). HashMap is used
@@ -144,9 +146,55 @@ impl ConvertContext<'_> {
         Arc::clone(
             self.font_cache
                 .entry(key)
-                .or_insert_with(|| Arc::new(font.data.data().to_vec())),
+                .or_insert_with(|| intern_font(font.data.data(), font.index)),
         )
     }
+}
+
+/// Key of the intern table: font length, face index, and a hash of the
+/// first and last 4 KiB. Cheap to compute; equality is confirmed byte for
+/// byte before two fonts share a copy.
+type InternKey = (usize, u32, u64);
+
+/// Live copies that share an [`InternKey`], normally one.
+type InternTable = HashMap<InternKey, Vec<std::sync::Weak<Vec<u8>>>>;
+
+/// One shared copy of each distinct font's bytes across documents.
+///
+/// Every document Blitz parses (a margin box is parsed once per distinct
+/// content, so a page-number footer parses on every page) loads the font
+/// files at its own address. The per-context pointer cache in
+/// [`ConvertContext::get_or_insert_font`] therefore misses for each document,
+/// and without this each page kept a private ~1 MB copy of every font it used
+/// until the PDF was finished. The table holds `Weak` references, so a font
+/// is freed with its last user.
+fn intern_font(bytes: &[u8], index: u32) -> Arc<Vec<u8>> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock, Weak};
+    static INTERNED: OnceLock<Mutex<InternTable>> = OnceLock::new();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes[..bytes.len().min(4096)].hash(&mut hasher);
+    bytes[bytes.len().saturating_sub(4096)..].hash(&mut hasher);
+    let key = (bytes.len(), index, hasher.finish());
+
+    // The table only caches; a panic elsewhere cannot leave it inconsistent.
+    let mut table = INTERNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let candidates = table.entry(key).or_default();
+    candidates.retain(|weak| weak.strong_count() > 0);
+    if let Some(shared) = candidates
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|candidate| candidate.as_slice() == bytes)
+    {
+        return shared;
+    }
+    let copy = Arc::new(bytes.to_vec());
+    candidates.push(Arc::downgrade(&copy));
+    copy
 }
 
 /// Phase 4 (fulgur-9t3z) + PR 8i: convert a resolved Blitz document into a
@@ -2288,6 +2336,80 @@ mod edge_case_tests {
             bad_block_ids.is_empty(),
             "whitespace-only id must not be stored in block entries; found {}",
             bad_block_ids.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod font_sharing_tests {
+    //! Documents parsed separately (each margin box of each page is one)
+    //! load the same font file at different addresses, so the converter's
+    //! per-context pointer cache misses. Equal font bytes must still end up
+    //! as one `Arc` across those documents.
+
+    use crate::drawables::Drawables;
+    use crate::paragraph::LineItem;
+    use crate::units::F32Units;
+    use std::ops::DerefMut;
+    use std::sync::Arc;
+
+    /// Parse `html` against a fresh copy of the bundled font and convert it
+    /// with its own `ConvertContext`, as the margin-box renderer does.
+    fn convert_with_own_context(html: &str) -> Drawables {
+        let font = Arc::new(crate::test_fonts::noto_sans_regular_ttf().as_ref().clone());
+        let mut doc = crate::blitz_adapter::parse_and_layout(
+            html,
+            200.0_f32.as_px(),
+            100.0_f32.as_px(),
+            &[font],
+            false,
+        );
+        let column_styles = crate::blitz_adapter::extract_column_style_table(&doc, &[]);
+        let multicol_geometry = crate::multicol_layout::run_pass(doc.deref_mut(), &column_styles);
+        let pagination_geometry = crate::pagination_layout::run_pass(doc.deref_mut(), 100.0);
+        let running_store = crate::gcpm::running::RunningElementStore::new();
+        let mut ctx = super::ConvertContext {
+            running_store: &running_store,
+            assets: None,
+            font_cache: Default::default(),
+            string_set_by_node: Default::default(),
+            counter_ops_by_node: Default::default(),
+            bookmark_by_node: Default::default(),
+            column_styles,
+            multicol_geometry,
+            pagination_geometry,
+            link_cache: Default::default(),
+            viewport_size_px: None,
+        };
+        super::dom_to_drawables(&doc, &mut ctx)
+    }
+
+    fn page_html(text: &str) -> String {
+        format!(
+            "<!DOCTYPE html><html><body style=\"margin:0;font-family:'Noto Sans'\"><p>{text}</p></body></html>"
+        )
+    }
+
+    fn first_glyph_run_font(drawables: &Drawables) -> Arc<Vec<u8>> {
+        drawables
+            .paragraphs
+            .values()
+            .flat_map(|p| p.lines.iter())
+            .flat_map(|l| l.items.iter())
+            .find_map(|item| match item {
+                LineItem::Text(run) => Some(Arc::clone(&run.font_data)),
+                _ => None,
+            })
+            .expect("the document has a text run")
+    }
+
+    #[test]
+    fn equal_font_bytes_in_separately_converted_documents_share_one_arc() {
+        let first = first_glyph_run_font(&convert_with_own_context(&page_html("Page 1")));
+        let second = first_glyph_run_font(&convert_with_own_context(&page_html("Page 2")));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each document kept its own copy of the same font"
         );
     }
 }
