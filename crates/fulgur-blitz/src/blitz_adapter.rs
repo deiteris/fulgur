@@ -182,6 +182,127 @@ pub(crate) fn parse_and_layout_with_fonts(
     doc
 }
 
+/// [`parse_and_layout_with_fonts`] for a document whose only author
+/// stylesheet is `sheet`: the document's `<style>` element is empty, and the
+/// stylesheet is attached to it before styles resolve. With `None` the
+/// document carries its own stylesheet text, as parsed.
+pub(crate) fn parse_and_layout_with_sheet(
+    sheet: Option<&SharedSheet>,
+    html: &str,
+    viewport_width: crate::units::Px,
+    viewport_height: crate::units::Px,
+    fonts: &RenderFonts,
+) -> HtmlDocument {
+    let mut doc = parse_inner(
+        html,
+        viewport_width.to_f32(),
+        viewport_height.to_f32() as u32,
+        fonts,
+        None,
+        None,
+    );
+    if let Some(sheet) = sheet {
+        sheet.attach_to(&mut doc);
+    }
+    resolve(&mut doc);
+    relayout_position_fixed(&mut doc, viewport_width.to_f32(), viewport_height.to_f32());
+    doc
+}
+
+/// One stylesheet parsed once and handed to many documents.
+///
+/// A margin box is a small document of its own, and a render builds one per
+/// distinct margin-box content: a page-number footer differs on every page.
+/// Embedding the margin stylesheet in each would have stylo parse it again
+/// every time, and that parse outweighs everything else a margin box costs.
+///
+/// Stylo reads a parsed rule only with the lock of the document that owns it
+/// and asserts otherwise, so the parsed sheet cannot be shared as it is.
+/// [`attach_to`](Self::attach_to) instead copies the parsed rules onto the
+/// lock of the document, without parsing the text again.
+///
+/// The sheet is parsed in a document of its own, kept for the lock its rules
+/// belong to, under the base URL every margin-box document has, so a `url()`
+/// resolves to what it would in each of them.
+pub(crate) struct SharedSheet {
+    template: HtmlDocument,
+    sheet: style::stylesheets::DocumentStyleSheet,
+}
+
+/// The first `<style>` element of `doc`, in document order.
+fn first_style_node(doc: &HtmlDocument) -> Option<usize> {
+    doc.tree()
+        .iter()
+        .find(|(_, node)| {
+            node.element_data()
+                .is_some_and(|el| el.name.local.as_ref() == "style")
+        })
+        .map(|(id, _)| id)
+}
+
+impl SharedSheet {
+    /// Parse `css` once. `None` when there is nothing to share: the text is
+    /// blank, Blitz kept no stylesheet for it, or the sheet has an `@import`.
+    pub(crate) fn parse(css: &str, fonts: &RenderFonts) -> Option<Self> {
+        if css.trim().is_empty() {
+            return None;
+        }
+        let html =
+            format!("<!DOCTYPE html><html><head><style>{css}</style></head><body></body></html>");
+        let template = parse_inner(&html, 100.0, 100, fonts, None, None);
+        let id = first_style_node(&template)?;
+        let blitz_dom::node::SpecialElementData::Stylesheet(sheet) =
+            &template.get_node(id)?.element_data()?.special_data
+        else {
+            return None;
+        };
+        let sheet = sheet.clone();
+        // Stylo's copy of an `@import` keeps the imported sheet, and with it
+        // the lock of this document, so a sheet that imports cannot be
+        // re-homed. Its documents embed the text instead.
+        let guard = sheet.0.shared_lock.read();
+        if sheet
+            .0
+            .contents
+            .rules(&guard)
+            .iter()
+            .any(|rule| matches!(rule, style::stylesheets::CssRule::Import(_)))
+        {
+            return None;
+        }
+        drop(guard);
+        Some(Self { template, sheet })
+    }
+
+    /// Replace the stylesheet of the first `<style>` element of `doc` with a
+    /// copy of this one on the lock of `doc`. Taking the place of the
+    /// element's own stylesheet, the copy sits in the cascade where the
+    /// embedded text would: after the user-agent sheet, before any later
+    /// `<style>` element, and below `style` attributes.
+    fn attach_to(&self, doc: &mut HtmlDocument) {
+        use style::servo_arc::Arc as ServoArc;
+        use style::shared_lock::DeepCloneWithLock;
+        let Some(id) = first_style_node(doc) else {
+            return;
+        };
+        let lock = doc.guard().clone();
+        let source = &self.sheet.0;
+        let contents = source
+            .contents
+            .deep_clone_with_lock(&lock, &self.template.guard().read());
+        let sheet = style::stylesheets::Stylesheet {
+            contents: ServoArc::new(contents),
+            shared_lock: lock.clone(),
+            media: ServoArc::new(lock.wrap(style::media_queries::MediaList::empty())),
+            disabled: std::sync::atomic::AtomicBool::new(false),
+        };
+        doc.add_stylesheet_for_node(
+            style::stylesheets::DocumentStyleSheet(ServoArc::new(sheet)),
+            id,
+        );
+    }
+}
+
 /// The fonts of one render: the system fonts, when allowed, and the fonts
 /// bundled with the engine.
 ///
@@ -582,7 +703,28 @@ fn parse_inner(
 
     let mut doc = HtmlDocument::from_html(html, config);
     crate::svg_sandbox::sandbox_inline_svg(&mut doc);
+    #[cfg(test)]
+    STYLE_TEXT_PARSES.with(|n| n.set(n.get() + count_style_elements_with_text(&doc)));
     doc
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `<style>` elements with text [`parse_inner`] has parsed on
+    /// this thread: stylo parses that text once per element.
+    pub(crate) static STYLE_TEXT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_style_elements_with_text(doc: &HtmlDocument) -> usize {
+    doc.tree()
+        .iter()
+        .filter(|(_, node)| {
+            node.element_data()
+                .is_some_and(|el| el.name.local.as_ref() == "style")
+                && !node.text_content().trim().is_empty()
+        })
+        .count()
 }
 
 /// Apply a sequence of DOM passes to a parsed document.
