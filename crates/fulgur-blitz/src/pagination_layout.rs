@@ -4599,6 +4599,7 @@ fn record_subtree_fragments_at_offset(
                 };
                 let entry = geometry.entry(node_id).or_default();
                 entry.fragments.clear();
+                entry.line_boundaries.clear();
                 entry.is_repeat = false;
                 for page_index in first_page..=last_page {
                     // Aggregate budget: each node emits one fragment per
@@ -10133,6 +10134,42 @@ h2 { string-set: chapter-title content(text); }
             "position:absolute child must be recursively walked and appear in geometry; \
              geom keys={:?}",
             geom.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The abs walk replaces a node's fragments; a line partition left from an
+    /// earlier producer would index fragments that no longer exist, and with
+    /// an equal fragment count it would pass the consumer's length check.
+    #[test]
+    fn record_subtree_walk_drops_the_line_partition_of_the_fragments_it_replaces() {
+        let html = r#"
+            <html><body style="margin: 0">
+              <div id="abs_root" style="position: absolute; top: 0; left: 0; width: 200px; height: 2000px"></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let abs_id = find_by_id(doc.deref_mut(), "abs_root").expect("abs_root");
+        let mut geom = PaginationGeometryTable::new();
+        geom.entry(abs_id).or_default().line_boundaries = vec![0, 2, 4, 6];
+        super::record_subtree_fragments_at_offset(
+            &mut geom,
+            doc.deref_mut(),
+            abs_id,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            800.0,
+            800.0,
+            3,
+            false,
+            &mut 0,
+            None,
+        );
+        let entry = &geom[&abs_id];
+        assert_eq!(entry.fragments.len(), 3, "one fragment per page spanned");
+        assert!(
+            entry.line_boundaries.is_empty(),
+            "stale partition survived: {:?}",
+            entry.line_boundaries
         );
     }
 
