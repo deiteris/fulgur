@@ -5,11 +5,23 @@ use std::rc::Rc;
 use crate::{
     MAX_PDF_CONTENT_BYTES, MAX_PDF_FONT_NAME_BYTES, MAX_PDF_GS_STACK_DEPTH,
     MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES, MAX_PDF_INSPECT_ITEMS, MAX_PDF_INSPECT_OPERATIONS,
-    MAX_PDF_INSPECT_TEXT_BYTES, MAX_PDF_METADATA_FIELD_BYTES, MAX_PDF_PARENT_DEPTH,
-    PDF_CONTENT_STREAM_COST_FLOOR_BYTES,
+    MAX_PDF_INSPECT_TEXT_BYTES, MAX_PDF_LOAD_STREAM_BYTES, MAX_PDF_METADATA_FIELD_BYTES,
+    MAX_PDF_PARENT_DEPTH, PDF_CONTENT_STREAM_COST_FLOOR_BYTES,
 };
 
 const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Per-filter-stage output bound for decoding one content stream.
+///
+/// `lopdf` checks its size limit after *every* filter stage, and for Flate
+/// before the predictor runs, so a stream whose final output fits in a page can
+/// still pass through a larger intermediate: `/ASCIIHexDecode` doubles its
+/// input, and a PNG predictor adds a tag byte per row. Bounding each stage at
+/// [`MAX_PDF_CONTENT_BYTES`] itself would skip such pages; a few times that
+/// leaves room for those expansions while still stopping a decompression bomb
+/// long before it inflates in full. Whether the final output fits in a page is
+/// decided separately, against [`MAX_PDF_CONTENT_BYTES`].
+const PDF_CONTENT_DECODE_LIMIT_BYTES: usize = 4 * MAX_PDF_CONTENT_BYTES;
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct InspectResult {
@@ -68,6 +80,8 @@ pub struct ImageItem {
 /// [`Default`] is the production configuration; nothing outside tests
 /// constructs it any other way.
 struct InspectLimits {
+    /// See [`MAX_PDF_LOAD_STREAM_BYTES`].
+    load_stream_bytes: usize,
     /// See [`MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES`].
     content_total_bytes: usize,
     /// See [`MAX_PDF_INSPECT_OPERATIONS`].
@@ -81,6 +95,7 @@ struct InspectLimits {
 impl Default for InspectLimits {
     fn default() -> Self {
         Self {
+            load_stream_bytes: MAX_PDF_LOAD_STREAM_BYTES,
             content_total_bytes: MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES,
             operations: MAX_PDF_INSPECT_OPERATIONS,
             text_bytes: MAX_PDF_INSPECT_TEXT_BYTES,
@@ -90,17 +105,23 @@ impl Default for InspectLimits {
 }
 
 pub fn inspect(path: &Path) -> crate::Result<InspectResult> {
-    let doc = lopdf::Document::load(path)
-        .map_err(|e| crate::Error::Other(format!("Failed to load PDF: {e}")))?;
+    inspect_with_limits(path, &InspectLimits::default())
+}
 
-    let limits = InspectLimits::default();
+fn inspect_with_limits(path: &Path, limits: &InspectLimits) -> crate::Result<InspectResult> {
+    let doc = lopdf::Document::load_with_options(
+        path,
+        lopdf::LoadOptions::with_max_decompressed_size(limits.load_stream_bytes),
+    )
+    .map_err(|e| crate::Error::Other(format!("Failed to load PDF: {e}")))?;
+
     // `get_pages()` is `page_iter().enumerate().collect()`, so counting straight
     // off the iterator is the same walk without materialising a `BTreeMap` whose
     // size is bounded only by the document's object count.
     let pages = doc.page_iter().count() as u32;
     let metadata = extract_metadata(&doc);
-    let text_items = extract_text_items(&doc, &limits)?;
-    let images = extract_image_items(&doc, &limits)?;
+    let text_items = extract_text_items(&doc, limits)?;
+    let images = extract_image_items(&doc, limits)?;
 
     Ok(InspectResult {
         pages,
@@ -198,8 +219,10 @@ fn canonical_object_id_within(
 /// stream shared by several pages — directly or through aliases — is decoded
 /// once. Retained bytes are bounded by the same
 /// [`MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES`] budget that charges each distinct
-/// stream as it is decoded.
-type DecodedStreams = std::collections::BTreeMap<lopdf::ObjectId, Rc<Vec<u8>>>;
+/// stream as it is decoded. `None` marks a stream whose decoded size reaches
+/// [`MAX_PDF_CONTENT_BYTES`], so every page referencing it is skipped without
+/// decoding it again.
+type DecodedStreams = std::collections::BTreeMap<lopdf::ObjectId, Option<Rc<Vec<u8>>>>;
 
 /// Outcome of gathering one page's content, which distinguishes "skip this
 /// page" from "stop walking pages".
@@ -244,15 +267,22 @@ enum PageContent {
 /// only usable pages would leave the aggregate unbounded, since a page can be
 /// made to decode a full per-page allowance and then be rejected.
 ///
-/// `decoded_cache` holds each content stream's decoded bytes, so a stream shared
-/// by many pages is decoded once. That matters beyond the saved time: a stream's
-/// *intermediate* filter output is invisible from here — `/Filter [/FlateDecode
-/// /ASCII85Decode]` can expand a small payload into megabytes of whitespace that
-/// the second stage reduces to nothing, leaving both the encoded and decoded
-/// lengths small — so no charge computed from those two lengths can bound
-/// repeated decoding of it. Decoding each stream once reduces that to a single
-/// occurrence per document, which is the same residual as a single oversized
-/// stream (see [`MAX_PDF_CONTENT_BYTES`]).
+/// Each stream is decoded with every filter stage's output bounded to
+/// [`PDF_CONTENT_DECODE_LIMIT_BYTES`], so neither the result nor an
+/// intermediate stage is inflated in full before its size is known. A stream
+/// whose decoded bytes (or raw fallback bytes) reach [`MAX_PDF_CONTENT_BYTES`]
+/// could never fit in a page, so it is recorded as oversized, charged for the
+/// output it produced, and the page is skipped.
+///
+/// `decoded_cache` holds each content stream's decoded bytes (or its oversized
+/// marker), so a stream shared by many pages is decoded once. That matters
+/// beyond the saved time: a stream's *intermediate* filter output is invisible
+/// from here — `/Filter [/FlateDecode /ASCII85Decode]` can expand a small
+/// payload into up to a page's worth of whitespace that the second stage
+/// reduces to nothing, leaving both the encoded and decoded lengths small — so
+/// no charge computed from those two lengths can bound repeated decoding of it.
+/// Decoding each stream once reduces that to a single bounded occurrence per
+/// document.
 ///
 /// Charges split accordingly: filter work once per distinct stream, and the copy
 /// into the page's content on every reference to it.
@@ -281,16 +311,40 @@ fn gather_page_content(
         let bytes: Rc<Vec<u8>> = match decoded_cache.get(&object_id) {
             // Decoded already for an earlier page: no filter work to charge, only
             // the copy into `content` below.
-            Some(cached) => Rc::clone(cached),
+            Some(Some(cached)) => Rc::clone(cached),
+            // Already known to exceed the per-page bound on its own.
+            Some(None) => return PageContent::Skip,
             None => {
                 let Ok(stream) = doc.get_object(object_id).and_then(lopdf::Object::as_stream)
                 else {
                     continue;
                 };
-                let decoded = match stream.decompressed_content() {
-                    Ok(d) => d,
-                    Err(_) => stream.content.clone(),
-                };
+                // `Err` carries how many bytes were produced for a stream found
+                // too large to use.
+                let decoded: Result<Vec<u8>, usize> =
+                    match stream.decompressed_content_with_limit(PDF_CONTENT_DECODE_LIMIT_BYTES) {
+                        Ok(d) => Ok(d),
+                        Err(lopdf::Error::Decompress(
+                            lopdf::DecompressError::MemoryLimitExceeded { .. },
+                        )) => Err(PDF_CONTENT_DECODE_LIMIT_BYTES + 1),
+                        // Any other decode failure falls back to the raw bytes, as
+                        // `lopdf::Document::get_page_content` does — unless they
+                        // could not fit in a page anyway, in which case they are
+                        // not copied at all.
+                        Err(_) if stream.content.len() >= MAX_PDF_CONTENT_BYTES => {
+                            Err(stream.content.len())
+                        }
+                        Err(_) => Ok(stream.content.clone()),
+                    };
+                // A stream of at least the per-page bound fails the page check
+                // below on every reference, so it is not worth keeping.
+                let decoded = decoded.and_then(|d| {
+                    if d.len() >= MAX_PDF_CONTENT_BYTES {
+                        Err(d.len())
+                    } else {
+                        Ok(d)
+                    }
+                });
                 // Filter work, charged once per distinct stream: the encoded
                 // length, because a filter reads every one of those bytes even
                 // when it yields nothing — `/ASCII85Decode` over a megabyte of
@@ -298,11 +352,23 @@ fn gather_page_content(
                 let encoded = stream.content.len();
                 *doc_budget = doc_budget
                     .saturating_sub(encoded.saturating_sub(PDF_CONTENT_STREAM_COST_FLOOR_BYTES));
-                let cached = Rc::new(decoded);
-                decoded_cache.insert(object_id, Rc::clone(&cached));
+                let entry = match decoded {
+                    Ok(d) => Some(Rc::new(d)),
+                    Err(produced) => {
+                        // An oversized stream is never copied into a page, but
+                        // producing its output was real work: charge it here, once,
+                        // so skipped pages still pay for what decoding them cost.
+                        *doc_budget = doc_budget.saturating_sub(produced);
+                        None
+                    }
+                };
+                decoded_cache.insert(object_id, entry.clone());
                 if *doc_budget == 0 {
                     return PageContent::Exhausted;
                 }
+                let Some(cached) = entry else {
+                    return PageContent::Skip;
+                };
                 cached
             }
         };
@@ -3288,6 +3354,152 @@ mod tests {
         assert_eq!(budget, 0);
     }
 
+    /// A compressed content stream that would decode past the per-page bound is
+    /// rejected by a bounded decode, recorded as oversized in the cache, and
+    /// every page that references it is skipped without decoding it again.
+    #[test]
+    fn oversized_compressed_stream_is_skipped_and_cached_as_oversized() {
+        // A few kilobytes of Flate data that inflate past the per-page bound.
+        let payload = vec![b' '; PDF_CONTENT_DECODE_LIMIT_BYTES * 2];
+        let pdf = make_pdf_with_shared_content_stream(2, payload, false);
+        let mut doc = lopdf::Document::load_mem(&pdf).unwrap();
+        let pages: Vec<_> = doc.get_pages().into_values().collect();
+        let stream_id = doc.get_page_contents(pages[0])[0];
+        let stream = doc
+            .get_object_mut(stream_id)
+            .and_then(lopdf::Object::as_stream_mut)
+            .unwrap();
+        stream.compress().unwrap();
+        let encoded = stream.content.len();
+        assert!(
+            encoded < MAX_PDF_CONTENT_BYTES / 64,
+            "test relies on the stream compressing well, got {encoded} bytes"
+        );
+
+        let start = MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES;
+        let mut budget = start;
+        let mut cache = DecodedStreams::new();
+        assert!(matches!(
+            gather_page_content(&doc, pages[0], &mut budget, &mut cache),
+            PageContent::Skip
+        ));
+        assert_eq!(cache.get(&stream_id), Some(&None));
+        // Charged the floor, the filter work and the output decoded before the
+        // stream was rejected, but never the full inflated size.
+        assert_eq!(
+            start - budget,
+            encoded.max(PDF_CONTENT_STREAM_COST_FLOOR_BYTES) + PDF_CONTENT_DECODE_LIMIT_BYTES + 1
+        );
+
+        // The second page hits the oversized marker and pays only the floor.
+        let before = budget;
+        assert!(matches!(
+            gather_page_content(&doc, pages[1], &mut budget, &mut cache),
+            PageContent::Skip
+        ));
+        assert_eq!(before - budget, PDF_CONTENT_STREAM_COST_FLOOR_BYTES);
+    }
+
+    /// A filter chain whose intermediate stage is larger than a page, but whose
+    /// final output fits, is still decoded: the per-stage decode bound leaves
+    /// room for `/ASCIIHexDecode`'s doubling.
+    #[test]
+    fn hex_chain_with_intermediate_over_page_bound_still_decodes() {
+        let mut payload = b"BT /F1 12 Tf 1 0 0 1 10 800 Tm (Hex) Tj ET\n".to_vec();
+        payload.resize(MAX_PDF_CONTENT_BYTES * 3 / 4, b' ');
+        let hex: Vec<u8> = payload
+            .iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .chain(*b">")
+            .collect();
+        assert!(hex.len() > MAX_PDF_CONTENT_BYTES);
+
+        let pdf = make_pdf_with_shared_content_stream(1, hex, false);
+        let mut doc = lopdf::Document::load_mem(&pdf).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let stream_id = doc.get_page_contents(page)[0];
+        let stream = doc
+            .get_object_mut(stream_id)
+            .and_then(lopdf::Object::as_stream_mut)
+            .unwrap();
+        stream.compress().unwrap();
+        stream.dict.set(
+            "Filter",
+            vec![
+                lopdf::Object::Name(b"FlateDecode".to_vec()),
+                lopdf::Object::Name(b"ASCIIHexDecode".to_vec()),
+            ],
+        );
+
+        let mut budget = MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES;
+        let PageContent::Ready(content) =
+            gather_page_content(&doc, page, &mut budget, &mut DecodedStreams::new())
+        else {
+            panic!("the page must be decoded");
+        };
+        assert_eq!(content.len(), payload.len() + 1);
+        assert!(content.starts_with(b"BT /F1 12 Tf"));
+    }
+
+    /// When decoding fails and the raw fallback bytes could not fit in a page,
+    /// the stream is recorded as oversized instead of being copied.
+    #[test]
+    fn undecodable_stream_over_page_bound_is_not_copied() {
+        let pdf = make_pdf_with_shared_content_stream(1, vec![b' '; MAX_PDF_CONTENT_BYTES], false);
+        let mut doc = lopdf::Document::load_mem(&pdf).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let stream_id = doc.get_page_contents(page)[0];
+        doc.get_object_mut(stream_id)
+            .and_then(lopdf::Object::as_stream_mut)
+            .unwrap()
+            .dict
+            .set("Filter", "Crypt");
+
+        let mut budget = MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES;
+        let mut cache = DecodedStreams::new();
+        assert!(matches!(
+            gather_page_content(&doc, page, &mut budget, &mut cache),
+            PageContent::Skip
+        ));
+        assert_eq!(cache.get(&stream_id), Some(&None));
+    }
+
+    /// The load-time stream bound reaches `lopdf`: an object stream over it is
+    /// dropped while loading, so the objects it holds no longer resolve.
+    #[test]
+    fn load_stream_bound_drops_oversized_object_streams() {
+        let pdf = make_pdf_with_shared_content_stream(
+            1,
+            b"BT /F1 12 Tf 1 0 0 1 10 800 Tm (ObjStm) Tj ET".to_vec(),
+            false,
+        );
+        let mut doc = lopdf::Document::load_mem(&pdf).unwrap();
+        let mut buf = Vec::new();
+        doc.save_with_options(
+            &mut buf,
+            lopdf::SaveOptions::builder()
+                .use_object_streams(true)
+                .build(),
+        )
+        .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &buf).unwrap();
+
+        let full = inspect_with_limits(tmp.path(), &InspectLimits::default()).unwrap();
+        assert_eq!(full.pages, 1);
+        assert_eq!(full.text_items.len(), 1);
+
+        let tiny = InspectLimits {
+            load_stream_bytes: 16,
+            ..InspectLimits::default()
+        };
+        // The page tree lives in the dropped object stream, so no page resolves;
+        // the load itself still succeeds.
+        let bounded = inspect_with_limits(tmp.path(), &tiny).unwrap();
+        assert_eq!(bounded.pages, 0);
+        assert!(bounded.text_items.is_empty());
+    }
+
     /// A `/Contents` entry that does not resolve to a stream object is skipped
     /// individually; it must not abandon the rest of the page, matching how
     /// `lopdf::Document::get_page_content` treats the same input.
@@ -3604,5 +3816,101 @@ mod tests {
         let (x, y) = transform_point(&m, 3.0, 4.0);
         assert!((x - 6.0).abs() < 1e-5, "x {x}");
         assert!((y - 8.0).abs() < 1e-5, "y {y}");
+    }
+
+    // --- Tj operator edge cases ---
+
+    /// `Tj` にホワイトスペースのみの文字列を渡した場合、TextItem は生成されない（line 567 false branch）。
+    #[test]
+    fn tj_whitespace_only_string_produces_no_item() {
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm (   ) Tj ET\n".to_vec();
+        let result = inspect_bytes(&make_pdf_with_raw_content(content));
+        assert!(
+            result.text_items.is_empty(),
+            "Tj with whitespace-only string must produce no text items"
+        );
+    }
+
+    /// `Tj` にオペランドが0個のとき、演算子はスキップされ TextItem は生成されない（line 569 None branch）。
+    #[test]
+    fn tj_no_operands_produces_no_item() {
+        // In a PDF content stream operands precede the operator. Writing `Tj`
+        // with nothing before it leaves the operand list empty.
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm Tj ET\n".to_vec();
+        let result = inspect_bytes(&make_pdf_with_raw_content(content));
+        assert!(
+            result.text_items.is_empty(),
+            "Tj with no operands must produce no text items"
+        );
+    }
+
+    /// `Tj` に文字列でないオペランド（整数）を渡した場合、`as_str()` が Err となりスキップされる（line 568 Err branch）。
+    #[test]
+    fn tj_non_string_operand_produces_no_item() {
+        // `42 Tj` — the operand is an integer, not a string literal.
+        // `text_obj.as_str()` returns Err, so no item is produced.
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm 42 Tj ET\n".to_vec();
+        let result = inspect_bytes(&make_pdf_with_raw_content(content));
+        assert!(
+            result.text_items.is_empty(),
+            "Tj with a non-string operand must produce no text items"
+        );
+    }
+
+    // --- TJ operator edge cases ---
+
+    /// `TJ` にオペランドが0個のとき、演算子はスキップされ TextItem は生成されない（line 596 None branch）。
+    #[test]
+    fn tj_array_no_operands_produces_no_item() {
+        // `TJ` with nothing on the operand stack: `operands.first()` returns None.
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm TJ ET\n".to_vec();
+        let result = inspect_bytes(&make_pdf_with_raw_content(content));
+        assert!(
+            result.text_items.is_empty(),
+            "TJ with no operands must produce no text items"
+        );
+    }
+
+    /// `TJ` に配列でないオペランド（整数）を渡した場合、`as_array()` が Err となりスキップされる（line 595 Err branch）。
+    #[test]
+    fn tj_array_non_array_operand_produces_no_item() {
+        // `42 TJ` — the operand is an integer, not an array.
+        // `array_obj.as_array()` returns Err, so no item is produced.
+        let content = b"BT /F1 12 Tf 1 0 0 1 10 700 Tm 42 TJ ET\n".to_vec();
+        let result = inspect_bytes(&make_pdf_with_raw_content(content));
+        assert!(
+            result.text_items.is_empty(),
+            "TJ with a non-array operand must produce no text items"
+        );
+    }
+
+    // --- Content decode failure ---
+
+    /// 完全に不正なバイト列を含むコンテントストリームは gracefully にスキップされ、
+    /// TextItem は生成されないがページカウントは増加する（line 406 Err branch を狙う）。
+    #[test]
+    fn corrupt_content_stream_produces_no_text_items() {
+        // Purely binary bytes, not valid PDF operator syntax.
+        // If `Content::decode` returns Err the `continue` branch fires;
+        // even if it returns Ok([]) the observable guarantee still holds.
+        let garbage = vec![0x80u8, 0x00, 0x81, 0xff, 0xfe, 0xfd, 0x82, 0x83];
+        let result = inspect_bytes(&make_pdf_with_raw_content(garbage));
+        assert!(
+            result.text_items.is_empty(),
+            "corrupt content stream must produce no text items"
+        );
+        assert_eq!(result.pages, 1, "page must still be counted");
+    }
+
+    /// image pass でも不正なコンテントストリームは gracefully にスキップされる（line 889 Err branch を狙う）。
+    #[test]
+    fn corrupt_content_stream_produces_no_image_items() {
+        let garbage = vec![0x80u8, 0x00, 0x81, 0xff, 0xfe, 0xfd, 0x82, 0x83];
+        let result = inspect_bytes(&make_pdf_with_image_and_raw_content(garbage));
+        assert!(
+            result.images.is_empty(),
+            "corrupt content stream must produce no image items"
+        );
+        assert_eq!(result.pages, 1, "page must still be counted");
     }
 }

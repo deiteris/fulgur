@@ -1,6 +1,7 @@
 //! Run a single WPT reftest end-to-end: classify, render test + ref,
 //! compare each page, and return an observed PASS/FAIL/SKIP.
 
+use crate::backend::Backend;
 use crate::expectations::Expectation;
 use crate::reftest::{ReftestKind, classify};
 use crate::render::render_test;
@@ -26,12 +27,14 @@ pub struct RunOutcome {
 ///   will be created under it.
 /// - `diff_out_dir`: where to dump per-page diff PNGs on failure.
 /// - `dpi`: pdftocairo rasterization resolution.
+/// - `backend`: layout backend used for both the test and the reference.
 pub fn run_one(
     test_html_path: &Path,
     work_dir: &Path,
     diff_out_dir: &Path,
     dpi: u32,
     assets: Option<&fulgur::asset::AssetBundle>,
+    backend: Backend,
 ) -> Result<RunOutcome> {
     use fulgur_vrt::diff::{compare, write_diff_image};
     use fulgur_vrt::manifest::Tolerance;
@@ -61,8 +64,8 @@ pub fn run_one(
 
     let test_work = work_dir.join("test");
     let ref_work = work_dir.join("ref");
-    let test_out = render_test(test_html_path, &test_work, dpi, assets)?;
-    let ref_out = render_test(&ref_abs, &ref_work, dpi, assets)?;
+    let test_out = render_test(test_html_path, &test_work, dpi, assets, backend)?;
+    let ref_out = render_test(&ref_abs, &ref_work, dpi, assets, backend)?;
 
     if test_out.pages.len() != ref_out.pages.len() {
         let msg = format!(

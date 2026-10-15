@@ -2676,4 +2676,52 @@ mod tests {
             "trailing combinator without a following subject must drop the whole list"
         );
     }
+
+    // -------- column-rule shorthand: color-slot already filled, third token unmatched --------
+
+    /// Cover the false branch of `if color.is_none()` in `parse_column_rule_shorthand`.
+    ///
+    /// When the loop iteration finds that the color slot is **already set**
+    /// (because `red` was consumed in iteration 1 via `continue`), neither
+    /// the width nor the style branch matches `garbage_token`, and the
+    /// `if color.is_none()` guard evaluates to false — skipping the block.
+    /// Execution falls through to `return None`, dropping the shorthand.
+    ///
+    /// This is the only call-site path that exercises the `if color.is_none()`
+    /// false branch (i.e., color already set when we reach that guard).
+    #[test]
+    fn column_rule_shorthand_color_already_set_unmatched_token_drops_rule() {
+        // red → color consumed (iter 1, continue).
+        // 1pt → width consumed (iter 2, continue).
+        // garbage_token → not width, not style; color.is_none() == false → return None.
+        let props = parse_declaration_block("column-rule: red 1pt garbage_token;");
+        assert!(
+            props.rule.is_none(),
+            "unrecognised token after color+width (color slot already filled) must drop the rule"
+        );
+    }
+
+    // -------- parse_selector_list: trailing comma --------
+
+    /// Cover the false branch of the `else if selectors.is_empty() || prev_sibling.is_some()`
+    /// guard that follows the main selector-accumulation loop.
+    ///
+    /// After `div,` the Comma handler pushes `div` into `selectors` and resets
+    /// `current`.  When the loop ends, `current.parts` is empty (the `if` branch
+    /// is not taken) and `selectors` already contains an entry, `prev_sibling` is
+    /// `None` — so the `else if` condition is false and execution falls through
+    /// the closing `}` to `return selectors`.
+    ///
+    /// Behavior: the single selector accumulated before the trailing comma is
+    /// returned.  Whether this is ideal CSS semantics is a separate question;
+    /// this test pins the current implementation.
+    #[test]
+    fn selector_list_trailing_comma_returns_accumulated_selectors() {
+        let list = parse_selector_list("div,");
+        assert_eq!(
+            list.len(),
+            1,
+            "the selector before a trailing comma must be returned"
+        );
+    }
 }

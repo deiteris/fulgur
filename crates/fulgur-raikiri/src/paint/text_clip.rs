@@ -22,10 +22,10 @@ pub(super) fn run_element(dom: DomView<'_>, run: &PositionedGlyphRun<'_>) -> Opt
 /// of its descendants, or `None` when there are none.
 ///
 /// The outlines are in `space`, where the element's box is drawn.
-pub(super) fn outlines(
+pub(super) fn outlines<'r, 'p: 'r>(
     dom: DomView<'_>,
     element: NodeId,
-    runs: &[PositionedGlyphRun<'_>],
+    runs: impl IntoIterator<Item = &'r PositionedGlyphRun<'p>>,
     space: PaintTransform,
 ) -> Option<Path> {
     let mut pen = Pen::new(PathBuilder::new());

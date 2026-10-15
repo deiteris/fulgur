@@ -173,8 +173,9 @@ fn draw(
         bookmarks::BookmarkOutline::default()
     };
     let outline = want_bookmarks.then_some(bookmarks.outline);
-    let pdf = paint::paint_document(&document, resources, config, outline, document_url, options)?;
-    bookmarks::apply_open_state(pdf, &bookmarks.open)
+    let (pdf, rotations) =
+        paint::paint_document(&document, resources, config, outline, document_url, options)?;
+    rotations.apply(bookmarks::apply_open_state(pdf, &bookmarks.open)?)
 }
 
 #[cfg(test)]
@@ -330,6 +331,7 @@ mod bookmarks;
 mod tagging;
 
 mod merge;
+mod orientation;
 mod stream;
 
 pub use stream::render_streaming;

@@ -2,12 +2,12 @@
 //! page: the painter only draws the resolved boxes.
 
 use super::raster::BackgroundLayer;
-use super::shape::{Edges, RoundedRect};
+use super::shape::{self, Edges, RoundedRect};
 use super::{FontCache, fill, paint_body, paint_glyph_run, paints_glyphs, raster, svg};
 use crate::tagging::{Tags, Target, margin_box_artifact};
 use fulgur_core::{Error, Result};
 use krilla::geom::Transform;
-use krilla::paint::FillRule;
+use krilla::paint::{Fill, FillRule};
 use krilla::surface::Surface;
 use raikiri_html::computed::ComputedVisualBox;
 use raikiri_html::{MarginBox, Page, PaintInsets, PaintRect, PlacedRunningElement};
@@ -66,21 +66,37 @@ fn paint_box(
     let Some(border_box) = outer.path() else {
         return Ok(());
     };
+    let borders = edges(margin_box.border_widths());
+    let padding = edges(margin_box.padding);
+    let visual_box = |visual: ComputedVisualBox| match visual {
+        ComputedVisualBox::PaddingBox => Some(outer.inset(borders)),
+        ComputedVisualBox::ContentBox => Some(outer.inset(borders.add(padding))),
+        ComputedVisualBox::BorderBox => Some(outer),
+        // Margin boxes have no glyph clip shapes here; Raikiri's own
+        // painter skips the color or image in these cases too.
+        _ => None,
+    };
     if let Some(color) = margin_box.background_color {
-        surface.set_fill(Some(fill(color)));
-        surface.draw_path(&border_box);
-    }
-    if let Some(image) = &margin_box.background_image {
-        let borders = edges(margin_box.border_widths());
-        let padding = edges(margin_box.padding);
-        let visual_box = |visual: ComputedVisualBox| match visual {
-            ComputedVisualBox::PaddingBox => Some(outer.inset(borders)),
-            ComputedVisualBox::ContentBox => Some(outer.inset(borders.add(padding))),
-            ComputedVisualBox::BorderBox => Some(outer),
-            // Margin boxes have no glyph or border-area clip shapes here;
-            // Raikiri's own painter skips the image in these cases too.
-            _ => None,
+        // The bottom layer's clip also clips the color (CSS Backgrounds 3
+        // §2.2); `border-area` paints it in the border ring only.
+        let area = match margin_box.background_clip {
+            ComputedVisualBox::BorderArea => {
+                shape::ring(&outer, &outer.inset(borders)).map(|path| (path, FillRule::EvenOdd))
+            }
+            clip => visual_box(clip)
+                .and_then(|area| area.path())
+                .map(|path| (path, FillRule::NonZero)),
         };
+        if let Some((area, rule)) = area {
+            surface.set_fill(Some(Fill {
+                rule,
+                ..fill(color)
+            }));
+            surface.draw_path(&area);
+        }
+    }
+    // The first layer is on top (CSS Backgrounds 3 §2.1).
+    for image in margin_box.background_layers.iter().rev() {
         if let (Some(positioning), Some(painting)) =
             (visual_box(image.origin), visual_box(image.clip))
             && let Some(area) = painting.path()

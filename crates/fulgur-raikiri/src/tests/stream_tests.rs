@@ -281,3 +281,72 @@ fn streaming_reports_layout_errors() {
         assert_eq!(streamed.to_string(), batch.to_string());
     }
 }
+
+/// The `/Rotate` of each page of `pdf`, 0 when the entry is missing.
+fn rotations(pdf: &[u8]) -> Vec<i64> {
+    let pdf = lopdf::Document::load_mem(pdf).unwrap();
+    pdf.get_pages()
+        .values()
+        .map(|&page| {
+            pdf.get_dictionary(page)
+                .unwrap()
+                .get(b"Rotate")
+                .map_or(0, |value| value.as_i64().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn page_orientation_rotates_batch_and_streamed_pages() {
+    // CSS Paged Media 3 §3.5: the layout stays upright and the viewer turns
+    // the page. The streamed pages also get their deferred margin boxes
+    // merged in, which must keep the rotation.
+    let css = "<style>@page { size: 300px 200px; margin: 40px; \
+        @bottom-center { content: counter(page) ' of ' counter(pages) } } \
+        @page :first { page-orientation: rotate-left } \
+        @page turned { page-orientation: rotate-right } \
+        @page upright { page-orientation: upright } \
+        body { margin: 0 } p { margin: 0; break-after: page } \
+        .turned { page: turned } .upright { page: upright }</style>";
+    let html = long_input(css, 4, |index| match index {
+        1 => "<p class=turned>page 1</p>".to_owned(),
+        2 => "<p class=upright>page 2</p>".to_owned(),
+        _ => format!("<p>page {index}</p>"),
+    });
+    let (batch, streamed) = both(&html, &Config::default());
+    assert_eq!(rotations(&batch), [270, 90, 0, 0, 0]);
+    assert_eq!(rotations(&streamed), [270, 90, 0, 0, 0]);
+}
+
+#[test]
+fn a_root_without_a_box_prints_blank_pages_without_margin_boxes() {
+    // A root with `display: none` generates no boxes, and browsers print
+    // such a document as blank paper: no canvas and no margin boxes, even
+    // one that waits for the page count.
+    let css = "<style>@page { size: 300px 200px; margin: 40px; \
+        background: rgb(0, 0, 255); \
+        @top-center { content: 'head'; background: rgb(255, 0, 0) } \
+        @bottom-center { content: counter(page) ' of ' counter(pages) } }</style>";
+    let html = format!(
+        "<html style=\"display: none; background: rgb(0, 128, 0)\"><head>{css}</head>\
+         <body><p>body</p></body></html>"
+    );
+    let (batch, streamed) = both(&html, &Config::default());
+    for bytes in [batch, streamed] {
+        let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+        assert_eq!(pdf.get_pages().len(), 1);
+        let operations = page_operations(&pdf, 1);
+        assert!(fill_colors(&operations).is_empty(), "{operations:?}");
+        assert_eq!(pdf.extract_text(&[1]).unwrap().trim(), "");
+        // The page has no deferred margin boxes to merge in either.
+        let forms = pdf.objects.values().filter(|object| {
+            object.as_stream().is_ok_and(|stream| {
+                stream
+                    .dict
+                    .get(b"Subtype")
+                    .is_ok_and(|subtype| subtype.as_name().is_ok_and(|name| name == b"Form"))
+            })
+        });
+        assert_eq!(forms.count(), 0);
+    }
+}

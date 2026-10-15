@@ -106,8 +106,7 @@ fn legacy_pages_keep_raster_pixels_and_own_opacity_and_allow_no_source() {
             );
         }
         let page_id = *parsed.get_pages().values().next().unwrap();
-        let content =
-            lopdf::content::Content::decode(&parsed.get_page_content(page_id).unwrap()).unwrap();
+        let content = lopdf::content::Content::decode(&parsed.get_page_content(page_id)).unwrap();
         assert!(
             content
                 .operations
@@ -201,8 +200,7 @@ fn ordered_marker_events_can_be_rendered_without_a_pixel_provider() {
             .count();
         assert_eq!(images, usize::from(with_source));
         let page_id = *parsed.get_pages().values().next().unwrap();
-        let content =
-            lopdf::content::Content::decode(&parsed.get_page_content(page_id).unwrap()).unwrap();
+        let content = lopdf::content::Content::decode(&parsed.get_page_content(page_id)).unwrap();
         let saves = content
             .operations
             .iter()
@@ -327,8 +325,7 @@ fn images_and_draws(bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<lopdf::content::Operatio
         .map(|stream| stream.decompressed_content().unwrap())
         .collect();
     let page_id = *parsed.get_pages().values().next().unwrap();
-    let content =
-        lopdf::content::Content::decode(&parsed.get_page_content(page_id).unwrap()).unwrap();
+    let content = lopdf::content::Content::decode(&parsed.get_page_content(page_id)).unwrap();
     (images, content.operations)
 }
 
@@ -468,5 +465,91 @@ fn legacy_pages_draw_generated_images_with_their_owner_opacity() {
             .values()
             .filter_map(|object| object.as_dict().ok())
             .any(|dict| dict.get(b"ca").and_then(lopdf::Object::as_float).ok() == Some(0.5))
+    );
+}
+
+#[test]
+fn legacy_pages_draw_generated_images_inside_their_transforms() {
+    let pixels = red_8x4();
+    // The matrix that draws the image, as Krilla writes it with the
+    // enclosing transforms folded in.
+    let image_matrix = |css: &str| {
+        let layout = generated_image_layout(&pixels, css);
+        let page = layout.page(0).unwrap();
+        let source = RenderResources::new().image_pixel_source(&pixels);
+        let mut pdf = krilla::Document::new();
+        let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
+        let mut surface = pdf_page.surface();
+        let mut fonts = FontCache::default();
+        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut raster = raster::RasterCache::for_tests(source.image_pixel_source_ref());
+        let runs = page.text_runs();
+        paint_legacy(
+            &mut surface,
+            &page,
+            &page.paint_order_for_text_runs(&runs),
+            &runs,
+            &mut fonts,
+            &mut svg,
+            &mut raster,
+            &mut crate::tagging::Tags::disabled(),
+            None,
+        )
+        .unwrap();
+        surface.finish();
+        pdf_page.finish();
+        let (images, operations) = images_and_draws(&pdf.finish().unwrap());
+        assert_eq!(images, vec![[255, 0, 0].repeat(32)]);
+        let saves = operations.iter().filter(|op| op.operator == "q").count();
+        let restores = operations.iter().filter(|op| op.operator == "Q").count();
+        assert_eq!(saves, restores);
+        let draw = operations
+            .iter()
+            .position(|op| op.operator == "Do")
+            .expect("the image is drawn");
+        let matrix = &operations[draw - 1];
+        assert_eq!(matrix.operator, "cm");
+        matrix
+            .operands
+            .iter()
+            .map(|operand| operand.as_float().unwrap())
+            .collect::<Vec<_>>()
+    };
+    // Without pixels the image is skipped, transform or not.
+    let layout = generated_image_layout(&pixels, "p{transform:translate(10px,6px)}");
+    let page = layout.page(0).unwrap();
+    let mut pdf = krilla::Document::new();
+    let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
+    let mut surface = pdf_page.surface();
+    let runs = page.text_runs();
+    paint_legacy(
+        &mut surface,
+        &page,
+        &page.paint_order_for_text_runs(&runs),
+        &runs,
+        &mut FontCache::default(),
+        &mut svg::SvgCache::new(crate::RenderOptions::default()),
+        &mut raster::RasterCache::for_tests(None),
+        &mut crate::tagging::Tags::disabled(),
+        None,
+    )
+    .unwrap();
+    surface.finish();
+    pdf_page.finish();
+    let (images, _) = images_and_draws(&pdf.finish().unwrap());
+    assert!(images.is_empty());
+    let plain = image_matrix("");
+    let moved = image_matrix("p{transform:translate(10px,6px)}");
+    // PDF space grows upwards, so moving down lowers the image's y.
+    assert_eq!(
+        moved,
+        [
+            plain[0],
+            plain[1],
+            plain[2],
+            plain[3],
+            plain[4] + 10.0,
+            plain[5] - 6.0
+        ]
     );
 }

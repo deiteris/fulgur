@@ -8,7 +8,8 @@ name: Raikiri
 # PRs run it only when they touch the Raikiri backend, its direct
 # dependencies, or the Raikiri pin (Cargo.lock). The nightly schedule catches
 # breakage that slips in from elsewhere (e.g. a fulgur-blitz API change that
-# fulgur-dev consumes).
+# fulgur-dev consumes). The nightly schedule (and manual dispatch) also runs
+# the WPT reftests through the Raikiri backend; see the `wpt` job.
 
 on:
   push:
@@ -22,6 +23,7 @@ on:
       - "crates/fulgur-core/**"
       - "crates/fulgur-raikiri/**"
       - "crates/fulgur-dev/**"
+      - "crates/fulgur-wpt/**"
       - "scripts/compare-raikiri-dev.py"
       - "scripts/compare_raikiri_dev_tests.py"
       # Test inputs fulgur-dev / fulgur-raikiri read from outside their crates.
@@ -38,6 +40,7 @@ on:
       - "crates/fulgur-core/**"
       - "crates/fulgur-raikiri/**"
       - "crates/fulgur-dev/**"
+      - "crates/fulgur-wpt/**"
       - "scripts/compare-raikiri-dev.py"
       - "scripts/compare_raikiri_dev_tests.py"
       # Test inputs fulgur-dev / fulgur-raikiri read from outside their crates.
@@ -106,9 +109,9 @@ jobs:
       - name: Test development backend comparison script
         run: python3 -m unittest discover -s scripts -p compare_raikiri_dev_tests.py
       - name: Rustfmt
-        run: cargo fmt --check -p fulgur-raikiri -p fulgur-dev
+        run: cargo fmt --check -p fulgur-raikiri -p fulgur-dev -p fulgur-wpt
       - name: Clippy
-        run: cargo clippy -p fulgur-raikiri -p fulgur-dev --all-targets -- -D warnings
+        run: cargo clippy -p fulgur-raikiri -p fulgur-dev -p fulgur-wpt --features fulgur-wpt/raikiri --all-targets -- -D warnings
       # Run the tests under coverage so Codecov patch coverage keeps working
       # on Raikiri PRs now that ci.yml excludes these crates. The upload is
       # flagged `raikiri` and carried forward (codecov.yml) on commits where
@@ -116,7 +119,7 @@ jobs:
       - name: Run tests with coverage
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov nextest -p fulgur-raikiri -p fulgur-dev --profile ci --no-report
+          cargo llvm-cov nextest -p fulgur-raikiri -p fulgur-dev -p fulgur-wpt --features fulgur-wpt/raikiri --profile ci --no-report
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
@@ -125,3 +128,89 @@ jobs:
           flags: raikiri
           use_oidc: true
           fail_ci_if_error: false
+
+  # WPT reftests rendered through the Raikiri backend (fulgur-raikiri's
+  # Krilla painter), compared against the Raikiri expectations under
+  # crates/fulgur-wpt/expectations/raikiri/. The step summary also lists
+  # where the results differ from the Blitz expectations. Nightly and manual
+  # runs only: this is a measurement channel, so regressions are reported
+  # in the summary and artifacts and never fail the job or file issues.
+  wpt:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: wpt raikiri / ${{ matrix.phase }}
+    runs-on: ubuntu-latest
+    # A crash that catch_unwind cannot stop (e.g. a stack overflow) still
+    # ends the test binary; keep that a report, not a red workflow.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - phase: css-page
+            test: wpt_css_page
+          - phase: multicol-1
+            test: wpt_lists
+            filter: wpt_list_multicol_1
+          - phase: multicol-2
+            test: wpt_lists
+            filter: wpt_list_multicol_2
+          - phase: multicol-3
+            test: wpt_lists
+            filter: wpt_list_multicol_3
+          - phase: bugs
+            test: wpt_lists
+            filter: wpt_list_bugs
+          - phase: smoke
+            test: wpt_lists
+            filter: wpt_list_smoke
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-latest-fulgur-raikiri-wpt-${{ matrix.phase }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install poppler-utils
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils mold
+      - name: Configure mold linker
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> $GITHUB_ENV
+      - name: Fetch WPT subset
+        run: scripts/wpt/fetch.sh
+      - name: Run ${{ matrix.phase }} reftests (raikiri)
+        env:
+          FULGUR_REVISION: ${{ github.sha }}
+          FULGUR_WPT_ENGINE: raikiri
+          # Missing prerequisites are a real bug in the WPT job.
+          FULGUR_WPT_REQUIRED: "1"
+        run: cargo test -p fulgur-wpt --features raikiri --test ${{ matrix.test }} -- ${{ matrix.filter }} --nocapture
+      - name: Append step summary
+        if: always()
+        run: |
+          summary="target/wpt-report/raikiri/${{ matrix.phase }}/summary.md"
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no summary for ${{ matrix.phase }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wpt-raikiri-${{ matrix.phase }}
+          path: target/wpt-report/raikiri/${{ matrix.phase }}
+          if-no-files-found: warn
+      - name: Evict WPT checkout from the build-artifact cache
+        # Same reason as the wpt job in ci.yml: a git checkout under target/
+        # must not round-trip through the rust-cache tarball.
+        if: always()
+        run: rm -rf target/wpt

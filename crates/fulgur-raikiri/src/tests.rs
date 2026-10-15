@@ -194,9 +194,7 @@ fn hidden_boxes_and_transparent_text_draw_nothing() {
     let text = pdf.extract_text(&[1]).expect("extractable text");
     assert_eq!(text.split_whitespace().collect::<Vec<_>>(), ["kept"]);
     // Nothing red is filled: the hidden box draws no background or border.
-    let content = pdf
-        .get_page_content(*pdf.get_pages().get(&1).unwrap())
-        .unwrap();
+    let content = pdf.get_page_content(*pdf.get_pages().get(&1).unwrap());
     let content = String::from_utf8_lossy(&content);
     assert!(!content.contains("1 0 0 rg"), "{content}");
 }
@@ -293,9 +291,7 @@ fn margin_boxes_draw_the_running_element_of_each_page() {
     assert_eq!(words(1), ["Alpha", "one"]);
     assert_eq!(words(2), ["Beta", "two"]);
     // The element is drawn as laid out, with its background.
-    let content = pdf
-        .get_page_content(*pdf.get_pages().get(&1).unwrap())
-        .unwrap();
+    let content = pdf.get_page_content(*pdf.get_pages().get(&1).unwrap());
     let operations = lopdf::content::Content::decode(&content)
         .unwrap()
         .operations;
@@ -337,7 +333,7 @@ fn operations_with(
     let pdf = lopdf::Document::load_mem(&bytes).expect("a readable PDF");
     let mut operations = Vec::new();
     for page in pdf.get_pages().values() {
-        let content = pdf.get_page_content(*page).unwrap();
+        let content = pdf.get_page_content(*page);
         operations.extend(
             lopdf::content::Content::decode(&content)
                 .unwrap()
@@ -561,11 +557,14 @@ fn overflow_hidden_clips_descendants_to_the_padding_box() {
     let (_, hidden) = operations(&format!(
         "{CSS}<div style=\"height: 40px; border: 5px solid black; overflow: hidden\">{child}</div>"
     ));
-    // One clip, kept for the child's background and its text, at the
-    // padding box: the border box at (20, 20) inset by the 5px border, 40px
-    // high.
-    assert_eq!(count(&hidden, "W"), 1, "{hidden:?}");
-    assert_eq!(clip_bounds(&hidden), [[25.0, 25.0, 275.0, 65.0]]);
+    // The child's background and its text are painted in separate phases
+    // (CSS 2 Appendix E), each under the clip at the padding box: the border
+    // box at (20, 20) inset by the 5px border, 40px high.
+    assert_eq!(count(&hidden, "W"), 2, "{hidden:?}");
+    assert_eq!(
+        clip_bounds(&hidden),
+        [[25.0, 25.0, 275.0, 65.0], [25.0, 25.0, 275.0, 65.0]]
+    );
 }
 
 #[test]
@@ -1164,11 +1163,17 @@ fn clip_switches_between_sibling_overflow_boxes() {
          <p style=\"background-color: green\">after</p>"
     ));
     let bounds = clip_bounds(&operations);
-    // Each subtree draws its box and text together, then switches to the
-    // second clip after popping the first.
+    // The block backgrounds of both subtrees are painted before their text
+    // (CSS 2 Appendix E), so each phase switches from the first clip to the
+    // second after popping the first.
     assert_eq!(
         bounds,
-        [[20.0, 20.0, 280.0, 40.0], [20.0, 40.0, 280.0, 60.0],]
+        [
+            [20.0, 20.0, 280.0, 40.0],
+            [20.0, 40.0, 280.0, 60.0],
+            [20.0, 20.0, 280.0, 40.0],
+            [20.0, 40.0, 280.0, 60.0],
+        ]
     );
     // Every pushed clip is popped: the graphics states balance.
     assert_eq!(count(&operations, "q"), count(&operations, "Q"));
@@ -1308,7 +1313,7 @@ fn body_overflow_clips_when_the_root_overflow_is_not_visible() {
 /// Decoded operations of one page's content stream.
 fn page_operations(pdf: &lopdf::Document, page: u32) -> Vec<lopdf::content::Operation> {
     let id = *pdf.get_pages().get(&page).unwrap();
-    lopdf::content::Content::decode(&pdf.get_page_content(id).unwrap())
+    lopdf::content::Content::decode(&pdf.get_page_content(id))
         .unwrap()
         .operations
 }
@@ -1697,6 +1702,27 @@ fn background_clip_border_area_paints_under_the_border() {
     // The ring between the border and padding edges, filled even-odd.
     assert_eq!(count(&operations, "f*"), 1);
     assert_eq!(count(&operations, "f"), 0);
+}
+
+#[test]
+fn margin_box_background_color_follows_the_bottom_layer_clip() {
+    // CSS Backgrounds 3 §2.2: the color is clipped like the bottom layer;
+    // `border-area` fills the ring under the border, even-odd.
+    let page = |clip: &str| {
+        operations(&format!(
+            "<style>@page {{ size: 300px 200px; margin: 40px; @top-center {{ content: 'H'; \
+             border: 5px solid transparent; padding: 3px; background-color: rgb(0, 128, 0); \
+             background-clip: {clip} }} }} body {{ margin: 0 }}</style><p>body</p>"
+        ))
+        .1
+    };
+    let ring = page("border-area");
+    assert!(fill_colors(&ring).contains(&[0, 128, 0]));
+    assert_eq!(count(&ring, "f*"), 1);
+    // `text` has no glyph shape for margin boxes, so the color is skipped,
+    // as Raikiri's own painter does.
+    assert!(!fill_colors(&page("text")).contains(&[0, 128, 0]));
+    assert!(fill_colors(&page("content-box")).contains(&[0, 128, 0]));
 }
 
 mod assets_tests;

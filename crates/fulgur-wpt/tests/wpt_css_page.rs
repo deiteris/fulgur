@@ -1,6 +1,7 @@
 //! Phase 1 entry: run all css-page reftests via the shared phase runner.
 //! Never panics on regressions — emits artifacts under target/wpt-report/css-page/.
 
+use fulgur_wpt::backend::Backend;
 use fulgur_wpt::runner::run_phase;
 use std::path::PathBuf;
 
@@ -15,7 +16,9 @@ fn workspace_root() -> PathBuf {
 
 #[test]
 fn wpt_css_page() {
-    let outcome = run_phase(&workspace_root(), "css-page", 96).expect("runner should not error");
+    let backend = Backend::from_env().expect("FULGUR_WPT_ENGINE");
+    let outcome =
+        run_phase(&workspace_root(), "css-page", 96, backend).expect("runner should not error");
     match outcome {
         Some(o) => eprintln!("css-page report at {}", o.report_dir.display()),
         // `FULGUR_WPT_REQUIRED=1` is set only by the dedicated `wpt` matrix

@@ -23,6 +23,7 @@ mod svg;
 mod text_clip;
 mod transform;
 
+use crate::orientation::Rotations;
 use crate::tagging::{Tags, Target};
 use clip::{ClipMap, ClipStack};
 use fulgur_core::units::PX_TO_PT;
@@ -37,18 +38,19 @@ use krilla::surface::Surface;
 use krilla::tagging::ArtifactType;
 use navigation::PageLink;
 use raikiri_html::computed::{
-    ComputedBackgroundImage, ComputedDisplay, ComputedLengthPercentage, ComputedValues,
+    ComputedBackgroundImage, ComputedDisplay, ComputedLengthPercentageOrCalc, ComputedValues,
     ComputedVisibility, ComputedVisualBox, CssColor,
 };
 use raikiri_html::{
-    AnchorIndex, DocumentLayout, FontId, FragmentKind, GeneratedImageId, MarginBox, NodeId,
-    NodeKind, Page, PaintEvent, PaintRect, PaintTransform, PositionedGlyphRun, RunSource,
-    TextShadow,
+    AnchorIndex, DocumentLayout, FontId, FragmentKind, GeneratedImageId,
+    MAX_PAINTED_BACKGROUND_LAYERS, MarginBox, NodeId, NodeKind, Page, PaintEvent, PaintRect,
+    PaintTransform, PositionedGlyphRun, RunSource, TextShadow,
 };
 use shape::{Edges, RoundedRect, Slice};
 use std::collections::HashMap;
 
-/// Draw every page of `document` and return the PDF bytes.
+/// Draw every page of `document` and return the PDF bytes, with the pages
+/// to rotate for display.
 pub(crate) fn paint_document(
     document: &DocumentLayout,
     resources: &raikiri_html::RenderResources<'_>,
@@ -56,7 +58,7 @@ pub(crate) fn paint_document(
     outline: Option<krilla::outline::Outline>,
     document_url: &url::Url,
     options: &crate::RenderOptions<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Rotations)> {
     let first_page = document.page(0);
     let lang = document_lang(config, first_page.as_ref());
     if config.pdf_ua && lang.is_none() {
@@ -83,9 +85,22 @@ pub(crate) fn paint_document(
         anchors: Some(document.anchors()),
     };
     for page in document.pages() {
-        painter.page(&page, &page.margin_boxes(), &targets)?;
+        painter.page(&page, &margin_boxes(&page), &targets)?;
     }
-    painter.finish(lang)
+    let rotations = painter.take_rotations();
+    Ok((painter.finish(lang)?, rotations))
+}
+
+/// The margin boxes of `page`.
+///
+/// A document whose root element has `display: none` prints as blank paper:
+/// browsers draw no margin boxes on its pages either, and the canvas has no
+/// background to propagate.
+pub(crate) fn margin_boxes(page: &Page<'_>) -> Vec<MarginBox> {
+    if canvas::root_generates_no_box(page) {
+        return Vec::new();
+    }
+    page.margin_boxes()
 }
 
 /// The document language: the configured one unless blank, else the `lang`
@@ -142,6 +157,7 @@ pub(crate) struct Painter<'a> {
     svg: svg::SvgCache<'a>,
     raster: raster::RasterCache<'a>,
     tags: Tags,
+    rotations: Rotations,
 }
 
 impl<'a> Painter<'a> {
@@ -176,6 +192,7 @@ impl<'a> Painter<'a> {
             svg: svg::SvgCache::new(*options),
             raster: raster::RasterCache::new(resources.image_pixel_source_ref(), base),
             tags,
+            rotations: Rotations::default(),
         }
     }
 
@@ -185,6 +202,12 @@ impl<'a> Painter<'a> {
 
     pub(crate) fn set_outline(&mut self, outline: krilla::outline::Outline) {
         self.pdf.set_outline(outline);
+    }
+
+    /// The pages drawn so far whose `page-orientation` turns them, to set on
+    /// the finished PDF.
+    pub(crate) fn take_rotations(&mut self) -> Rotations {
+        std::mem::take(&mut self.rotations)
     }
 
     /// Draw `page` with `margin_boxes` below its body, and add its links.
@@ -203,7 +226,9 @@ impl<'a> Painter<'a> {
             svg,
             raster,
             tags,
+            rotations,
         } = self;
+        rotations.add(page);
         let mut pdf_page = start_page(pdf, page.geometry().page_box)?;
         let mut surface = pdf_page.surface();
         surface.push_transform(&Transform::from_scale(PX_TO_PT, PX_TO_PT));
@@ -339,7 +364,7 @@ fn paint_body(
 ) -> Result<()> {
     let runs = page.text_runs();
     let events = page.paint_order_for_text_runs(&runs);
-    let paint = if order::supported(&events, &runs, |run| page.text_run_opacity_group(run)) {
+    let paint = if in_order(page, &events, &runs) {
         paint_ordered
     } else {
         paint_legacy
@@ -355,6 +380,20 @@ fn paint_body(
         tags,
         canvas_owner,
     )
+}
+
+/// Whether `page` is painted in its paint order rather than by the legacy
+/// whole-page painter.
+#[cfg(test)]
+pub(crate) fn supports_order(page: &Page<'_>) -> bool {
+    let runs = page.text_runs();
+    in_order(page, &page.paint_order_for_text_runs(&runs), &runs)
+}
+
+/// Whether `events`, the paint order of `page` for `runs`, draws every run
+/// exactly once, so that the page can be painted in that order.
+fn in_order(page: &Page<'_>, events: &[PaintEvent<'_>], runs: &[PositionedGlyphRun<'_>]) -> bool {
+    order::supported(events, runs, |run| page.text_run_opacity_group(run))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,14 +458,30 @@ fn paint_legacy(
         paint_replaced(surface, page, &fragment, svg, raster, tags, false)?;
     }
     // Content images are replaced content of their pseudo-element, so they
-    // go with the other replaced content, below the text.
+    // go with the other replaced content, below the text. Like the text,
+    // they are drawn where the enclosing transforms put them.
+    let mut spaces = vec![PaintTransform::IDENTITY];
     for event in events {
-        if let PaintEvent::GeneratedImage(image) = event
-            && let Some(placement) = raster.generated_image(page, *image)
-        {
-            let chain = clips.chain(page, placement.clip_owner, placement.rect);
-            active.apply(surface, &clips, &chain);
-            paint_content_image(surface, page, raster, tags, *image, &placement, false)?;
+        match event {
+            PaintEvent::PushTransform(own) => {
+                let space = *spaces.last().unwrap_or(&PaintTransform::IDENTITY);
+                spaces.push(space * *own);
+            }
+            PaintEvent::PopTransform => {
+                spaces.pop();
+            }
+            PaintEvent::GeneratedImage(image) => {
+                if let Some(placement) = raster.generated_image(page, *image) {
+                    let chain = clips.chain(page, placement.clip_owner, placement.rect);
+                    active.apply(surface, &clips, &chain);
+                    let space = *spaces.last().unwrap_or(&PaintTransform::IDENTITY);
+                    let moved = (space != PaintTransform::IDENTITY).then_some(space);
+                    transform::with(surface, moved, |surface| {
+                        paint_content_image(surface, page, raster, tags, *image, &placement, false)
+                    })?;
+                }
+            }
+            _ => {}
         }
     }
     // Text goes above every block background and border.
@@ -569,6 +624,34 @@ fn paint_ordered(
                         )
                     },
                 )?;
+            }
+            // One line's piece of an inline box that a translucent
+            // `::first-line` splits, drawn in place of the whole box.
+            PaintEvent::LineBox(piece) => {
+                let node = piece.fragment.node();
+                if let Some(style) = page.computed(node) {
+                    let chain = clips.chain(page, dom.parent(node), piece.rect);
+                    active.apply(surface, &clips, &chain);
+                    let line = runs.iter().filter(|run| run.line == piece.line);
+                    let text = || text_clip::outlines(dom, node, line, space);
+                    tags.mark(
+                        surface,
+                        page,
+                        Target::Artifact(ArtifactType::Other),
+                        |surface| {
+                            paint_box(
+                                surface,
+                                raster,
+                                piece.rect,
+                                None,
+                                Slice::line_piece(style, piece.has_start_edge, piece.has_end_edge),
+                                style,
+                                Collapse::Separate,
+                                text,
+                            )
+                        },
+                    )?;
+                }
             }
             PaintEvent::Replaced(fragment) => {
                 let chain = clips.chain(page, Some(fragment.node()), fragment.paint_rect());
@@ -978,8 +1061,9 @@ fn is_table(style: &ComputedValues) -> bool {
 }
 
 /// CSS Backgrounds 3 §2: the background color, then the background image
-/// over it, both clipped to the `background-clip` box with its corner
-/// curves (§5.3). CSS Backgrounds 4 §2.6 adds two painting areas:
+/// layers from the bottom one up, each clipped to its `background-clip` box
+/// with its corner curves (§5.3). The color takes the clip of the bottom
+/// layer (§2.2). CSS Backgrounds 4 §2.6 adds two painting areas:
 /// `border-area` (the area under the border) and `text` (the glyphs of the
 /// element's text).
 fn paint_background(
@@ -999,76 +1083,104 @@ fn paint_background(
         // `border-box`, and the boxes this painter does not distinguish.
         _ => *border_box,
     };
-    let painting_area = match style.background_clip {
-        ComputedVisualBox::BorderArea => shape::ring(border_box, &border_box.inset(borders))
-            .map(|path| (path, FillRule::EvenOdd)),
-        ComputedVisualBox::Text => text().map(|path| (path, FillRule::NonZero)),
-        visual => visual_box(visual)
-            .path()
-            .map(|path| (path, FillRule::NonZero)),
-    };
-    let Some((area, rule)) = painting_area else {
-        return Ok(());
+    let layers = style.background_layers();
+    let painted = &layers[..layers.len().min(MAX_PAINTED_BACKGROUND_LAYERS)];
+    // The text outlines are built once, and only when something is clipped
+    // to them.
+    let clipped_to_text = (style.background_color.a > 0
+        && style.final_background_clip() == ComputedVisualBox::Text)
+        || painted.iter().any(|layer| {
+            layer.clip == ComputedVisualBox::Text
+                && !matches!(layer.image, ComputedBackgroundImage::None)
+        });
+    let outlines = if clipped_to_text { text() } else { None };
+    // Draw with the painting area of `clip`, if it is not empty.
+    let with_area = |clip: ComputedVisualBox,
+                     draw: &mut dyn FnMut(&Path, FillRule) -> Result<()>|
+     -> Result<()> {
+        let owned;
+        let (area, rule) = match clip {
+            ComputedVisualBox::Text => (outlines.as_ref(), FillRule::NonZero),
+            ComputedVisualBox::BorderArea => {
+                owned = shape::ring(border_box, &border_box.inset(borders));
+                (owned.as_ref(), FillRule::EvenOdd)
+            }
+            visual => {
+                owned = visual_box(visual).path();
+                (owned.as_ref(), FillRule::NonZero)
+            }
+        };
+        area.map_or(Ok(()), |area| draw(area, rule))
     };
     if style.background_color.a > 0 {
-        surface.set_fill(Some(Fill {
-            rule,
-            ..fill(style.background_color)
-        }));
-        surface.draw_path(&area);
+        with_area(style.final_background_clip(), &mut |area, rule| {
+            surface.set_fill(Some(Fill {
+                rule,
+                ..fill(style.background_color)
+            }));
+            surface.draw_path(area);
+            Ok(())
+        })?;
     }
-    let positioning_area = visual_box(style.background_origin);
-    match &style.background_image {
-        // One layer with the initial size, position and repeat: the gradient
-        // covers the positioning area and its end colors extend to the rest
-        // of the painting area.
-        ComputedBackgroundImage::Gradient(gradient) => {
-            if let Some(paint) = gradient::paint(gradient, &positioning_area, style.color) {
-                surface.set_fill(Some(Fill {
-                    paint,
-                    opacity: NormalizedF32::ONE,
-                    rule,
-                }));
-                surface.draw_path(&area);
+    for layer in painted.iter().rev() {
+        let positioning_area = visual_box(layer.origin);
+        match &layer.image {
+            // The gradient covers the positioning area and its end colors
+            // extend to the rest of the painting area.
+            ComputedBackgroundImage::Gradient(gradient) => {
+                if let Some(paint) = gradient::paint(gradient, &positioning_area, style.color) {
+                    with_area(layer.clip, &mut |area, rule| {
+                        surface.set_fill(Some(Fill {
+                            paint: paint.clone(),
+                            opacity: NormalizedF32::ONE,
+                            rule,
+                        }));
+                        surface.draw_path(area);
+                        Ok(())
+                    })?;
+                }
             }
+            ComputedBackgroundImage::Url(url) => {
+                // Tiles cover the clip box; `border-area` and `text` clip
+                // inside the border box.
+                let painting = match layer.clip {
+                    ComputedVisualBox::BorderArea | ComputedVisualBox::Text => *border_box,
+                    visual => visual_box(visual),
+                };
+                let image = raster::BackgroundLayer {
+                    url,
+                    size: &layer.size,
+                    position: &layer.position,
+                    repeat: &layer.repeat,
+                };
+                with_area(layer.clip, &mut |area, rule| {
+                    raster.paint_background(
+                        surface,
+                        &image,
+                        positioning_area.bounds(),
+                        painting.bounds(),
+                        (area, rule),
+                    )
+                })?;
+            }
+            _ => {}
         }
-        ComputedBackgroundImage::Url(url) => {
-            // Tiles cover the clip box; `border-area` and `text` clip inside
-            // the border box.
-            let painting = match style.background_clip {
-                ComputedVisualBox::BorderArea | ComputedVisualBox::Text => *border_box,
-                visual => visual_box(visual),
-            };
-            let layer = raster::BackgroundLayer {
-                url,
-                size: &style.background_size,
-                position: &style.background_position,
-                repeat: &style.background_repeat,
-            };
-            raster.paint_background(
-                surface,
-                &layer,
-                positioning_area.bounds(),
-                painting.bounds(),
-                (&area, rule),
-            )?;
-        }
-        _ => {}
     }
     Ok(())
 }
 
 /// Used padding widths of the box whose border box is `rect`.
 ///
-/// A percentage refers to the containing block's width (CSS Box 4 §4),
-/// which the fragment does not carry. The layout's `content` box already
-/// subtracts the resolved padding, so a percentage side is read back as the
+/// A percentage, alone or in a `calc()`, refers to the containing block's
+/// width (CSS Box 4 §4), which the fragment does not carry. The layout's
+/// `content` box already subtracts the resolved padding, so such a side is
+/// read back as the
 /// gap between the border box, less its border, and the content box. The
 /// content box covers the whole element before page cuts in the same
 /// page-local coordinates as `rect`, so the top and bottom gaps are only
 /// meaningful on the fragments that hold those edges; the broken edges are
 /// zeroed by the caller's slice anyway. Without a content box (generated
-/// pieces, inline boxes split over several lines) a percentage counts as
+/// pieces, inline boxes split over several lines) the percentage counts as
 /// zero.
 fn padding(style: &ComputedValues, rect: PaintRect, content: Option<PaintRect>) -> Edges {
     let borders = border::widths(style);
@@ -1078,9 +1190,9 @@ fn padding(style: &ComputedValues, rect: PaintRect, content: Option<PaintRect>) 
         bottom: rect.y + rect.height - borders.bottom - (content.y + content.height),
         left: content.x - rect.x - borders.left,
     });
-    let px = |value: ComputedLengthPercentage, used: Option<f32>| match value {
-        ComputedLengthPercentage::Px(px) => px.max(0.0),
-        ComputedLengthPercentage::Percent(_) => used.unwrap_or(0.0).max(0.0),
+    let px = |value: ComputedLengthPercentageOrCalc, used: Option<f32>| match value {
+        ComputedLengthPercentageOrCalc::Px(px) => px.max(0.0),
+        _ => used.unwrap_or_else(|| value.resolve(0.0)).max(0.0),
     };
     Edges {
         top: px(style.padding.top, used.map(|edges| edges.top)),

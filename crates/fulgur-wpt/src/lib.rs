@@ -1,5 +1,6 @@
 //! WPT reftest runner for fulgur. See README for scope.
 
+pub mod backend;
 pub mod expectations;
 pub mod fonts;
 pub mod harness;

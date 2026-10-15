@@ -128,3 +128,77 @@ fn generated_and_ellipsis_preserve_visible_text() {
         assert_eq!(text, expected);
     }
 }
+
+#[test]
+fn translucent_first_line_draws_the_split_inline_box_line_by_line() {
+    // A translucent `::first-line` splits the span's box by line: the piece
+    // on the first line fades with the line, the rest is drawn on the page.
+    let html = format!(
+        "{ORDER_CSS}<style>#p::first-line {{ opacity: 0.5 }} \
+         #s {{ background: rgb(0, 0, 255); padding: 0 3px }}</style>\
+         <p id=p>A<span id=s>B<br>C</span></p>"
+    );
+    let (_dir, path) = input(&html);
+    let document = completed(&path);
+    let page = document.page(0).unwrap();
+    let runs = page.text_runs();
+    let events = page.paint_order_for_text_runs(&runs);
+    let pieces: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            raikiri_html::PaintEvent::LineBox(piece) => Some(*piece),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pieces.len(), 2);
+    let (first, rest) = if pieces[0].rect.y < pieces[1].rect.y {
+        (pieces[0], pieces[1])
+    } else {
+        (pieces[1], pieces[0])
+    };
+    assert!(first.has_start_edge && !first.has_end_edge);
+    assert!(!rest.has_start_edge && rest.has_end_edge);
+    // The ordered painter keeps the opacity group of the first line.
+    assert!(paint::supports_order(&page));
+
+    let (pdf, _) = operations(&html);
+    assert!(has_fill_opacity(&pdf, 0.5));
+    let forms = group_forms(&pdf);
+    assert!(
+        forms.iter().any(|form| form.contains("0 0 1 rg")),
+        "{forms:?}"
+    );
+    let content = pdf.get_page_content(pdf.get_pages()[&1]);
+    let content = String::from_utf8_lossy(&content);
+    assert!(content.contains("0 0 1 rg"), "{content}");
+}
+
+#[test]
+fn translucent_pseudo_element_composites_its_box_and_text_together() {
+    // A translucent `::before` is one opacity group whose id is not a DOM
+    // node; its background and glyphs fade together, inside one group.
+    let html = format!(
+        "{ORDER_CSS}<style>p::before {{ content: 'A'; background: rgb(0, 0, 255); \
+         opacity: 0.5 }}</style><p>kept</p>"
+    );
+    let (_dir, path) = input(&html);
+    let document = completed(&path);
+    let page = document.page(0).unwrap();
+    assert!(paint::supports_order(&page));
+    let (pdf, _) = operations(&html);
+    assert!(has_fill_opacity(&pdf, 0.5));
+    let forms = group_forms(&pdf);
+    assert!(
+        forms
+            .iter()
+            .any(|form| form.contains("0 0 1 rg") && form.contains(" Tj")),
+        "{forms:?}"
+    );
+    assert_eq!(
+        pdf.extract_text(&[1])
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["kept"]
+    );
+}

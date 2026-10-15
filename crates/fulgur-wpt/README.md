@@ -81,6 +81,28 @@ SKIP  css/css-page/flaky-test.html  # flaky on low-DPI rendering, tracked in ful
 
 原因追跡 issue を beads に起票して、修正後に `FAIL` か `PASS` に戻す。
 
+## Raikiri バックエンドでの計測
+
+既定では `fulgur` ファサード (Blitz) で描画する。環境変数 `FULGUR_WPT_ENGINE=raikiri` を付けると、未公開の Raikiri バックエンド (`crates/fulgur-raikiri` の Krilla ペインタ) を通した PDF で同じ reftest を走らせる。Raikiri は cargo feature `raikiri` を有効にしたときだけリンクされるため、Blitz 側の CI や公開 crate は Raikiri に依存しない。
+
+```bash
+FULGUR_WPT_ENGINE=raikiri cargo test -p fulgur-wpt --features raikiri \
+  --test wpt_lists -- wpt_list_bugs --nocapture
+```
+
+- expectations は `expectations/raikiri/<subdir>.txt` と `expectations/raikiri/lists/<name>.txt` に Blitz とは別に持つ。テスト関数は Blitz の `expectations/lists/` から生成されるので、Raikiri 側は同じ名前のファイルを置く。
+- レポートは `target/wpt-report/raikiri/<phase>/` に出る。`baseline-diff.json` と `summary.md` の「vs Blitz」節に、Blitz の expectations (宣言値) と比べて Raikiri だけが PASS するテスト・Raikiri だけが FAIL するテストを並べる。
+- `.github/workflows/raikiri.yml` の `wpt` ジョブが nightly と手動実行で css-page / multicol-1..3 / bugs / smoke を回す。計測用なので、回帰があってもジョブは落とさず issue も起票しない。
+- seed は `--list` で既存リストのテストを対象にできる。
+
+```bash
+FULGUR_WPT_ENGINE=raikiri cargo run --release -p fulgur-wpt --features raikiri \
+  --example seed -- \
+  --list crates/fulgur-wpt/expectations/lists/bugs.txt \
+  --wpt-root target/wpt \
+  --out crates/fulgur-wpt/expectations/raikiri/lists/bugs.txt
+```
+
 ## Cross-subdir cherry-pick lists (`expectations/lists/`)
 
 大量の WPT テストをサブディレクトリ単位で丸ごと回すのは高コストです。複数の WPT サブディレクトリから数本ずつテストを引きたい bug 用途向けに、`expectations/lists/<name>.txt` というファイルを置くと、そのリストに列挙されたテストだけを cherry-pick で実行できます。書式は phase ファイル (`css-page.txt` など) と同じ `PASS | FAIL | SKIP` で、パスは `css/` 配下の **任意のサブディレクトリ**を跨いで指定可能です。

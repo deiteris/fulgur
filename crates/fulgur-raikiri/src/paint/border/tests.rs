@@ -51,7 +51,7 @@ fn content(rule: Option<&raikiri_html::ColumnRule>) -> Vec<u8> {
     page.finish();
     let parsed = lopdf::Document::load_mem(&pdf.finish().unwrap()).unwrap();
     let page = *parsed.get_pages().values().next().unwrap();
-    parsed.get_page_content(page).unwrap()
+    parsed.get_page_content(page)
 }
 
 #[test]

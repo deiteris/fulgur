@@ -149,7 +149,7 @@ fn stylesheet_urls_resolve_against_the_stylesheet_like_a_browser() {
         };
         let bytes = render_with_options(&path, &Config::default(), &options).unwrap();
         let pdf = lopdf::Document::load_mem(&bytes).unwrap();
-        let content = pdf.get_page_content(pdf.get_pages()[&1]).unwrap();
+        let content = pdf.get_page_content(pdf.get_pages()[&1]);
         let operations = lopdf::content::Content::decode(&content)
             .unwrap()
             .operations;
@@ -186,7 +186,7 @@ fn images_outside_the_input_directory_are_not_read_even_with_a_bundle() {
     };
     let bytes = render_with_options(&path, &Config::default(), &options).unwrap();
     let pdf = lopdf::Document::load_mem(&bytes).unwrap();
-    let content = pdf.get_page_content(pdf.get_pages()[&1]).unwrap();
+    let content = pdf.get_page_content(pdf.get_pages()[&1]);
     let operations = lopdf::content::Content::decode(&content)
         .unwrap()
         .operations;
@@ -312,7 +312,7 @@ fn background_url_reads_local_files_without_a_bundle() {
     std::fs::write(dir.path().join("dot.png"), dot_png()).unwrap();
     let bytes = render(&path, &Config::default()).unwrap();
     let pdf = lopdf::Document::load_mem(&bytes).unwrap();
-    let content = pdf.get_page_content(pdf.get_pages()[&1]).unwrap();
+    let content = pdf.get_page_content(pdf.get_pages()[&1]);
     let operations = lopdf::content::Content::decode(&content)
         .unwrap()
         .operations;
@@ -431,7 +431,7 @@ fn html_string_bundles_resolve_against_the_base_directory_or_absolute_urls() {
         let bytes =
             render_html_with_options(&html, base_dir, &Config::default(), &options).unwrap();
         let pdf = lopdf::Document::load_mem(&bytes).unwrap();
-        let content = pdf.get_page_content(pdf.get_pages()[&1]).unwrap();
+        let content = pdf.get_page_content(pdf.get_pages()[&1]);
         let operations = lopdf::content::Content::decode(&content)
             .unwrap()
             .operations;

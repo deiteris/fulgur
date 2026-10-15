@@ -1,3 +1,4 @@
+use fulgur_wpt::backend::Backend;
 use fulgur_wpt::expectations::Expectation;
 use fulgur_wpt::harness::run_one;
 use std::io::Write;
@@ -48,7 +49,7 @@ fn identical_test_and_ref_pass() {
 
     let work = dir.path().join("work");
     let diff = dir.path().join("diff");
-    let out = run_one(&test, &work, &diff, 96, None).unwrap();
+    let out = run_one(&test, &work, &diff, 96, None, Backend::Blitz).unwrap();
     assert_eq!(out.observed, Expectation::Pass, "reason: {:?}", out.reason);
 }
 
@@ -86,7 +87,7 @@ fn page_count_mismatch_fails() {
 
     let work = dir.path().join("work");
     let diff = dir.path().join("diff");
-    let out = run_one(&test, &work, &diff, 96, None).unwrap();
+    let out = run_one(&test, &work, &diff, 96, None, Backend::Blitz).unwrap();
     assert_eq!(out.observed, Expectation::Fail);
     assert!(
         out.reason.as_deref().unwrap_or("").contains("page count"),
@@ -107,7 +108,7 @@ fn skipped_reftest_reports_skip() {
 
     let work = dir.path().join("work");
     let diff = dir.path().join("diff");
-    let out = run_one(&test, &work, &diff, 96, None).unwrap();
+    let out = run_one(&test, &work, &diff, 96, None, Backend::Blitz).unwrap();
     assert_eq!(out.observed, Expectation::Skip);
 }
 
@@ -135,6 +136,7 @@ fn mismatch_test_with_identical_ref_is_fail() {
         &root.join("diff"),
         96,
         None,
+        Backend::Blitz,
     )
     .unwrap();
     assert_eq!(
@@ -176,6 +178,7 @@ fn mismatch_test_with_different_ref_is_pass() {
         &root.join("diff"),
         96,
         None,
+        Backend::Blitz,
     )
     .unwrap();
     assert_eq!(
@@ -216,10 +219,41 @@ div { height: 50px; break-after: page; }
         &root.join("diff"),
         96,
         None,
+        Backend::Blitz,
     )
     .unwrap();
     assert_eq!(
         outcome.observed,
         fulgur_wpt::expectations::Expectation::Pass
     );
+}
+
+#[cfg(feature = "raikiri")]
+#[test]
+fn raikiri_backend_renders_matching_reftest() {
+    if !poppler_available() {
+        eprintln!("skip: no pdftocairo");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let test_html = r#"<!DOCTYPE html>
+<link rel="match" href="r-ref.html">
+<body style="margin:0"><div style="width:50px;height:50px;background:green"></div></body>"#;
+    let ref_html = r#"<!DOCTYPE html>
+<body style="margin:0"><div style="width:50px;height:50px;background:green"></div></body>"#;
+    std::fs::write(root.join("t.html"), test_html).unwrap();
+    std::fs::write(root.join("r-ref.html"), ref_html).unwrap();
+
+    let outcome = run_one(
+        &root.join("t.html"),
+        &root.join("work"),
+        &root.join("diff"),
+        96,
+        None,
+        Backend::Raikiri,
+    )
+    .unwrap();
+    assert_eq!(outcome.observed, Expectation::Pass, "{:?}", outcome.reason);
 }

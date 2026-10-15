@@ -1895,9 +1895,7 @@ fn count_red_fill_ops(pdf: &[u8]) -> usize {
     let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
     let mut count = 0;
     for (_, page_id) in doc.get_pages() {
-        let bytes = doc
-            .get_page_content(page_id)
-            .expect("page content stream readable");
+        let bytes = doc.get_page_content(page_id);
         count += count_red_in_content(&bytes);
     }
     for obj in doc.objects.values() {
@@ -3098,9 +3096,7 @@ fn multicol_inline_root_split_skips_slices_outside_current_page() {
     // `needs_partition = false`) on Linux 2026-05-03: the sweep fails
     // with "page 2: Tm at y=126.1, outside [-25, 125]".
     for (&page_num, &page_id) in &pages {
-        let bytes = doc
-            .get_page_content(page_id)
-            .expect("page content stream readable");
+        let bytes = doc.get_page_content(page_id);
         let content =
             lopdf::content::Content::decode(&bytes).expect("page content stream decodable");
         for op in &content.operations {

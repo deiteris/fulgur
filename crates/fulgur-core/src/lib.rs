@@ -64,24 +64,18 @@ pub const MAX_PDF_PARENT_DEPTH: usize = 128;
 /// what gets parsed, not what gets allocated: a page carrying many small
 /// compressed streams would still inflate all of them first.
 ///
-/// Three residual amplifications belong to `lopdf` rather than to fulgur, and
-/// this bound is the only lever over any of them, because each has already
-/// allocated by the time fulgur could observe a size. Reimplementing the
-/// surrounding `lopdf` logic to bound them would risk diverging from it, and the
-/// property being protected here is that `inspect` output stays byte-identical
-/// across the repository corpus:
+/// Each content stream is decoded with
+/// `Stream::decompressed_content_with_limit`, every filter stage bounded to a
+/// small multiple of this value, so a single stream that would decode far past
+/// it is rejected as soon as its output (or any intermediate filter stage's
+/// output) outgrows that bound, instead of being inflated in full first. A
+/// stream whose final output reaches this bound is skipped as it always was.
+///
+/// Two residual amplifications belong to `lopdf` rather than to fulgur, and
+/// this bound is the only lever over either of them, because each has already
+/// allocated by the time fulgur could observe a size:
 ///
 /// - `Content::decode`'s ~570 bytes per operation, above.
-/// - A *single* content stream whose decoded size exceeds this bound is still
-///   inflated in full by `Stream::decompressed_content` before its length can
-///   be measured. Bounding that from fulgur would mean reimplementing the
-///   filter chain (Flate/LZW/ASCII85 plus predictors, and `lopdf`'s raw-deflate
-///   retry for streams with a corrupt adler32 checksum) against a size-limited
-///   reader — which would silently stop inspecting PDFs that decode today.
-///   Note that [`inspect::gather_page_content`]'s decoded-stream cache reduces
-///   this to *once per document* rather than once per referring page, including
-///   for a filter chain whose intermediate stage is large while both its encoded
-///   and decoded lengths are small.
 /// - `Document::get_page_contents` materialises a page's whole `/Contents` array
 ///   into a `Vec<ObjectId>` before any of it can be charged, so one such build
 ///   per pass is unavoidable from here. Measured at ~4 MB for a 500k-reference
@@ -90,6 +84,34 @@ pub const MAX_PDF_PARENT_DEPTH: usize = 128;
 ///   budget on the first page that walks it.
 #[doc(hidden)]
 pub const MAX_PDF_CONTENT_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on how many bytes any single stream may decode to while
+/// [`inspect::inspect`] *loads* a PDF.
+///
+/// `lopdf` decodes object streams (`/Type /ObjStm`) and cross-reference streams
+/// eagerly during `Document::load`, before any fulgur code can look at them,
+/// and applies no size limit unless `LoadOptions::max_decompressed_size` is
+/// set. Without it a few kilobytes of Flate data can inflate into gigabytes in
+/// a single stream and exhaust memory before inspection starts. An object
+/// stream over this bound is dropped by `lopdf`'s lenient loader (its objects
+/// become unresolvable, as for any other unreadable object stream) rather than
+/// failing the whole load.
+///
+/// 16 MiB leaves wide headroom for real documents: object and xref streams
+/// hold only dictionaries, arrays, numbers and offsets — never page content,
+/// images or fonts, which live in their own streams and are not decoded at
+/// load time — and an xref stream of this size already indexes over two
+/// million objects.
+///
+/// This bounds each stream, not the document. The number of object streams is
+/// limited only by the input, the objects parsed out of them stay in the loaded
+/// `Document`, and `lopdf` decodes object streams in parallel, so a small file
+/// built from many streams just under the bound can still make loading
+/// allocate far more than its own size. Bounding that would mean replacing
+/// `lopdf`'s loader; this bound removes the single-stream bomb, which needs no
+/// such effort from an attacker.
+#[doc(hidden)]
+pub const MAX_PDF_LOAD_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whole-document budget on how many bytes of *decoded* page content
 /// [`inspect::inspect`] will parse, across all pages, in each of its two passes.
@@ -127,7 +149,7 @@ pub const MAX_PDF_INSPECT_CONTENT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 /// one content stream, regardless of how few bytes it decodes to.
 ///
 /// Charging a stream only for its decoded length undercounts it: resolving the
-/// object and calling `decompressed_content` costs the same whether the result
+/// object and calling `decompressed_content_with_limit` costs the same whether the result
 /// is one byte or none. A `/Contents` array of many *zero-length* streams —
 /// itself shareable across pages by one indirect reference — would otherwise
 /// draw the budget down by ~1 byte per stream, so a 1.8 MB file could keep

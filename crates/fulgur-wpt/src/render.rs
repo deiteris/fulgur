@@ -2,6 +2,7 @@
 //! pdftocairo. CRITICAL: must not pass `-f 1 -l 1` to pdftocairo — we
 //! need every page to catch multi-page regressions (advisor P1-1).
 
+use crate::backend::Backend;
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ pub struct RenderedTest {
 /// `dpi` controls pdftocairo's rasterization resolution.
 /// `assets`: optional bundle of fonts/images injected into the engine
 /// (cloned internally; `AssetBundle` stores shared `Arc`s so clones are cheap).
+/// `backend`: layout backend that produces the PDF.
 // MSRV bump to 1.89 (PR #701) makes clippy suggest collapsing the nested
 // `if`/`if let` below into a let-chain; left as-is because the collapse
 // would touch the (untested) stale-PNG removal error branch and trip
@@ -31,9 +33,8 @@ pub fn render_test(
     work_dir: &Path,
     dpi: u32,
     assets: Option<&fulgur::asset::AssetBundle>,
+    backend: Backend,
 ) -> Result<RenderedTest> {
-    use fulgur::engine::Engine;
-
     std::fs::create_dir_all(work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
     let abs = test_html_path
@@ -44,14 +45,13 @@ pub fn render_test(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("test has no parent dir: {}", abs.display()))?;
 
-    let mut builder = Engine::builder().base_path(base);
-    if let Some(b) = assets {
-        builder = builder.assets(b.clone());
-    }
-    let engine = builder.build();
-    let pdf_bytes = engine
-        .render(&html)
-        .map_err(|e| anyhow::anyhow!("fulgur render failed for {}: {e}", abs.display()))?;
+    // Keep the cause in the message itself: callers format errors with
+    // `{e}`, which drops inner anyhow contexts. Only the file name is used
+    // so seeded expectation comments stay machine-independent.
+    let file_name = abs.file_name().unwrap_or_default().to_string_lossy();
+    let pdf_bytes = backend
+        .render_pdf(&html, base, assets)
+        .map_err(|e| anyhow::anyhow!("render {file_name}: {e}"))?;
 
     // Remove stale page PNGs from prior runs so page count is accurate.
     let prefix = work_dir.join("page");

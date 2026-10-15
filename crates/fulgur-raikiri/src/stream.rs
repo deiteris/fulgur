@@ -10,7 +10,7 @@
 
 use crate::bookmarks::{BookmarkCollector, OutlineBuilder};
 use crate::paint::navigation::PageLink;
-use crate::paint::{LinkTargets, Painter, document_lang, html_title};
+use crate::paint::{LinkTargets, Painter, document_lang, html_title, margin_boxes};
 use crate::tagging::Tags;
 use crate::{RenderOptions, Source, bookmarks, metadata, page_defaults, with_resources};
 use fulgur_core::{Config, Error, Result};
@@ -163,7 +163,7 @@ impl<'a> PdfSink<'a, '_> {
             self.start(Some(&page), base)?;
         }
         let painter = self.painter.as_mut().expect("started above");
-        let margin_boxes = page.margin_boxes();
+        let margin_boxes = margin_boxes(&page);
         let deferred = margin_boxes
             .iter()
             .any(|margin_box| !margin_box.deferred.is_empty());
@@ -228,14 +228,19 @@ impl<'a> PdfSink<'a, '_> {
             )?;
             extra_pages.push(index as u32);
         }
+        let rotations = painter.take_rotations();
         let pdf = painter.finish(self.lang)?;
         // Before the merge, which writes object streams and a cross-reference
         // stream that this in-place rewrite does not handle.
         let pdf = bookmarks::apply_open_state(pdf, &open)?;
-        if extra_pages.is_empty() {
-            return Ok(pdf);
-        }
-        crate::merge::merge_extra_pages(pdf, &extra_pages)
+        // The extra pages come after the delivered ones, so merging them
+        // leaves the page indices of the rotations as they are.
+        let pdf = if extra_pages.is_empty() {
+            pdf
+        } else {
+            crate::merge::merge_extra_pages(pdf, &extra_pages)?
+        };
+        rotations.apply(pdf)
     }
 }
 

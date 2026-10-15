@@ -5,6 +5,7 @@
 //! build.rs at compile time. No edits here are required when adding a
 //! new list — just drop a .txt file.
 
+use fulgur_wpt::backend::Backend;
 use fulgur_wpt::runner::run_list;
 use std::path::PathBuf;
 
@@ -20,11 +21,27 @@ fn workspace_root() -> PathBuf {
 
 #[allow(dead_code)]
 fn run(list_name: &str) {
-    let expectations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("expectations/lists")
-        .join(format!("{list_name}.txt"));
-    let outcome =
-        run_list(&workspace_root(), list_name, &expectations, 96).expect("runner should not error");
+    let backend = Backend::from_env().expect("FULGUR_WPT_ENGINE");
+    let file_name = format!("{list_name}.txt");
+    // Blitz lists define which test functions exist (see build.rs); another
+    // backend runs the same-named list from its own expectations directory
+    // and compares against the Blitz list.
+    let blitz_lists = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("expectations/lists");
+    let expectations = backend
+        .expectations_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("expectations"))
+        .join("lists")
+        .join(&file_name);
+    let baseline = blitz_lists.join(&file_name);
+    let baseline = backend.subdir().map(|_| baseline.as_path());
+    let outcome = run_list(
+        &workspace_root(),
+        list_name,
+        &expectations,
+        96,
+        backend,
+        baseline,
+    )
+    .expect("runner should not error");
     match outcome {
         Some(o) => eprintln!("list {list_name} report at {}", o.report_dir.display()),
         // `FULGUR_WPT_REQUIRED=1` is set only by the dedicated `wpt`

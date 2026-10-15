@@ -16,47 +16,60 @@ use std::rc::Rc;
 /// Name of the form XObject in the resources of a merged page.
 const FORM_NAME: &[u8] = b"/FulgurMarginBoxes";
 
-type Document = Pdf<BufReader<File>>;
+pub(crate) type Document = Pdf<BufReader<File>>;
 
 /// Merge extra page `k` (counted after the last page) into page
 /// `targets[k]`, both zero-based, and remove the extra pages.
+pub(crate) fn merge_extra_pages(pdf: Vec<u8>, targets: &[u32]) -> Result<Vec<u8>> {
+    rewrite(pdf, "merging streamed pages", |document| {
+        let pages = flpdf::pages::page_refs(document).map_err(pdf_error)?;
+        let first_extra = pages
+            .len()
+            .checked_sub(targets.len())
+            .ok_or_else(|| Error::PdfGeneration("missing extra pages".into()))?;
+        for (offset, &target) in targets.iter().enumerate() {
+            let target = *pages
+                .get(target as usize)
+                .filter(|_| (target as usize) < first_extra)
+                .ok_or_else(|| Error::PdfGeneration("extra page target out of range".into()))?;
+            merge_page(document, pages[first_extra + offset], target).map_err(pdf_error)?;
+        }
+        let mut helper = PageDocumentHelper::new(document);
+        for &extra in &pages[first_extra..] {
+            helper.remove_page(extra).map_err(pdf_error)?;
+        }
+        update_page_count(document, first_extra).map_err(pdf_error)
+    })
+}
+
+/// Open `pdf`, change it with `edit`, and write it out again. Errors of
+/// reading and writing the PDF name what was being done, `context`.
 ///
 /// The PDF moves to a temporary file first: flpdf reads objects from its
 /// input as it needs them, so the input bytes are not held in memory next
 /// to the parsed objects and the output.
-pub(crate) fn merge_extra_pages(pdf: Vec<u8>, targets: &[u32]) -> Result<Vec<u8>> {
+pub(crate) fn rewrite(
+    pdf: Vec<u8>,
+    context: &str,
+    edit: impl FnOnce(&mut Document) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let error = |error: flpdf::Error| Error::PdfGeneration(format!("{context}: {error}"));
     let mut file = tempfile::tempfile()?;
     file.write_all(&pdf)?;
     drop(pdf);
     file.rewind()?;
-    let mut document = Pdf::open(BufReader::new(file)).map_err(pdf_error)?;
-    let pages = flpdf::pages::page_refs(&mut document).map_err(pdf_error)?;
-    let first_extra = pages
-        .len()
-        .checked_sub(targets.len())
-        .ok_or_else(|| Error::PdfGeneration("missing extra pages".into()))?;
-    for (offset, &target) in targets.iter().enumerate() {
-        let target = *pages
-            .get(target as usize)
-            .filter(|_| (target as usize) < first_extra)
-            .ok_or_else(|| Error::PdfGeneration("extra page target out of range".into()))?;
-        merge_page(&mut document, pages[first_extra + offset], target).map_err(pdf_error)?;
-    }
-    let mut helper = PageDocumentHelper::new(&mut document);
-    for &extra in &pages[first_extra..] {
-        helper.remove_page(extra).map_err(pdf_error)?;
-    }
-    update_page_count(&mut document, first_extra).map_err(pdf_error)?;
-    // The writer only keeps objects reachable from the trailer, so the
-    // removed pages and their content streams are dropped.
+    let mut document = Pdf::open(BufReader::new(file)).map_err(error)?;
+    edit(&mut document)?;
+    // The writer only keeps objects reachable from the trailer, so removed
+    // pages and their content streams are dropped.
     let mut writer = flpdf::PdfWriter::new(&mut document);
-    writer.set_output_memory().map_err(pdf_error)?;
+    writer.set_output_memory().map_err(error)?;
     writer.set_deterministic_id(true);
     // Krilla writes no object streams; packing the objects into them makes
-    // the merged PDF smaller than the PDF of a batch render.
+    // the rewritten PDF smaller than the one Krilla wrote.
     writer.set_object_stream_mode(flpdf::ObjectStreamMode::Generate);
-    writer.write().map_err(pdf_error)?;
-    writer.get_buffer().map_err(pdf_error)
+    writer.write().map_err(error)?;
+    writer.get_buffer().map_err(error)
 }
 
 fn merge_page(document: &mut Document, extra: ObjectRef, target: ObjectRef) -> flpdf::Result<()> {

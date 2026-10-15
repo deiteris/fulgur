@@ -191,7 +191,7 @@ fn repeated_table_headers_are_tagged_once() {
     let mut marks = String::new();
     kids(&pdf, header[0].get(b"K").unwrap(), &mut marks);
     assert_eq!(marks, "#");
-    let second = pdf.get_page_content(pdf.get_pages()[&2]).unwrap();
+    let second = pdf.get_page_content(pdf.get_pages()[&2]);
     assert!(
         String::from_utf8_lossy(&second).contains("/Artifact"),
         "the repeated header is an artifact on later pages"
@@ -229,8 +229,7 @@ fn box_decorations_and_margin_boxes_are_artifacts() {
         "<style>@page { @bottom-center { content: 'Footer' } } p { background: red }</style><p>Body</p>",
         &tagged(),
     );
-    let content =
-        String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1]).unwrap()).into_owned();
+    let content = String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1])).into_owned();
     assert!(content.contains("/Artifact"), "{content}");
     assert!(content.contains("/Footer"), "{content}");
     assert_eq!(outline(&pdf), "Document[P[#]]");
@@ -242,8 +241,7 @@ fn text_shadows_are_artifacts() {
         "<p style='text-shadow: 2px 2px red, 4px 4px blue'>Body</p>",
         &tagged(),
     );
-    let content =
-        String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1]).unwrap()).into_owned();
+    let content = String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1])).into_owned();
     assert!(content.contains("/Artifact"), "{content}");
     assert_eq!(outline(&pdf), "Document[P[#]]");
 }
@@ -256,12 +254,14 @@ fn pdf_ua_output_validates() {
         .lang("en")
         .build();
     let pdf = tagged_pdf(
-        "<h1>Report</h1><p>Body with <a href='https://example.com/'>a link</a>.</p>\
+        "<style>p::before{content:'* ' / 'Note: '} p::after{content:' ~' / ''}</style>\
+         <h1>Report</h1><p>Body with <a href='https://example.com/'>a link</a>.</p>\
          <ul><li>Item</li></ul>",
         &config,
     );
     let catalog = pdf.catalog().unwrap();
     assert!(catalog.has(b"StructTreeRoot"));
+    assert_eq!(text(elements(&pdf, b"Span")[0], b"Alt"), "Note: ");
     assert!(catalog.has(b"Outlines"), "PDF/UA implies bookmarks");
 }
 
@@ -538,8 +538,7 @@ fn running_elements_are_footer_and_header_artifacts() {
          <div class='hdr'><a href='https://example.com/'>Home</a></div><p>Body</p>",
         &config,
     );
-    let content =
-        String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1]).unwrap()).into_owned();
+    let content = String::from_utf8_lossy(&pdf.get_page_content(pdf.get_pages()[&1])).into_owned();
     assert!(content.contains("/Header"), "{content}");
     let page = pdf.get_dictionary(pdf.get_pages()[&1]).unwrap();
     let annotation = resolve(&pdf, &page.get(b"Annots").unwrap().as_array().unwrap()[0])
@@ -578,7 +577,7 @@ fn generated_content_images_are_tagged_in_reading_order() {
 /// text, `I` for an image, whether an XObject or filled vector paths.
 fn mcid_kinds(pdf: &Document) -> std::collections::HashMap<i64, char> {
     let page_id = *pdf.get_pages().values().next().unwrap();
-    let content = lopdf::content::Content::decode(&pdf.get_page_content(page_id).unwrap()).unwrap();
+    let content = lopdf::content::Content::decode(&pdf.get_page_content(page_id)).unwrap();
     let mut kinds = std::collections::HashMap::new();
     let mut open: Vec<Option<i64>> = Vec::new();
     for operation in &content.operations {
@@ -640,6 +639,106 @@ fn after_images_follow_the_element_text() {
         &tagged(),
     );
     assert_eq!(paragraph_leaves(&pdf), "ITI");
+}
+
+#[test]
+fn generated_text_and_images_keep_their_content_list_order() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    // Paint draws the line's image before its text; the structure follows
+    // the `content` list instead.
+    let pdf = tagged_pdf(
+        &format!("<style>p::before{{content:'Note: ' {image} ' end '}}</style><p>Body</p>"),
+        &tagged(),
+    );
+    assert_eq!(paragraph_leaves(&pdf), "TITT");
+}
+
+#[test]
+fn generated_images_on_mixed_direction_lines_keep_paint_order() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    // A line that mixes bidi directions gives the image no offset, so it
+    // keeps its place before the line's text.
+    let pdf = tagged_pdf(
+        &format!(
+            "<style>p::before{{content:'Note: ' {image} ' \u{5e9}\u{5dc}\u{5d5}\u{5dd} '}}</style>\
+             <p>Body</p>"
+        ),
+        &tagged(),
+    );
+    // The number of text runs depends on the fonts that cover Hebrew.
+    let leaves = paragraph_leaves(&pdf);
+    assert!(leaves.starts_with('I'), "{leaves}");
+    assert!(leaves[1..].len() >= 2 && leaves[1..].chars().all(|kind| kind == 'T'));
+}
+
+#[test]
+fn generated_content_with_alternative_text_is_a_span_with_alt() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    let pdf = tagged_pdf(
+        &format!(
+            "<style>p::before{{content:{image} ' Note: ' / attr(data-kind) ' note'}}</style>\
+             <p data-kind=Warning>Body</p>"
+        ),
+        &tagged(),
+    );
+    // The image and the text of the pseudo-element share the Span, read in
+    // their content-list order, and the element's own text follows it.
+    assert_eq!(outline(&pdf), "Document[P[Span[# #] #]]");
+    let span = elements(&pdf, b"Span")[0];
+    assert_eq!(text(span, b"Alt"), "Warning note");
+}
+
+#[test]
+fn generated_content_with_empty_alternative_text_is_an_artifact() {
+    let image = "url(\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' \
+                 width='8' height='8'><rect width='8' height='8'/></svg>\")";
+    let pdf = tagged_pdf(
+        &format!(
+            "<style>p::before{{content:{image} ' * ' / ''}} \
+             p::after{{content:' end'}}</style><p>Body</p>"
+        ),
+        &tagged(),
+    );
+    // The decorative `::before` leaves only the text and the `::after`.
+    assert_eq!(paragraph_leaves(&pdf), "TT");
+    assert!(elements(&pdf, b"Span").is_empty());
+}
+
+#[test]
+fn marker_alternative_text_names_the_label() {
+    let pdf = tagged_pdf(
+        "<style>li::marker{content:'* ' / 'Important'}</style><ul><li>First</li></ul>",
+        &tagged(),
+    );
+    assert_eq!(outline(&pdf), "Document[L[LI[Lbl[#] LBody[#]]]]");
+    let label = elements(&pdf, b"Lbl")[0];
+    assert_eq!(text(label, b"Alt"), "Important");
+}
+
+#[test]
+fn decorative_markers_are_artifacts() {
+    // The label stays, but the marker it held is drawn as an artifact.
+    let pdf = tagged_pdf(
+        "<style>li::marker{content:'* ' / ''}</style><ul><li>First</li></ul>",
+        &tagged(),
+    );
+    assert_eq!(outline(&pdf), "Document[L[LI[Lbl[] LBody[#]]]]");
+}
+
+#[test]
+fn markers_outside_list_items_belong_to_their_element() {
+    // A list item that is not an `<li>` has no label, so its marker is
+    // content of the element, before its text.
+    let pdf = tagged_pdf(
+        "<p style='display:list-item;list-style:inside decimal'>Body</p>",
+        &tagged(),
+    );
+    assert!(elements(&pdf, b"Lbl").is_empty());
+    let leaves = paragraph_leaves(&pdf);
+    assert!(leaves.len() >= 2 && leaves.chars().all(|kind| kind == 'T'));
 }
 
 #[test]

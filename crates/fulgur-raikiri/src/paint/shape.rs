@@ -60,12 +60,21 @@ impl Slice {
 
     /// The physical inline edges missing from one generated line piece.
     pub(super) fn generated(piece: &raikiri_html::GeneratedBox<'_>) -> Self {
-        let (left, right) =
-            if piece.style.direction == raikiri_html::computed::ComputedDirection::Rtl {
-                (!piece.has_end_edge, !piece.has_start_edge)
-            } else {
-                (!piece.has_start_edge, !piece.has_end_edge)
-            };
+        Self::line_piece(piece.style, piece.has_start_edge, piece.has_end_edge)
+    }
+
+    /// The physical inline edges missing from one line's piece of an inline
+    /// box whose style is `style`, given which logical edges it holds.
+    pub(super) fn line_piece(
+        style: &raikiri_html::computed::ComputedValues,
+        has_start_edge: bool,
+        has_end_edge: bool,
+    ) -> Self {
+        let (left, right) = if style.direction == raikiri_html::computed::ComputedDirection::Rtl {
+            (!has_end_edge, !has_start_edge)
+        } else {
+            (!has_start_edge, !has_end_edge)
+        };
         Self {
             left,
             right,

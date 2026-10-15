@@ -46,9 +46,7 @@ fn count_red_ops_on_page(pdf: &[u8], page_number: u32) -> usize {
         .get_pages()
         .get(&page_number)
         .expect("requested page should exist");
-    let bytes = document
-        .get_page_content(page_id)
-        .expect("page content stream should be readable");
+    let bytes = document.get_page_content(page_id);
     count_red_ops_in_content(&bytes)
 }
 

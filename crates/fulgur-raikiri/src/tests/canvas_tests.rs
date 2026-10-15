@@ -146,3 +146,25 @@ fn the_canvas_goes_under_the_margin_boxes() {
     assert_eq!(fills.first(), Some(&[0, 0, 255]), "{fills:?}");
     assert!(fills.contains(&[255, 0, 0]), "{fills:?}");
 }
+
+#[test]
+fn a_root_without_a_box_draws_no_margin_boxes() {
+    // Browsers print a document whose root has `display: none` as blank
+    // paper, without its margin boxes.
+    let css = "<style>@page { size: 300px 200px; margin: 20px; \
+        @top-center { content: 'head'; background: rgb(255, 0, 0) } }</style>";
+    let (_dir, path) = input(&format!(
+        "<html style=\"display: none\"><head>{css}</head><body><p>one</p></body></html>"
+    ));
+    let bytes = render(&path, &Config::default()).expect("PDF bytes");
+    let pdf = lopdf::Document::load_mem(&bytes).expect("a readable PDF");
+    assert!(fills(&page_operations(&pdf, 1)).is_empty());
+    assert_eq!(pdf.extract_text(&[1]).unwrap().trim(), "");
+    // With a box, the same margin box is drawn.
+    let (_dir, path) = input(&format!(
+        "<html><head>{css}</head><body><p>one</p></body></html>"
+    ));
+    let bytes = render(&path, &Config::default()).expect("PDF bytes");
+    let pdf = lopdf::Document::load_mem(&bytes).expect("a readable PDF");
+    assert_eq!(fills(&page_operations(&pdf, 1)), [[255, 0, 0]]);
+}

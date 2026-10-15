@@ -4,8 +4,11 @@
 //!     cargo run -p fulgur-wpt --example run_one -- <test.html> [--dpi N]
 //!
 //! Outputs are written under `target/wpt-run/<test-stem>/` (test/, ref/, diff/).
+//! Set `FULGUR_WPT_ENGINE=raikiri` (with `--features raikiri`) to render
+//! through the Raikiri backend; its outputs go under `target/wpt-run/raikiri/`.
 
 use anyhow::{Context, Result, bail};
+use fulgur_wpt::backend::Backend;
 use fulgur_wpt::expectations::Expectation;
 use fulgur_wpt::harness::run_one;
 use std::path::{Path, PathBuf};
@@ -31,21 +34,23 @@ fn main() -> Result<()> {
         }
     }
 
+    let backend = Backend::from_env()?;
     let test_path = PathBuf::from(&test_arg);
     let stem = Path::new(&test_arg)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "test".to_string());
-    let out_root = PathBuf::from("target/wpt-run").join(&stem);
+    let out_root = backend.run_root(Path::new("")).join(&stem);
     let work_dir = out_root.join("work");
     let diff_dir = out_root.join("diff");
 
     println!("test:    {}", test_path.display());
+    println!("engine:  {}", backend.name());
     println!("dpi:     {dpi}");
     println!("work:    {}", work_dir.display());
     println!("diff:    {}", diff_dir.display());
 
-    let outcome = run_one(&test_path, &work_dir, &diff_dir, dpi, None)?;
+    let outcome = run_one(&test_path, &work_dir, &diff_dir, dpi, None, backend)?;
     let verdict = match outcome.observed {
         Expectation::Pass => "PASS",
         Expectation::Fail => "FAIL",

@@ -22,10 +22,23 @@
 //!         --shards 3 \
 //!         --output-prefix crates/fulgur-wpt/expectations/lists/multicol-
 //!
+//! To seed from the tests of an existing list instead of a whole
+//! subdirectory, pass `--list <file>` in place of `--subdir`.
+//!
+//! Set `FULGUR_WPT_ENGINE=raikiri` (with `--features raikiri`) to seed the
+//! Raikiri backend's expectations, e.g.
+//!
+//!     FULGUR_WPT_ENGINE=raikiri cargo run -p fulgur-wpt --features raikiri \
+//!         --example seed -- \
+//!         --list crates/fulgur-wpt/expectations/lists/bugs.txt \
+//!         --wpt-root target/wpt \
+//!         --out crates/fulgur-wpt/expectations/raikiri/lists/bugs.txt
+//!
 //! The expectations format matches `ExpectationFile::parse()`.
 
 use anyhow::{Context, Result, bail};
-use fulgur_wpt::expectations::Expectation;
+use fulgur_wpt::backend::Backend;
+use fulgur_wpt::expectations::{Expectation, ExpectationFile};
 use fulgur_wpt::fonts::load_fonts_dir;
 use fulgur_wpt::harness::run_one;
 use fulgur_wpt::reftest::collect_reftest_files;
@@ -37,12 +50,14 @@ use std::time::Instant;
 
 fn main() -> Result<()> {
     let mut subdir: Option<String> = None;
+    let mut list: Option<PathBuf> = None;
     let mut wpt_root: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--subdir" => subdir = Some(args.next().context("--subdir needs value")?),
+            "--list" => list = Some(PathBuf::from(args.next().context("--list needs value")?)),
             "--wpt-root" => {
                 wpt_root = Some(PathBuf::from(
                     args.next().context("--wpt-root needs value")?,
@@ -52,12 +67,9 @@ fn main() -> Result<()> {
             other => bail!("unknown flag: {other}"),
         }
     }
-    let subdir = subdir.context("--subdir required (e.g. css-page)")?;
     let wpt_root = wpt_root.context("--wpt-root required")?;
     let out = out.context("--out required")?;
-
-    let dir = wpt_root.join("css").join(&subdir);
-    anyhow::ensure!(dir.is_dir(), "not a directory: {}", dir.display());
+    let backend = Backend::from_env()?;
 
     // Runner の execute_and_report と同条件で測定するために
     // target/wpt/fonts を同じく登録する（さもないと seed の PASS/FAIL
@@ -75,11 +87,49 @@ fn main() -> Result<()> {
     // Recursive walk via the shared helper — handles nested subdirectories
     // (tentative/, margin-boxes/, cssom/, ...) and the `-ref.tentative.html`
     // edge case that a suffix-only filter misses.
-    let tests = collect_reftest_files(&dir).context("collect reftest files")?;
+    let (tests, source) = match (subdir, list) {
+        (Some(subdir), None) => {
+            let dir = wpt_root.join("css").join(&subdir);
+            anyhow::ensure!(dir.is_dir(), "not a directory: {}", dir.display());
+            let tests = collect_reftest_files(&dir).context("collect reftest files")?;
+            (tests, dir)
+        }
+        (None, Some(list)) => {
+            let declared =
+                ExpectationFile::load(&list).with_context(|| format!("load {}", list.display()))?;
+            // Same entry checks as `runner::run_list`: never leave wpt_root,
+            // and report entries missing from the snapshot instead of
+            // seeding them as harness failures.
+            let mut tests = Vec::new();
+            for rel in declared.paths() {
+                let rel_path = Path::new(rel);
+                let escapes = rel_path.is_absolute()
+                    || rel_path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                let abs = wpt_root.join(rel_path);
+                if escapes || !abs.is_file() {
+                    eprintln!(
+                        "warn: skipping {rel}: not a file under {}",
+                        wpt_root.display()
+                    );
+                    continue;
+                }
+                tests.push(abs);
+            }
+            (tests, list)
+        }
+        _ => bail!("pass exactly one of --subdir (e.g. css-page) or --list <file>"),
+    };
+    let seed_root = backend.scoped(Path::new("target/wpt-seed"));
 
     let mut results: BTreeMap<String, (Expectation, Option<String>)> = BTreeMap::new();
     let total = tests.len();
-    println!("Running {total} reftests in {}", dir.display());
+    println!(
+        "Running {total} reftests from {} ({})",
+        source.display(),
+        backend.name()
+    );
     let start = Instant::now();
 
     for (i, test) in tests.iter().enumerate() {
@@ -89,10 +139,10 @@ fn main() -> Result<()> {
             .to_string_lossy()
             .replace('\\', "/");
         let stem = test.file_stem().unwrap().to_string_lossy();
-        let work = PathBuf::from("target/wpt-seed").join(&*stem).join("work");
-        let diff = PathBuf::from("target/wpt-seed").join(&*stem).join("diff");
+        let work = seed_root.join(&*stem).join("work");
+        let diff = seed_root.join(&*stem).join("diff");
         let outcome = match catch_unwind(AssertUnwindSafe(|| {
-            run_one(test, &work as &Path, &diff as &Path, 96, fonts_arg)
+            run_one(test, &work as &Path, &diff as &Path, 96, fonts_arg, backend)
         })) {
             Ok(Ok(o)) => (o.observed, o.reason),
             Ok(Err(e)) => (Expectation::Fail, Some(format!("harness error: {e}"))),

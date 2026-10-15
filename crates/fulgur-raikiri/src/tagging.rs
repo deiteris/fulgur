@@ -5,9 +5,12 @@
 //! each draw in marked content: text, images and list markers become content
 //! of the structure element their node belongs to, while box decorations,
 //! margin boxes and repeated copies (table headers and `position: fixed`
-//! boxes after their first page) become artifacts. Link annotations are added
-//! as tagged annotations of their `<a>` element. After the last page the
-//! structure tree is assembled in document order.
+//! boxes after their first page) become artifacts. The content of a
+//! `::before` or `::after` with alternative text is grouped in a `Span`
+//! carrying it as `/Alt` (a marker's goes on its list label), or is an
+//! artifact when that text is empty. Link
+//! annotations are added as tagged annotations of their `<a>` element. After
+//! the last page the structure tree is assembled in document order.
 
 use fulgur_core::tagging::{ListNumbering, PdfTag, TableHeaderScope, classify_element};
 use krilla::annotation::{Annotation, LinkAnnotation};
@@ -101,7 +104,7 @@ impl Tags {
         let Some(tagger) = &mut self.0 else {
             return draw(surface);
         };
-        match tagger.resolve(page.dom(), target) {
+        match tagger.resolve(page, target) {
             Mark::Artifact(kind) => {
                 surface.start_tagged(ContentTag::Artifact(kind));
                 let result = draw(surface);
@@ -251,8 +254,16 @@ enum Mark {
 }
 
 /// Sort key of an item within its structure element: the DOM preorder
-/// position of its source, then the order in which it was drawn.
-type Key = (u32, u64);
+/// position of its source, its [`Place`] in the text, then the order in
+/// which it was drawn.
+type Key = (u32, Place, u64);
+
+/// Where generated content sits in the text of its pseudo-element: the
+/// line index in its paragraph and the UTF-8 offset in that line's
+/// processed text. Ordering by it puts the text and images of one `content`
+/// list in reading order, while paint draws a line's images before its
+/// text. Other content has the default place and keeps its drawing order.
+type Place = (usize, usize);
 
 struct Element {
     tag: PdfTag,
@@ -483,7 +494,7 @@ fn krilla_tag(tag: &PdfTag, title: Option<String>, alt: Option<String>) -> TagKi
             Tag::Hn(level, title).into()
         }
         PdfTag::Div => Tag::<kind::Div>::Div.into(),
-        PdfTag::Span => Tag::<kind::Span>::Span.into(),
+        PdfTag::Span => Tag::<kind::Span>::Span.with_alt_text(alt).into(),
         PdfTag::Figure => Tag::<kind::Figure>::Figure(alt).into(),
         PdfTag::L { numbering } => Tag::L(match numbering {
             ListNumbering::None => KN::None,
@@ -497,7 +508,7 @@ fn krilla_tag(tag: &PdfTag, title: Option<String>, alt: Option<String>) -> TagKi
             ListNumbering::UpperAlpha => KN::UpperAlpha,
         })
         .into(),
-        PdfTag::Lbl => Tag::<kind::Lbl>::Lbl.into(),
+        PdfTag::Lbl => Tag::<kind::Lbl>::Lbl.with_alt_text(alt).into(),
         PdfTag::LBody => Tag::<kind::LBody>::LBody.into(),
         PdfTag::Li => Tag::<kind::LI>::LI.into(),
         PdfTag::Table => Tag::<kind::Table>::Table.into(),
@@ -529,7 +540,23 @@ struct Tagger {
     page_repeats: HashSet<NodeId>,
     /// Repeated nodes already shown on an earlier page.
     seen_repeats: HashSet<NodeId>,
+    /// How the content of each pseudo-element is tagged, by its
+    /// alternative text.
+    pseudo_alts: HashMap<(NodeId, GeneratedKind), PseudoAlt>,
     sequence: u64,
+}
+
+/// How the content of a pseudo-element is tagged, following the
+/// alternative text of its `content` (CSS Content 3 §1).
+#[derive(Clone, Copy)]
+enum PseudoAlt {
+    /// No alternative text: the content belongs to its element.
+    None,
+    /// An empty alternative text: the content is decorative.
+    Decorative,
+    /// The content is grouped in this `Span`, or this list label, whose
+    /// `/Alt` is the alternative text.
+    Span(usize),
 }
 
 impl Tagger {
@@ -547,6 +574,7 @@ impl Tagger {
             annotations: HashMap::new(),
             page_repeats: HashSet::new(),
             seen_repeats: HashSet::new(),
+            pseudo_alts: HashMap::new(),
             sequence: 0,
         }
     }
@@ -577,12 +605,16 @@ impl Tagger {
         false
     }
 
-    fn resolve(&mut self, dom: DomView<'_>, target: Target<'_, '_>) -> Mark {
+    fn resolve(&mut self, page: &Page<'_>, target: Target<'_, '_>) -> Mark {
+        let dom = page.dom();
         let (source, element) = match target {
             Target::Artifact(kind) => return Mark::Artifact(kind),
             Target::Run(run) => match run.source {
                 RunSource::Text(text) => (text, dom.parent(text)),
-                RunSource::Generated(owner, kind) => return self.generated(dom, owner, kind),
+                RunSource::Generated(owner, kind) => {
+                    let place = (run.line.index, run.text_offset);
+                    return self.generated(page, owner, kind, place);
+                }
                 // Ellipses and anything else stand in for content that is
                 // already in the structure, or decorate it.
                 _ => return Mark::Artifact(ArtifactType::Other),
@@ -591,8 +623,16 @@ impl Tagger {
                 return Mark::Artifact(ArtifactType::Other);
             }
             Target::Replaced(node) => (node, Some(node)),
-            // Content images sit in their pseudo-element's line like its text.
-            Target::GeneratedImage(image) => return self.generated(dom, image.owner, image.kind),
+            // Content images sit in their pseudo-element's line like its
+            // text. On a line that mixes bidi directions the image has no
+            // offset and goes before the line's text, as paint draws it.
+            Target::GeneratedImage(image) => {
+                let place = page
+                    .generated_image_text_position(image)
+                    .map(|(line, offset)| (line.index, offset.unwrap_or(0)))
+                    .unwrap_or_default();
+                return self.generated(page, image.owner, image.kind, place);
+            }
             Target::MarkerImage(owner) => {
                 if self.is_repeat_copy(dom, owner) {
                     return Mark::Artifact(ArtifactType::Other);
@@ -600,7 +640,7 @@ impl Tagger {
                 return match self.structure.labels.get(&owner) {
                     Some(&label) => {
                         let order = self.order(owner).0;
-                        self.content(label, order)
+                        self.content(label, order, Place::default())
                     }
                     None => Mark::Artifact(ArtifactType::Other),
                 };
@@ -610,28 +650,81 @@ impl Tagger {
             return Mark::Artifact(ArtifactType::Other);
         }
         let key = self.order(source).0;
-        self.content_at(dom, source, element, key)
+        self.content_at(dom, source, element, key, Place::default())
     }
 
     /// Content generated for `owner`: a list marker belongs to the item's
     /// label, `::before` content precedes the element's own content and
     /// `::after` content follows it.
-    fn generated(&mut self, dom: DomView<'_>, owner: NodeId, kind: GeneratedKind) -> Mark {
+    ///
+    /// The alternative text of the pseudo-element's `content` decides how
+    /// it is tagged: an empty one makes the content an artifact, and any
+    /// other is the `/Alt` of the item's label or of a `Span` grouping the
+    /// content.
+    fn generated(
+        &mut self,
+        page: &Page<'_>,
+        owner: NodeId,
+        kind: GeneratedKind,
+        place: Place,
+    ) -> Mark {
+        let dom = page.dom();
         if self.is_repeat_copy(dom, owner) {
             return Mark::Artifact(ArtifactType::Other);
         }
         let (order, end) = self.order(owner);
-        if kind == GeneratedKind::Marker
-            && let Some(&label) = self.structure.labels.get(&owner)
-        {
-            return self.content(label, order);
-        }
+        let label = match kind {
+            GeneratedKind::Marker => self.structure.labels.get(&owner).copied(),
+            _ => None,
+        };
         let key = if kind == GeneratedKind::After {
             end
         } else {
             order
         };
-        self.content_at(dom, owner, Some(owner), key)
+        match (self.pseudo_alt(page, owner, kind, label, key), label) {
+            (PseudoAlt::Decorative, _) => Mark::Artifact(ArtifactType::Other),
+            // A label holds the marker alone, kept in drawing order like
+            // a marker image.
+            (_, Some(label)) => self.content(label, order, Place::default()),
+            (PseudoAlt::Span(span), None) => self.content(span, key, place),
+            (PseudoAlt::None, None) => self.content_at(dom, owner, Some(owner), key, place),
+        }
+    }
+
+    /// How the content of the `kind` pseudo-element of `owner` is tagged,
+    /// decided once from its alternative text. The text of a marker with a
+    /// `label` becomes the label's `/Alt`; other content with alternative
+    /// text gets a `Span` at the position `key`.
+    fn pseudo_alt(
+        &mut self,
+        page: &Page<'_>,
+        owner: NodeId,
+        kind: GeneratedKind,
+        label: Option<usize>,
+        key: u32,
+    ) -> PseudoAlt {
+        if let Some(&alt) = self.pseudo_alts.get(&(owner, kind)) {
+            return alt;
+        }
+        // Only an empty alternative text marks the content as decorative.
+        let alt = match page.generated_alt_text(owner, kind) {
+            None => PseudoAlt::None,
+            Some(text) if text.is_empty() => PseudoAlt::Decorative,
+            Some(text) => {
+                let span = match label {
+                    Some(label) => label,
+                    None => {
+                        let container = self.container_at(page.dom(), owner, Some(owner), key);
+                        self.structure.push(Some(container), PdfTag::Span, key)
+                    }
+                };
+                self.structure.elements[span].alt = Some(text);
+                PseudoAlt::Span(span)
+            }
+        };
+        self.pseudo_alts.insert((owner, kind), alt);
+        alt
     }
 
     fn order(&self, node: NodeId) -> (u32, u32) {
@@ -649,8 +742,22 @@ impl Tagger {
         source: NodeId,
         element: Option<NodeId>,
         key: u32,
+        place: Place,
     ) -> Mark {
-        let container = match self.structure.container(dom, source) {
+        let container = self.container_at(dom, source, element, key);
+        self.content(container, key, place)
+    }
+
+    /// The structure element that content drawn for `source`, whose element
+    /// is `element`, belongs to at the position `key`.
+    fn container_at(
+        &mut self,
+        dom: DomView<'_>,
+        source: NodeId,
+        element: Option<NodeId>,
+        key: u32,
+    ) -> usize {
+        match self.structure.container(dom, source) {
             Some(container) => container,
             None => {
                 // Text directly inside `<body>` or another unclassified
@@ -665,13 +772,12 @@ impl Tagger {
                     .entry((element, segment))
                     .or_insert_with(|| self.structure.push(None, PdfTag::P, order))
             }
-        };
-        self.content(container, key)
+        }
     }
 
-    fn content(&mut self, element: usize, key: u32) -> Mark {
+    fn content(&mut self, element: usize, key: u32, place: Place) -> Mark {
         self.sequence += 1;
-        Mark::Content(element, (key, self.sequence))
+        Mark::Content(element, (key, place, self.sequence))
     }
 
     fn push_content(&mut self, element: usize, key: Key, id: Identifier) {
@@ -707,7 +813,7 @@ impl Tagger {
             .into_iter()
             .map(|child| {
                 let order = self.structure.elements[child].order;
-                ((order, 0), Item::Child(child))
+                ((order, Place::default(), 0), Item::Child(child))
             })
             .collect();
         items.extend(

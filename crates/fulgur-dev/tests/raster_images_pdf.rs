@@ -249,7 +249,7 @@ fn multicol_images_keep_column_and_spanner_positions_with_rounded_clips() {
             let pdf = lopdf::Document::load_mem(bytes).unwrap();
             let pages = pdf.get_pages();
             assert_eq!(pages.len(), 1);
-            let content = pdf.get_page_content(pages[&1]).unwrap();
+            let content = pdf.get_page_content(pages[&1]);
             let content = lopdf::content::Content::decode(&content).unwrap();
             assert_eq!(
                 content

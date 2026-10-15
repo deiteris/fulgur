@@ -90,8 +90,7 @@ fn legacy_pages_keep_inline_svg_vectors() {
     let bytes = pdf.finish().unwrap();
     let parsed = lopdf::Document::load_mem(&bytes).unwrap();
     let page_id = *parsed.get_pages().values().next().unwrap();
-    let content =
-        lopdf::content::Content::decode(&parsed.get_page_content(page_id).unwrap()).unwrap();
+    let content = lopdf::content::Content::decode(&parsed.get_page_content(page_id)).unwrap();
     assert!(
         content
             .operations
@@ -168,8 +167,7 @@ fn producer_fragmentainer_clip_is_applied_before_its_opacity_group() {
     pdf_page.finish();
     let parsed = lopdf::Document::load_mem(&pdf.finish().unwrap()).unwrap();
     let page_id = *parsed.get_pages().values().next().unwrap();
-    let content =
-        lopdf::content::Content::decode(&parsed.get_page_content(page_id).unwrap()).unwrap();
+    let content = lopdf::content::Content::decode(&parsed.get_page_content(page_id)).unwrap();
     let before_clip: Vec<_> = content
         .operations
         .iter()
@@ -286,7 +284,7 @@ fn legacy_pages_skip_the_background_given_to_the_canvas() {
         pdf_page.finish();
         let parsed = lopdf::Document::load_mem(&pdf.finish().unwrap()).unwrap();
         let id = *parsed.get_pages().get(&1).unwrap();
-        lopdf::content::Content::decode(&parsed.get_page_content(id).unwrap())
+        lopdf::content::Content::decode(&parsed.get_page_content(id))
             .unwrap()
             .operations
             .iter()

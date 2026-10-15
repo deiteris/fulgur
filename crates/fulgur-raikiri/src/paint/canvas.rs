@@ -18,9 +18,10 @@ use krilla::num::NormalizedF32;
 use krilla::surface::Surface;
 use krilla::tagging::ArtifactType;
 use raikiri_html::computed::{
-    ComputedBackgroundImage, ComputedDisplay, ComputedValues, ComputedVisualBox, CssColor,
+    ComputedBackgroundLayer, ComputedDisplay, ComputedValues, ComputedVisualBox, CssColor,
 };
 use raikiri_html::{NodeId, NodeKind, Page};
+use std::sync::Arc;
 
 /// The element whose background is the canvas background of `page`, with
 /// its computed style.
@@ -44,6 +45,14 @@ pub(super) fn owner<'p>(page: &'p Page<'_>) -> Option<(NodeId, &'p ComputedValue
         .map(|style| (body, style))
 }
 
+/// Whether the root element of `page` has `display: none`, so the document
+/// generates no boxes at all (CSS Display 3 §2.5).
+pub(super) fn root_generates_no_box(page: &Page<'_>) -> bool {
+    root(page)
+        .and_then(|html| page.computed(html))
+        .is_some_and(|style| !generates_box(style))
+}
+
 /// The root `<html>` element of `page`.
 fn root(page: &Page<'_>) -> Option<NodeId> {
     let dom = page.dom();
@@ -61,7 +70,7 @@ fn generates_box(style: &ComputedValues) -> bool {
 }
 
 fn has_background(style: &ComputedValues) -> bool {
-    style.background_color.a > 0 || !matches!(style.background_image, ComputedBackgroundImage::None)
+    style.background_color.a > 0 || style.has_background_image()
 }
 
 /// Paint the canvas background of `page`, if any, as an artifact, and return
@@ -127,12 +136,20 @@ fn paint(
     // page area (CSS Backgrounds 3 §2.11.1). The page area has no border or
     // padding, so the other boxes already coincide with it; `text` and
     // `border-area` would otherwise paint glyphs or an empty ring.
-    if matches!(
-        style.background_clip,
-        ComputedVisualBox::Text | ComputedVisualBox::BorderArea
-    ) {
-        style.background_clip = ComputedVisualBox::BorderBox;
-    }
+    style.background_layers = style
+        .background_layers()
+        .iter()
+        .map(|layer| {
+            let mut layer = layer.clone();
+            if matches!(
+                layer.clip,
+                ComputedVisualBox::Text | ComputedVisualBox::BorderArea
+            ) {
+                layer.clip = ComputedVisualBox::BorderBox;
+            }
+            layer
+        })
+        .collect();
     paint_background(
         surface,
         raster,
@@ -149,6 +166,6 @@ fn paint(
 pub(super) fn without_background(style: &ComputedValues) -> ComputedValues {
     let mut style = style.clone();
     style.background_color = CssColor::TRANSPARENT;
-    style.background_image = ComputedBackgroundImage::None;
+    style.background_layers = Arc::from([ComputedBackgroundLayer::initial()]);
     style
 }
