@@ -1457,6 +1457,11 @@ impl EngineBuilder {
         self
     }
 
+    pub fn named_destinations(mut self, enabled: bool) -> Self {
+        self.config_builder = self.config_builder.named_destinations(enabled);
+        self
+    }
+
     pub fn authors(mut self, authors: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.config_builder = self.config_builder.authors(authors);
         self
@@ -1720,6 +1725,13 @@ mod tests {
     fn builder_tagged_defaults_to_false() {
         let engine = Engine::builder().build();
         assert!(!engine.config().enable_tagging);
+    }
+
+    #[test]
+    fn builder_named_destinations_opt_in() {
+        assert!(!Engine::builder().build().config().named_destinations);
+        let engine = Engine::builder().named_destinations(true).build();
+        assert!(engine.config().named_destinations);
     }
 
     #[test]

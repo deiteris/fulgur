@@ -74,6 +74,13 @@ impl DestinationRegistry {
         ));
     }
 
+    /// Iterate the recorded anchors in id order as `(id, (page_idx, x, y))`.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&str, (usize, crate::units::Pt, crate::units::Pt))> {
+        self.entries.iter().map(|(id, &at)| (id.as_str(), at))
+    }
+
     /// Look up a recorded anchor. Returns `(page_idx, x, y)`.
     pub fn get(&self, id: &str) -> Option<(usize, crate::units::Pt, crate::units::Pt)> {
         self.entries.get(id).copied()

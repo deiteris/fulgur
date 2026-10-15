@@ -207,3 +207,28 @@ fn anchor_wrapping_inline_image_is_clickable() {
         "URI missing — anchor-wrapping image not clickable"
     );
 }
+
+#[test]
+fn named_destinations_write_a_dests_name_tree() {
+    let html = r##"<html><body>
+        <p><a href="#a">jump</a></p>
+        <div style="height:1500px"></div>
+        <h2 id="a">Target</h2>
+    </body></html>"##;
+    let bytes = Engine::builder()
+        .named_destinations(true)
+        .build()
+        .render(html)
+        .expect("render");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("/Names"), "missing /Names");
+    assert!(text.contains("/Dests"), "missing /Dests");
+    assert!(text.contains("(a)"), "missing the destination name (a)");
+}
+
+#[test]
+fn named_destinations_are_off_by_default() {
+    let html = r##"<html><body><h2 id="a">Target</h2></body></html>"##;
+    let bytes = engine().render(html).expect("render");
+    assert!(!String::from_utf8_lossy(&bytes).contains("/Dests"));
+}

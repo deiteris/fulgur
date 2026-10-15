@@ -181,6 +181,9 @@ pub struct Config {
     pub enable_tagging: bool,
     /// Enable PDF/UA-1 conformance (implies enable_tagging).
     pub pdf_ua: bool,
+    /// Write every anchor `id` as a PDF named destination (`/Names /Dests`),
+    /// so a viewer resolves `doc.pdf#id`.
+    pub named_destinations: bool,
 }
 
 impl Default for Config {
@@ -201,6 +204,7 @@ impl Default for Config {
             bookmarks: false,
             enable_tagging: false,
             pdf_ua: false,
+            named_destinations: false,
         }
     }
 }
@@ -386,6 +390,11 @@ impl ConfigBuilder {
 
     pub fn pdf_ua(mut self, enabled: bool) -> Self {
         self.config.pdf_ua = enabled;
+        self
+    }
+
+    pub fn named_destinations(mut self, enabled: bool) -> Self {
+        self.config.named_destinations = enabled;
         self
     }
 

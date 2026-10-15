@@ -115,6 +115,19 @@ pub fn render_v2(
         }
     }
 
+    if config.named_destinations {
+        for (id, (page_idx, x_pt, y_pt)) in dest_registry.iter() {
+            let at = krilla::destination::XyzDestination::new(
+                page_idx,
+                krilla::geom::Point::from_xy(x_pt.to_f32(), y_pt.to_f32()),
+            );
+            document.register_named_destination(krilla::destination::NamedDestination::new(
+                id.to_string(),
+                at,
+            ));
+        }
+    }
+
     // Body content and margin boxes get separate LinkCollectors. Body
     // occurrences are clipped to the content area before emission so a
     // body link positioned into a page-margin strip (via CSS positioning
