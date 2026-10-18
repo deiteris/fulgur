@@ -261,4 +261,76 @@ mod tests {
             assert_eq!(list_numbering(numbering), expected, "{numbering:?}");
         }
     }
+
+    // --- classify_element: re-exported from fulgur_core::tagging ---
+    // These tests exercise classify_element from the fulgur-blitz compile
+    // context so LLVM counts the match branches against this crate's coverage.
+
+    #[test]
+    fn classify_element_block_text_elements() {
+        assert_eq!(classify_element("p"), Some(PdfTag::P));
+        assert_eq!(classify_element("h1"), Some(PdfTag::H { level: 1 }));
+        assert_eq!(classify_element("h2"), Some(PdfTag::H { level: 2 }));
+        assert_eq!(classify_element("h3"), Some(PdfTag::H { level: 3 }));
+        assert_eq!(classify_element("h4"), Some(PdfTag::H { level: 4 }));
+        assert_eq!(classify_element("h5"), Some(PdfTag::H { level: 5 }));
+        assert_eq!(classify_element("h6"), Some(PdfTag::H { level: 6 }));
+    }
+
+    #[test]
+    fn classify_element_generic_containers_map_to_div() {
+        for tag in [
+            "div", "section", "article", "main", "aside", "nav", "header", "footer",
+        ] {
+            assert_eq!(classify_element(tag), Some(PdfTag::Div), "tag = {tag}");
+        }
+    }
+
+    #[test]
+    fn classify_element_inline_and_media_elements() {
+        assert_eq!(classify_element("span"), Some(PdfTag::Span));
+        assert_eq!(classify_element("img"), Some(PdfTag::Figure));
+    }
+
+    #[test]
+    fn classify_element_list_elements() {
+        assert_eq!(
+            classify_element("ul"),
+            Some(PdfTag::L {
+                numbering: ListNumbering::Disc
+            })
+        );
+        assert_eq!(
+            classify_element("ol"),
+            Some(PdfTag::L {
+                numbering: ListNumbering::Decimal
+            })
+        );
+        assert_eq!(classify_element("li"), Some(PdfTag::Li));
+    }
+
+    #[test]
+    fn classify_element_table_elements() {
+        assert_eq!(classify_element("table"), Some(PdfTag::Table));
+        assert_eq!(classify_element("thead"), Some(PdfTag::THead));
+        assert_eq!(classify_element("tbody"), Some(PdfTag::TBody));
+        assert_eq!(classify_element("tfoot"), Some(PdfTag::TFoot));
+        assert_eq!(classify_element("tr"), Some(PdfTag::Tr));
+        assert_eq!(
+            classify_element("th"),
+            Some(PdfTag::Th {
+                scope: TableHeaderScope::Both
+            })
+        );
+        assert_eq!(classify_element("td"), Some(PdfTag::Td));
+    }
+
+    #[test]
+    fn classify_element_unknown_and_empty_return_none() {
+        assert_eq!(classify_element(""), None);
+        assert_eq!(classify_element("script"), None);
+        assert_eq!(classify_element("style"), None);
+        assert_eq!(classify_element("custom-element"), None);
+        assert_eq!(classify_element("a"), None);
+    }
 }
