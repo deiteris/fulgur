@@ -173,22 +173,18 @@ fn should_warn_once(name: &str) -> bool {
 fn selector_matches(selector: &str, page_num: usize, first_page_is_left: bool) -> bool {
     match selector {
         ":first" => page_num == 1,
-        ":left" => {
-            if first_page_is_left {
-                page_num % 2 == 1
-            } else {
-                page_num.is_multiple_of(2)
-            }
-        }
-        ":right" => {
-            if first_page_is_left {
-                page_num.is_multiple_of(2)
-            } else {
-                page_num % 2 == 1
-            }
-        }
+        ":left" => is_left_page(page_num, first_page_is_left),
+        ":right" => !is_left_page(page_num, first_page_is_left),
         _ => false,
     }
+}
+
+/// Whether page `page_num` (1-based) is a left page: the even pages, or
+/// the odd ones when `first_page_is_left` (a right-to-left root, CSS Paged
+/// Media §5). The one rule of `@page :left` / `:right` settings and margin
+/// boxes, and of `left` / `right` forced breaks.
+pub(crate) fn is_left_page(page_num: usize, first_page_is_left: bool) -> bool {
+    page_num.is_multiple_of(2) != first_page_is_left
 }
 
 /// Resolve effective page size, margin, and landscape for a given page number.

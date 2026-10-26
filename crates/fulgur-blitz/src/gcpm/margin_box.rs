@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::{Margin, PageSize};
+use crate::gcpm::page_settings::is_left_page;
 use crate::units::{F32Units, Pt};
 
 /// Which edge of the page a set of margin boxes belongs to.
@@ -410,12 +411,15 @@ pub fn compute_edge_layout(
 /// `selector` is the prelude as the parser keeps it: an optional page name,
 /// then pseudo-classes in lower case (`:first`, `chapter`, `chapter:left`).
 /// A page name selects the pages of that name only. `:first` selects page 1,
-/// `:left` the even pages, `:right` the odd ones, and `:blank` the pages a
-/// side break leaves empty; any other pseudo-class selects no page.
+/// `:left` the even pages, `:right` the odd ones (the other way round when
+/// `first_page_is_left`, under a right-to-left root, as for the `@page`
+/// settings), and `:blank` the pages a side break leaves empty; any other
+/// pseudo-class selects no page.
 pub(crate) fn page_selector_specificity(
     selector: Option<&str>,
     page: &crate::pagination_layout::PageFacts,
     page_num: usize,
+    first_page_is_left: bool,
 ) -> Option<(u8, u8, u8)> {
     let Some(selector) = selector else {
         return Some((0, 0, 0));
@@ -430,8 +434,10 @@ pub(crate) fn page_selector_specificity(
         let (selects, count) = match pseudo {
             "first" => (page_num == 1, &mut specificity.1),
             "blank" => (page.blank, &mut specificity.1),
-            "left" => (page_num.is_multiple_of(2), &mut specificity.2),
-            "right" => (!page_num.is_multiple_of(2), &mut specificity.2),
+            "left" | "right" => (
+                (pseudo == "left") == is_left_page(page_num, first_page_is_left),
+                &mut specificity.2,
+            ),
             _ => return None,
         };
         if !selects {
@@ -467,9 +473,12 @@ mod tests {
         let plain = page(None, false);
         let select =
             |selector: &str, page: &crate::pagination_layout::PageFacts, page_num: usize| {
-                page_selector_specificity(Some(selector), page, page_num)
+                page_selector_specificity(Some(selector), page, page_num, false)
             };
-        assert_eq!(page_selector_specificity(None, &a, 2), Some((0, 0, 0)));
+        assert_eq!(
+            page_selector_specificity(None, &a, 2, false),
+            Some((0, 0, 0))
+        );
         assert_eq!(select(":left", &a, 2), Some((0, 0, 1)));
         assert_eq!(select(":left", &plain, 3), None);
         assert_eq!(select("a", &a, 3), Some((1, 0, 0)));
@@ -482,22 +491,35 @@ mod tests {
     }
 
     #[test]
+    fn under_a_right_to_left_root_left_selects_the_odd_pages() {
+        let plain = page(None, false);
+        let rtl = |selector: &str, page_num: usize| {
+            page_selector_specificity(Some(selector), &plain, page_num, true)
+        };
+        assert_eq!(rtl(":left", 1), Some((0, 0, 1)));
+        assert_eq!(rtl(":left", 2), None);
+        assert_eq!(rtl(":right", 2), Some((0, 0, 1)));
+        assert_eq!(rtl(":right", 3), None);
+        assert_eq!(rtl(":first:left", 1), Some((0, 1, 1)));
+    }
+
+    #[test]
     fn blank_selects_a_blank_page_and_an_unknown_pseudo_class_none() {
         assert_eq!(
-            page_selector_specificity(Some(":blank"), &page(None, true), 2),
+            page_selector_specificity(Some(":blank"), &page(None, true), 2, false),
             Some((0, 1, 0))
         );
         assert_eq!(
-            page_selector_specificity(Some(":blank"), &page(None, false), 2),
+            page_selector_specificity(Some(":blank"), &page(None, false), 2, false),
             None
         );
         assert_eq!(
-            page_selector_specificity(Some("a:blank:left"), &page(Some("a"), true), 2),
+            page_selector_specificity(Some("a:blank:left"), &page(Some("a"), true), 2, false),
             Some((1, 1, 1))
         );
         for selector in [":nth", ":recto", ":first:nth"] {
             assert_eq!(
-                page_selector_specificity(Some(selector), &page(None, true), 1),
+                page_selector_specificity(Some(selector), &page(None, true), 1, false),
                 None,
                 "{selector}"
             );
@@ -507,12 +529,12 @@ mod tests {
     #[test]
     fn a_page_name_outranks_first_and_blank_which_outrank_a_side() {
         let a = page(Some("a"), true);
-        let select = |selector: &str| page_selector_specificity(Some(selector), &a, 1);
+        let select = |selector: &str| page_selector_specificity(Some(selector), &a, 1, false);
         assert!(select("a") > select(":first:right"));
         assert!(select(":first") > select(":right"));
-        assert!(select(":first") == page_selector_specificity(Some(":blank"), &a, 2));
+        assert!(select(":first") == page_selector_specificity(Some(":blank"), &a, 2, false));
         assert!(select("a:first") > select("a:right"));
-        assert!(select(":right") > page_selector_specificity(None, &a, 1));
+        assert!(select(":right") > page_selector_specificity(None, &a, 1, false));
     }
 
     #[test]

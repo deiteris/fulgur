@@ -157,6 +157,7 @@ pub fn render_v2(
         page_count,
         implicit_href_by_page,
         page_facts,
+        drawables.root_dir_rtl,
     );
 
     // Page-independent skip sets. These reference only `drawables.*`
@@ -3774,6 +3775,9 @@ pub(crate) struct MarginBoxRenderer<'a> {
     /// boxes of `@page <name>` and `@page :blank` rules; empty when every
     /// margin box selector is plain, `:first`, `:left`, or `:right`.
     pub page_facts: Vec<crate::pagination_layout::PageFacts>,
+    /// Page 1 is a left page (the root is right to left), for the
+    /// `:left` / `:right` margin boxes, as for the `@page` settings.
+    pub first_page_is_left: bool,
 }
 
 impl<'a> MarginBoxRenderer<'a> {
@@ -3792,6 +3796,7 @@ impl<'a> MarginBoxRenderer<'a> {
         total_pages: usize,
         implicit_href_by_page: &'a BTreeMap<usize, String>,
         page_facts: Vec<crate::pagination_layout::PageFacts>,
+        first_page_is_left: bool,
     ) -> Self {
         let string_set_states = if gcpm.string_set_mappings.is_empty() {
             vec![BTreeMap::new(); total_pages]
@@ -3837,6 +3842,7 @@ impl<'a> MarginBoxRenderer<'a> {
             render_cache: HashMap::new(),
             implicit_href_by_page,
             page_facts,
+            first_page_is_left,
         }
     }
 
@@ -3905,6 +3911,7 @@ impl<'a> MarginBoxRenderer<'a> {
                 margin_box.page_selector.as_deref(),
                 page,
                 page_num,
+                self.first_page_is_left,
             ) else {
                 continue;
             };
@@ -6082,6 +6089,7 @@ mod tests {
             1,
             &implicit,
             Vec::new(),
+            false,
         );
     }
 
@@ -6110,6 +6118,7 @@ mod tests {
             1,
             &implicit,
             Vec::new(),
+            false,
         );
     }
 
@@ -6141,6 +6150,7 @@ mod tests {
             1,
             &implicit,
             Vec::new(),
+            false,
         );
     }
 
@@ -6174,6 +6184,7 @@ mod tests {
             1,
             &implicit,
             Vec::new(),
+            false,
         );
         check(&renderer);
     }

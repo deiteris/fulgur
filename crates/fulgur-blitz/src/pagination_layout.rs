@@ -1216,7 +1216,8 @@ impl<'a> PaginationLayoutTree<'a> {
 /// Fragmentation 3 §3.1). The page skipped holds no fragment, so it prints
 /// only the page box's margin boxes and still counts in `counter(page)`.
 /// Page index 0 is a right page, or a left page under a right-to-left root
-/// (as the `@page :left` / `:right` settings, CSS Paged Media §5).
+/// (`gcpm::page_settings::is_left_page`, the rule of the `@page :left` /
+/// `:right` settings and margin boxes, CSS Paged Media §5).
 fn page_on_side(
     doc: &BaseDocument,
     page_index: u32,
@@ -1225,7 +1226,10 @@ fn page_on_side(
     let Some(side) = side else {
         return page_index;
     };
-    let is_right = page_index.is_multiple_of(2) != crate::convert::extract_root_dir_rtl(doc);
+    let is_right = !crate::gcpm::page_settings::is_left_page(
+        page_index as usize + 1,
+        crate::convert::extract_root_dir_rtl(doc),
+    );
     if (side == crate::draw_primitives::PageSide::Right) == is_right {
         page_index
     } else {
