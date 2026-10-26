@@ -189,3 +189,27 @@ fn bookmarks_via_inline_style_block() {
         "expected 'Sidebar' bookmark entry — bookmark-label via inline <style> not working"
     );
 }
+
+/// A bookmark takes its heading's text as authored, not as `text-transform`
+/// renders it, also when a captioned table makes the document resolve before
+/// the bookmark pass runs.
+#[test]
+fn a_bookmark_keeps_the_authored_text_of_a_transformed_heading() {
+    let html = r#"<!doctype html><html><head>
+        <style>h1 { text-transform: uppercase; }</style>
+    </head><body>
+        <h1>Mixed Case Title</h1>
+        <table><caption>Caption</caption><tr><td>cell</td></tr></table>
+    </body></html>"#;
+
+    let pdf = render_with_bookmarks(html, true);
+
+    assert!(
+        pdf_contains_outline_entry(&pdf, "Mixed Case Title"),
+        "the outline entry keeps the authored text"
+    );
+    assert!(
+        !pdf_contains_outline_entry(&pdf, "MIXED CASE TITLE"),
+        "the outline entry is not transformed"
+    );
+}

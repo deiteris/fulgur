@@ -265,6 +265,40 @@ fn test_render_html_inline_style_running_element_not_duplicated() {
     );
 }
 
+/// `text-transform` rewrites the text of the body, of a generated
+/// `::after`, and of a margin box, each by its own computed style: the named
+/// string takes the heading's text as authored, and the margin box's own
+/// `text-transform` uppercases it.
+#[test]
+fn text_transform_applies_to_body_generated_and_margin_box_text() {
+    let html = r#"<!DOCTYPE html>
+<html><head><style>
+h1 { string-set: title content(text); }
+.shout { text-transform: uppercase; }
+.shout::after { content: "-Aftersentinel"; }
+@page { @bottom-center { content: string(title); text-transform: uppercase; } }
+</style></head>
+<body>
+<h1>Headingsentinel</h1>
+<p class="shout">Bodysentinel</p>
+</body></html>"#;
+
+    let pdf = Engine::builder().build().render(html).expect("render");
+
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not available; skipping text assertion");
+        return;
+    };
+    assert!(
+        text.contains("BODYSENTINEL") && text.contains("-AFTERSENTINEL"),
+        "body text and generated text are uppercased; got: {text:?}"
+    );
+    assert!(
+        text.contains("Headingsentinel") && text.contains("HEADINGSENTINEL"),
+        "the heading keeps its case and the margin box uppercases its copy; got: {text:?}"
+    );
+}
+
 /// Folding an inline `<style>`'s `cleaned_css` into `css_to_inject` must not
 /// move that stylesheet to the end of the cascade.
 ///
@@ -4379,6 +4413,32 @@ fn target_text_before_resolves_attr_pseudo() {
          AnchorMap, so `.ref::after {{ content: \"[\" \
          target-text(attr(href), before) \"]\" }}` rendered the wrong \
          text. Got: {text:?}"
+    );
+}
+
+/// `target-text()` takes its target's text as authored, not as the
+/// target's `text-transform` renders it, as `string-set: content(text)`
+/// does.
+#[test]
+fn target_text_takes_the_authored_text_of_a_transformed_target() {
+    let html = r##"<!doctype html><html><head><style>
+      body { font-family: 'Noto Sans', sans-serif; font-size: 12pt; }
+      #sec { text-transform: uppercase; }
+      .ref::after { content: "[" target-text(attr(href)) "]"; }
+    </style></head><body>
+      <p>See <a class="ref" href="#sec">the appendix</a> for details.</p>
+      <h2 id="sec">Appendixsentinel</h2>
+    </body></html>"##;
+    let pdf = tagged_render_with_noto(html);
+    assert!(!pdf.is_empty());
+
+    let Some(text) = extract_pdf_text(&pdf) else {
+        eprintln!("pdftotext not available; skipping text assertion");
+        return;
+    };
+    assert!(
+        text.contains("[Appendixsentinel]") && text.contains("APPENDIXSENTINEL"),
+        "the reference takes the authored text, the heading prints transformed.          Got: {text:?}"
     );
 }
 

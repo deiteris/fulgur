@@ -27,6 +27,7 @@
 use blitz_dom::DocumentConfig;
 use blitz_dom::net::Resource;
 use blitz_html::HtmlDocument;
+use style::values::computed::TextTransform;
 
 // Type re-exports for adapter isolation (fulgur-x92a)
 //
@@ -749,10 +750,344 @@ pub fn apply_single_pass<P: DomPass + ?Sized>(
     pass.apply(doc, ctx);
 }
 
-/// Resolve styles (Stylo) and compute layout (Taffy).
+/// Resolve styles (Stylo) and compute layout (Taffy), with `text-transform`
+/// applied to the text.
+///
+/// Blitz computes `text-transform` but never applies it, so the text is
+/// rewritten in the DOM (see [`apply_text_transform`]) between style
+/// resolution and the layout that reads it. Generated `::before` / `::after`
+/// text exists only once layout construction has created it, and
+/// `capitalize` must see it before the element's own text, so layout
+/// construction runs first, then the one rewrite, then Blitz's resolve.
+/// That resolve constructs the layout again and shapes the inline layouts
+/// the first construction queued (deduplicated by node) from the rewritten
+/// text; the text of a pseudo-element, set when Blitz creates it, is kept.
 pub fn resolve(doc: &mut HtmlDocument) {
     sanitize_inline_svgs(doc);
+    if doc.try_root_element().is_none() {
+        return;
+    }
+    doc.resolve_stylist(0.0);
+    doc.resolve_layout_children();
+    apply_text_transform(doc);
     doc.resolve(0.0);
+}
+
+/// [`resolve`] without the `text-transform` rewrite, for a pass that only
+/// reads computed styles before the DOM passes run: those passes
+/// (`string-set`, bookmarks, running elements) take the text as authored,
+/// as CSS defines `content(text)`, and a margin box applies its own
+/// `text-transform` when its document resolves.
+fn resolve_without_text_transform(doc: &mut HtmlDocument) {
+    sanitize_inline_svgs(doc);
+    doc.resolve(0.0);
+}
+
+/// Rewrite each rendered text node by the computed `text-transform` of the
+/// box that holds it: `uppercase` and `lowercase` map the whole text
+/// (`str::to_uppercase` / `str::to_lowercase`, language-independent), and
+/// `capitalize` uppercases the first letter of each word.
+///
+/// The text of a node is styled by its parent element (the property is
+/// inherited, so a `<span>` inside an uppercase `<p>` is uppercased unless
+/// it sets `none`); generated `::before` / `::after` text by its
+/// pseudo-element's style. `full-width` and `full-size-kana` are not
+/// applied; the case keyword combined with them is. Subtrees with
+/// `display: none` and inline `<svg>` subtrees (which Blitz parses on its
+/// own) are left alone.
+///
+/// For `capitalize`, a word starts at the first letter after whitespace or
+/// punctuation ([`starts_word_after`]); the state carries across inline
+/// element boundaries (`<p>hel<b>lo</b> world</p>` becomes `Hello World`)
+/// and resets at every box that is not `display: inline` and at `<br>`. The
+/// letter is uppercased, not titlecased. Applying the transform twice gives
+/// the same text, so a document that resolves again keeps its rewritten text.
+fn apply_text_transform(doc: &mut HtmlDocument) {
+    let mut rewrites = Vec::new();
+    let mut at_word_start = true;
+    collect_text_transforms(
+        doc,
+        doc.root_node().id,
+        TextTransform::none(),
+        0,
+        &mut at_word_start,
+        &mut rewrites,
+    );
+    if rewrites.is_empty() {
+        return;
+    }
+    let mut mutator = doc.mutate();
+    for (node_id, text) in rewrites {
+        mutator.set_node_text(node_id, &text);
+    }
+}
+
+/// Walk `node_id` in document order (`::before`, children, `::after`),
+/// collecting each text node whose transform changes its text.
+fn collect_text_transforms(
+    doc: &BaseDocument,
+    node_id: usize,
+    inherited: TextTransform,
+    depth: usize,
+    at_word_start: &mut bool,
+    rewrites: &mut Vec<(usize, String)>,
+) {
+    if depth >= MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return;
+    };
+    if let Some(text) = node.text_data() {
+        let transformed = transform_text(&text.content, inherited, at_word_start);
+        if let Some(transformed) = transformed {
+            rewrites.push((node_id, transformed));
+        }
+        return;
+    }
+    let tag = node.element_data().map(|elem| elem.name.local.as_ref());
+    if tag == Some("svg") {
+        return;
+    }
+    // The document node and elements without computed styles pass the
+    // transform of their parent on.
+    let (transform, inline) = match node.primary_styles() {
+        Some(style) => {
+            let display = style.clone_display();
+            if display.is_none() {
+                return;
+            }
+            (style.clone_text_transform(), display.is_inline_flow())
+        }
+        None => (inherited, true),
+    };
+    // A box that is not inline, and a line break, end the word before.
+    let breaks_words = !inline || tag == Some("br");
+    if breaks_words {
+        *at_word_start = true;
+    }
+    let children = node.before.into_iter().chain(node.children.iter().copied());
+    for child_id in children.chain(node.after) {
+        collect_text_transforms(doc, child_id, transform, depth + 1, at_word_start, rewrites);
+    }
+    if breaks_words {
+        *at_word_start = true;
+    }
+}
+
+/// `text` as `transform` renders it, or `None` when it renders unchanged.
+/// `at_word_start` carries the `capitalize` word state from the text before,
+/// and every text moves it on, whatever its own transform: `capitalize` after
+/// untransformed text that ends mid-word does not start a word.
+fn transform_text(
+    text: &str,
+    transform: TextTransform,
+    at_word_start: &mut bool,
+) -> Option<String> {
+    let capitalize = transform.contains(TextTransform::CAPITALIZE);
+    let mut capitalized = String::with_capacity(if capitalize { text.len() } else { 0 });
+    for c in text.chars() {
+        if capitalize {
+            if *at_word_start && c.is_alphabetic() {
+                capitalized.extend(c.to_uppercase());
+            } else {
+                capitalized.push(c);
+            }
+        }
+        *at_word_start = starts_word_after(c, *at_word_start);
+    }
+    let transformed = if capitalize {
+        capitalized
+    } else if transform.contains(TextTransform::UPPERCASE) {
+        text.to_uppercase()
+    } else if transform.contains(TextTransform::LOWERCASE) {
+        text.to_lowercase()
+    } else {
+        return None;
+    };
+    (transformed != text).then_some(transformed)
+}
+
+/// Whether the character after `c` starts a word, for `capitalize`: after
+/// whitespace or punctuation it does; after a letter or digit it does not;
+/// after anything else (a mark, a symbol) the state is unchanged. An
+/// apostrophe does not end a word (`don't` becomes `Don't`), a hyphen does
+/// (`self-made` becomes `Self-Made`).
+fn starts_word_after(c: char, at_word_start: bool) -> bool {
+    if c.is_alphanumeric() || matches!(c, '\'' | '\u{2019}') {
+        false
+    } else if c.is_whitespace() || is_punctuation(c) {
+        true
+    } else {
+        at_word_start
+    }
+}
+
+/// ASCII punctuation, the Latin-1 punctuation marks, the General
+/// Punctuation block, and CJK symbols and punctuation.
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || matches!(
+            c,
+            '\u{a1}' | '\u{a7}' | '\u{ab}' | '\u{b6}' | '\u{b7}' | '\u{bb}' | '\u{bf}'
+                | '\u{2010}'..='\u{205e}'
+                | '\u{3000}'..='\u{303f}'
+        )
+}
+
+#[cfg(test)]
+mod text_transform_tests {
+    use super::*;
+
+    fn resolved(body: &str, css: &str) -> HtmlDocument {
+        let html = format!(
+            "<!DOCTYPE html><html><head><style>{css}</style></head><body>{body}</body></html>"
+        );
+        let mut doc = parse(&html, 400.0, &[]);
+        resolve(&mut doc);
+        doc
+    }
+
+    fn element_with_id<'a>(doc: &'a HtmlDocument, id: &str) -> &'a Node {
+        doc.tree()
+            .iter()
+            .find(|(_, node)| {
+                node.element_data()
+                    .and_then(|elem| get_attr(elem, "id"))
+                    .is_some_and(|value| value == id)
+            })
+            .map(|(_, node)| node)
+            .unwrap_or_else(|| panic!("no element with id {id}"))
+    }
+
+    /// The text of the element with `id`, concatenated over its subtree.
+    fn text_of(doc: &HtmlDocument, id: &str) -> String {
+        element_with_id(doc, id).text_content()
+    }
+
+    /// The text of the `::before` pseudo-element of the element with `id`.
+    fn before_text_of(doc: &HtmlDocument, id: &str) -> String {
+        let before = element_with_id(doc, id)
+            .before
+            .expect("the element has a ::before box");
+        doc.get_node(before)
+            .unwrap()
+            .children
+            .iter()
+            .filter_map(|&child| doc.get_node(child)?.text_data())
+            .map(|text| text.content.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn resolve_applies_each_case_keyword() {
+        let doc = resolved(
+            r#"<p id="u">Mixed case text</p><p id="l">Mixed CASE Text</p><p id="c">capitalize mixed CASE text</p><p id="n">Mixed case text</p>"#,
+            "#u{text-transform:uppercase}#l{text-transform:lowercase}#c{text-transform:capitalize}",
+        );
+
+        assert_eq!(text_of(&doc, "u"), "MIXED CASE TEXT");
+        assert_eq!(text_of(&doc, "l"), "mixed case text");
+        assert_eq!(text_of(&doc, "c"), "Capitalize Mixed CASE Text");
+        assert_eq!(text_of(&doc, "n"), "Mixed case text");
+    }
+
+    #[test]
+    fn the_transform_is_inherited_and_none_turns_it_off() {
+        let doc = resolved(
+            r#"<p class="u">ab <span id="inherits">cd</span> <span id="off">ef</span></p>"#,
+            ".u{text-transform:uppercase}#off{text-transform:none}",
+        );
+
+        assert_eq!(text_of(&doc, "inherits"), "CD");
+        assert_eq!(text_of(&doc, "off"), "ef");
+    }
+
+    #[test]
+    fn capitalize_continues_a_word_across_inline_elements_and_restarts_at_a_block() {
+        let doc = resolved(
+            r#"<div id="d" class="c">hel<b>lo</b> world<p>again</p>x<span style="text-transform:none">y</span>z<br>new</div>"#,
+            ".c{text-transform:capitalize}",
+        );
+
+        assert_eq!(text_of(&doc, "d"), "Hello WorldAgainXyzNew");
+    }
+
+    #[test]
+    fn capitalize_starts_words_after_whitespace_and_punctuation_but_not_apostrophes() {
+        let mut at_word_start = true;
+
+        let text = transform_text(
+            "don't self-made (one) 3d «deux» l’été",
+            TextTransform::CAPITALIZE,
+            &mut at_word_start,
+        );
+
+        assert_eq!(
+            text.as_deref(),
+            Some("Don't Self-Made (One) 3d «Deux» L’été")
+        );
+    }
+
+    #[test]
+    fn uppercase_maps_characters_that_change_length() {
+        let doc = resolved(r#"<p id="p">straße</p>"#, "p{text-transform:uppercase}");
+
+        assert_eq!(text_of(&doc, "p"), "STRASSE");
+    }
+
+    #[test]
+    fn generated_before_content_takes_the_transform() {
+        let doc = resolved(
+            r#"<p id="p">body</p>"#,
+            "p{text-transform:uppercase}p::before{content:\"note: \"}",
+        );
+
+        assert_eq!(before_text_of(&doc, "p"), "NOTE: ");
+    }
+
+    #[test]
+    fn capitalize_continues_a_word_that_generated_before_text_starts() {
+        let doc = resolved(
+            r#"<p id="p">yz</p>"#,
+            "p{text-transform:capitalize}p::before{content:\"x\"}",
+        );
+
+        assert_eq!(before_text_of(&doc, "p"), "X");
+        assert_eq!(text_of(&doc, "p"), "yz");
+    }
+
+    #[test]
+    fn resolving_again_keeps_the_transformed_text() {
+        let mut doc = resolved(r#"<p id="p">two words</p>"#, "p{text-transform:capitalize}");
+
+        resolve(&mut doc);
+
+        assert_eq!(text_of(&doc, "p"), "Two Words");
+    }
+
+    #[test]
+    fn hidden_text_is_left_as_authored() {
+        let doc = resolved(
+            r#"<p id="p" style="display:none">hidden</p>"#,
+            "p{text-transform:uppercase}",
+        );
+
+        assert_eq!(text_of(&doc, "p"), "hidden");
+    }
+
+    #[test]
+    fn the_caption_pass_leaves_the_text_as_authored() {
+        let html = "<!DOCTYPE html><html><head><style>p{text-transform:uppercase}</style>\
+             </head><body>\
+             <p id=\"p\">authored</p><table><caption>c</caption><tr><td>x</td></tr></table>\
+             </body></html>";
+        let mut doc = parse(html, 400.0, &[]);
+
+        CaptionRestructurePass.apply(&mut doc, &PassContext { font_data: &[] });
+
+        assert_eq!(text_of(&doc, "p"), "authored");
+    }
 }
 
 /// Keep Blitz's inline `<svg>` parse from reading local files.
@@ -2617,8 +2952,9 @@ impl DomPass for CaptionRestructurePass {
         // resolve once to read them. This pass runs before the engine's own
         // `resolve()`, which re-resolves the restructured tree afterwards; the
         // extra resolve is paid only when the document actually contains a
-        // captioned table.
-        resolve(doc);
+        // captioned table. It leaves the text as authored for the DOM passes
+        // that follow.
+        resolve_without_text_transform(doc);
         for (table_id, caption_id) in pairs {
             // Respect a cascade that hides the caption or its table
             // (fulgur-uoao). Blitz drops a non-table-typed child of `<table>`

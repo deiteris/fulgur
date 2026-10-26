@@ -597,6 +597,16 @@ impl Engine {
                 HashMap::new()
             };
 
+        // `target-text()` takes the authored text, as `string-set:
+        // content(text)` does, so pass 1 reads the text of each anchor before
+        // `resolve` applies `text-transform` (see `build_anchor_map` below).
+        let needs_anchor_map_for_pass_two = anchor_map.is_none() && has_target_refs;
+        let mut anchor_texts = if needs_anchor_map_for_pass_two {
+            collect_anchor_texts(&doc)
+        } else {
+            HashMap::new()
+        };
+
         crate::blitz_adapter::resolve(&mut doc);
 
         // The `@page` size / margin and resolved content box were computed
@@ -747,9 +757,13 @@ impl Engine {
         // fixed` / body-direct absolute fragments have been appended,
         // so anchor pages reflect the final paginated layout.
         // `walk_anchors` short-circuits on `MAX_DOM_DEPTH`.
-        let needs_anchor_map_for_pass_two = anchor_map.is_none() && has_target_refs;
         let collected_anchor_map = if needs_anchor_map_for_pass_two {
-            build_anchor_map(&doc, &pagination_geometry, &counter_snapshots_for_anchor)
+            build_anchor_map(
+                &doc,
+                &pagination_geometry,
+                &counter_snapshots_for_anchor,
+                &mut anchor_texts,
+            )
         } else {
             AnchorMap::default()
         };
@@ -1179,10 +1193,39 @@ use crate::gcpm::target_ref::{AnchorEntry, AnchorMap, fragment_id_from_href, pag
 use crate::pagination_layout::PaginationGeometryTable;
 use blitz_dom::BaseDocument;
 
+/// The text of each element with an `id`, keyed by node, as
+/// [`collect_text_content`] reads it. Read before `resolve` rewrites the text
+/// by `text-transform`, so `target-text()` takes the authored text.
+fn collect_anchor_texts(doc: &BaseDocument) -> HashMap<usize, String> {
+    fn walk(doc: &BaseDocument, node_id: usize, depth: usize, out: &mut HashMap<usize, String>) {
+        if depth >= crate::MAX_DOM_DEPTH {
+            return;
+        }
+        let Some(node) = doc.get_node(node_id) else {
+            return;
+        };
+        if node
+            .element_data()
+            .is_some_and(|elem| get_attr(elem, "id").is_some())
+        {
+            out.insert(node_id, collect_text_content(doc, node_id));
+        }
+        for &child in &node.children {
+            walk(doc, child, depth + 1, out);
+        }
+    }
+    let mut texts = HashMap::new();
+    walk(doc, doc.root_element().id, 0, &mut texts);
+    texts
+}
+
+/// The anchors of the laid-out document, each element's text taken from
+/// `texts` ([`collect_anchor_texts`]).
 fn build_anchor_map(
     doc: &BaseDocument,
     pagination_geometry: &PaginationGeometryTable,
     counter_snapshots: &BTreeMap<usize, BTreeMap<String, Vec<i32>>>,
+    texts: &mut HashMap<usize, String>,
 ) -> AnchorMap {
     let mut map = AnchorMap::new();
     walk_anchors(
@@ -1191,6 +1234,7 @@ fn build_anchor_map(
         0,
         pagination_geometry,
         counter_snapshots,
+        texts,
         &mut map,
     );
     map
@@ -1202,6 +1246,7 @@ fn walk_anchors(
     depth: usize,
     geometry: &PaginationGeometryTable,
     snapshots: &BTreeMap<usize, BTreeMap<String, Vec<i32>>>,
+    texts: &mut HashMap<usize, String>,
     out: &mut AnchorMap,
 ) {
     if depth >= crate::MAX_DOM_DEPTH {
@@ -1220,7 +1265,7 @@ fn walk_anchors(
         && let Some(page_num) = page_for_node(geometry, node_id)
     {
         let counters = snapshots.get(&node_id).cloned().unwrap_or_default();
-        let text = collect_text_content(doc, node_id);
+        let text = texts.remove(&node_id).unwrap_or_default();
         let before_text = collect_pseudo_text(doc, node.before, elem);
         let after_text = collect_pseudo_text(doc, node.after, elem);
         out.insert(
@@ -1236,7 +1281,7 @@ fn walk_anchors(
     }
     let children: Vec<usize> = node.children.clone();
     for c in children {
-        walk_anchors(doc, c, depth + 1, geometry, snapshots, out);
+        walk_anchors(doc, c, depth + 1, geometry, snapshots, texts, out);
     }
 }
 
