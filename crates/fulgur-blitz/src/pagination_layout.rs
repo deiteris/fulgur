@@ -1823,9 +1823,11 @@ struct RowState {
 /// Blitz lays a table out as a grid of its cells, so the fragmenter walks
 /// the cells and never meets the row: each cell carries its row's `avoid`,
 /// and the row spans its cells' extent. A row is kept whole when it carries
-/// `break-inside: avoid` (css-break-3 §3.3) or holds a cell with `rowspan`;
-/// such a cell reaches down through the rows it spans, so they move with it
-/// and the cell is never cut at a page foot apart from its rows.
+/// `break-inside: avoid` (css-break-3 §3.3) or holds a cell that spans rows
+/// (`rowspan` as laid out: a span ends with its row group). Such a cell
+/// reaches down through the rows it spans, so they move with it and the
+/// cell is never cut at a page foot apart from its rows; a cell of a spanned
+/// row that spans further takes its own rows along too.
 fn kept_table_row_bottom(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -1841,34 +1843,79 @@ fn kept_table_row_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    let displays = |node: &blitz_dom::Node, inside: DisplayInside| {
+    fn displays(node: &blitz_dom::Node, inside: DisplayInside) -> bool {
         node.primary_styles()
             .is_some_and(|s| s.clone_display().inside() == inside)
-    };
+    }
+    fn cells<'a>(
+        doc: &'a BaseDocument,
+        row: &'a blitz_dom::Node,
+    ) -> impl Iterator<Item = &'a blitz_dom::Node> {
+        row.children
+            .iter()
+            .filter_map(|&id| doc.get_node(id))
+            .filter(|node| displays(node, DisplayInside::TableCell))
+    }
     if !displays(row, DisplayInside::TableRow) {
         return None;
     }
-    let cells = row
-        .children
-        .iter()
-        .filter_map(|&id| doc.get_node(id))
-        .filter(|node| displays(node, DisplayInside::TableCell));
-    let spans_rows = |node: &blitz_dom::Node| {
+    // Only a cell with `rowspan` may span rows; whether it does is read from
+    // the layout below, as Blitz ends a span with its row group.
+    let may_span = |node: &blitz_dom::Node| {
         node.element_data()
             .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
             .and_then(|value| value.parse::<u16>().ok())
             .is_some_and(|rowspan| rowspan > 1)
     };
-    if !avoid && !cells.clone().any(spans_rows) {
+    if !avoid && !cells(doc, row).any(may_span) {
         return None;
     }
-    let (top, bottom) = cells
-        .map(|node| {
-            let layout = node.final_layout;
-            (layout.location.y, layout.location.y + layout.size.height)
-        })
-        .reduce(|(top, bottom), (y, end)| (top.min(y), bottom.max(end)))?;
+    // The extent of a row's cells: every cell starts at its row's top, and a
+    // cell spanning rows ends below the row.
+    let extent = |row: &blitz_dom::Node| {
+        cells(doc, row)
+            .map(|node| {
+                let layout = node.final_layout;
+                (layout.location.y, layout.location.y + layout.size.height)
+            })
+            .reduce(|(top, bottom), (y, end)| (top.min(y), bottom.max(end)))
+    };
+    let (top, own_bottom) = extent(row)?;
+    let group = doc.get_node(row.parent?)?;
+    let later = group
+        .children
+        .iter()
+        .skip_while(|&&id| id != row.id)
+        .skip(1)
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|&next| displays(next, DisplayInside::TableRow))
+        .map(extent);
+    let bottom = match spanned_rows_bottom(own_bottom, later) {
+        Some(bottom) => bottom,
+        None if avoid => own_bottom,
+        None => return None,
+    };
     (bottom - top <= page_height_px + 1.0).then_some(bottom)
+}
+
+/// The bottom of the later rows that a row's cells reach, given the bottom
+/// of its cells and the extent `(top, bottom)` of the cells of each later row
+/// of its group, in order (`None` for a row without cells). A cell spanning
+/// rows reaches each later row that starts above the bottom so far, and the
+/// cells of that row may reach further. `None` when no later row is reached.
+fn spanned_rows_bottom(
+    bottom: f32,
+    later: impl IntoIterator<Item = Option<(f32, f32)>>,
+) -> Option<f32> {
+    let mut reached = None;
+    for (top, end) in later.into_iter().flatten() {
+        let so_far = reached.unwrap_or(bottom);
+        if top >= so_far - 0.5 {
+            break;
+        }
+        reached = Some(so_far.max(end));
+    }
+    reached
 }
 
 #[derive(Debug)]
@@ -10730,33 +10777,47 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
-    /// A row holding a cell with `rowspan` is kept whole with the rows the
-    /// cell spans: without `break-inside: avoid`, the row does not fit the
-    /// rest of the page and moves to the next with every cell, instead of
-    /// splitting its tall cell between blocks.
+    /// A cell spanning rows reaches the rows below its own that start above
+    /// its bottom, and no further. Blitz 0.2 lays no `rowspan` out, so the
+    /// extents are given rather than laid out.
     #[test]
-    fn a_row_holding_a_rowspan_cell_moves_whole_with_the_rows_it_spans() {
-        let html = r#"
-            <html><head><style>
-              html, body { margin: 0; padding: 0; }
-              table { border-spacing: 0; }
-              td { padding: 0; }
-            </style></head><body>
-              <div style="height: 120px"></div>
-              <table><tr>
-                <td id="span" rowspan="2">x</td>
-                <td><div id="a" style="height: 30px"></div><div style="height: 30px"></div><div style="height: 30px"></div></td>
-              </tr><tr><td id="next">y</td></tr></table>
-            </body></html>
-        "#;
-        let mut doc = parse(html, 200.0);
-        let ids = ["span", "a", "next"].map(|id| find_by_id(doc.deref_mut(), id).expect(id));
-        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
-        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
-        for id in ids {
-            let pages: Vec<u32> = geom[&id].fragments.iter().map(|f| f.page_index).collect();
-            assert_eq!(pages, [1], "the spanned rows move to page 1; geom={geom:?}");
-        }
+    fn a_spanning_cell_reaches_the_rows_that_start_above_its_bottom() {
+        let rows = |extents: &[(f32, f32)]| extents.iter().copied().map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            super::spanned_rows_bottom(40.0, rows(&[(20.0, 40.0), (40.0, 60.0)])),
+            Some(40.0),
+            "a cell spanning two rows reaches the second"
+        );
+        assert_eq!(
+            super::spanned_rows_bottom(20.0, rows(&[(20.0, 40.0)])),
+            None,
+            "cells one row tall reach no later row"
+        );
+        assert_eq!(
+            super::spanned_rows_bottom(20.0, []),
+            None,
+            "nor does the last row"
+        );
+        assert_eq!(
+            super::spanned_rows_bottom(20.0, rows(&[(22.0, 40.0)])),
+            None,
+            "nor a row after border spacing"
+        );
+    }
+
+    /// Staggered spanning cells chain their rows: a cell of a row that an
+    /// earlier cell reaches takes the rows it spans along, and a row without
+    /// cells (every column spanned from above) is passed over.
+    #[test]
+    fn staggered_spanning_cells_chain_their_rows() {
+        let later = [
+            Some((20.0, 60.0)),
+            Some((40.0, 100.0)),
+            Some((100.0, 120.0)),
+        ];
+        assert_eq!(super::spanned_rows_bottom(40.0, later), Some(100.0));
+        let covered = [None, Some((40.0, 60.0)), Some((60.0, 80.0))];
+        assert_eq!(super::spanned_rows_bottom(60.0, covered), Some(60.0));
     }
 
     // ── break-after: page after recursive split (lines 876-882) ──────────────
