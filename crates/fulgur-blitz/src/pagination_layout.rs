@@ -913,7 +913,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     })
                 });
             let available_strip = (self.page_height_px - cursor_y).max(0.0);
-            let avoid_fits_whole_page = avoid_inside && child_h <= self.page_height_px + 1.0;
+            // `avoid_inside` already holds only for a child that fits a page.
             let needs_recursion = has_splittable_children
                 && (!is_multicol || multicol_has_span_all)
                 && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
@@ -923,7 +923,7 @@ impl<'a> PaginationLayoutTree<'a> {
                         self.used_page_names.as_ref(),
                         0,
                     )
-                    || (!avoid_fits_whole_page
+                    || (!avoid_inside
                         && would_split_block_subtree(
                             self.doc,
                             child_id,
@@ -3286,7 +3286,7 @@ fn fragment_block_subtree_inner(
         // are atomic from the fragmenter's perspective.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
         // fulgur-2s7p.5: mirrors the body-direct branch's
-        // `avoid_fits_whole_page` guard — a nested `break-inside:
+        // `avoid_inside` guard — a nested `break-inside:
         // avoid` block container that fits whole on a fresh page must
         // not be recursed into just because it doesn't fit the
         // *remaining* strip (`would_split_block_subtree` measures
@@ -3757,11 +3757,18 @@ fn moves_whole_at_foot(
         .iter()
         .take_while(|line| top + (line.1 - first_top) <= page_height_px)
         .count();
-    if fit == line_metrics.len() {
-        return false;
-    }
-    let split = fit.min(line_metrics.len().saturating_sub(limits.widows));
-    split == 0 || split < limits.orphans
+    fit < line_metrics.len() && split_point(fit, 0, line_metrics.len(), limits).is_none()
+}
+
+/// The line a fragment of an inline root breaks before, when lines
+/// `[start, fit)` of its `total` fit the page: after the last that fits,
+/// pulled back so the remainder keeps `limits.widows` lines, or `None`
+/// when that leaves the fragment fewer than `limits.orphans` lines or none
+/// (CSS Fragmentation §4.4). [`fragment_inline_root`] splits by it, and
+/// [`moves_whole_at_foot`] asks it, so the two cannot disagree.
+fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Option<usize> {
+    let split = fit.min(total.saturating_sub(limits.widows));
+    (split > start && split >= start + limits.orphans).then_some(split)
 }
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
@@ -3859,9 +3866,8 @@ fn fragment_inline_root(
 
         // Lines [fragment_start_idx, i) fit. Keep `widows` lines for the
         // remainder.
-        let widow_safe_split = i.min(total_lines.saturating_sub(limits.widows));
-        let split = if widow_safe_split >= fragment_start_idx + limits.orphans {
-            widow_safe_split
+        let split = if let Some(split) = split_point(i, fragment_start_idx, total_lines, limits) {
+            split
         } else if at_page_top {
             // css-break-3 §4.4: the minimums cannot be met and moving gains
             // nothing, so relax them and split after the lines that fit.
@@ -10861,10 +10867,17 @@ h2 { string-set: chapter-title content(text); }
     /// page foot.
     #[test]
     fn break_inside_avoid_on_a_paragraph_taller_than_a_page_splits_it() {
-        let lines = (1..=12).map(|n| format!("L{n}")).collect::<Vec<_>>().join("<br>");
+        let lines = (1..=12)
+            .map(|n| format!("L{n}"))
+            .collect::<Vec<_>>()
+            .join("<br>");
         for wrap in [false, true] {
             let paragraph = format!(r#"<p id="p" style="break-inside: avoid">{lines}</p>"#);
-            let body = if wrap { format!("<div>{paragraph}</div>") } else { paragraph };
+            let body = if wrap {
+                format!("<div>{paragraph}</div>")
+            } else {
+                paragraph
+            };
             let html = format!(
                 r#"<html><head><style>
                   html, body {{ margin: 0; padding: 0; }}
