@@ -762,15 +762,50 @@ pub fn apply_single_pass<P: DomPass + ?Sized>(
 /// That resolve constructs the layout again and shapes the inline layouts
 /// the first construction queued (deduplicated by node) from the rewritten
 /// text; the text of a pseudo-element, set when Blitz creates it, is kept.
+///
+/// A document where no element or pseudo-element computes a case
+/// transform ([`has_case_transform`]) skips the first construction and the
+/// rewrite: Blitz's resolve then finds the styles clean and constructs the
+/// layout once.
 pub fn resolve(doc: &mut HtmlDocument) {
     sanitize_inline_svgs(doc);
     if doc.try_root_element().is_none() {
         return;
     }
     doc.resolve_stylist(0.0);
-    doc.resolve_layout_children();
-    apply_text_transform(doc);
+    if has_case_transform(doc) {
+        doc.resolve_layout_children();
+        apply_text_transform(doc);
+    }
     doc.resolve(0.0);
+}
+
+/// Whether any element, or any of its eager pseudo-elements (`::before`,
+/// `::after`), computes a `text-transform` with a case keyword
+/// (`uppercase`, `lowercase`, `capitalize`), the only ones
+/// [`apply_text_transform`] applies. Reads the styles of a resolved stylist.
+fn has_case_transform(doc: &BaseDocument) -> bool {
+    use style::properties::ComputedValues;
+    let changes_case = |style: &ComputedValues| {
+        style
+            .clone_text_transform()
+            .intersects(TextTransform::CASE_TRANSFORMS)
+    };
+    doc.tree().iter().any(|(_, node)| {
+        let data = node.stylo_element_data.borrow();
+        data.as_ref().is_some_and(|data| {
+            data.styles
+                .get_primary()
+                .is_some_and(|style| changes_case(style))
+                || data
+                    .styles
+                    .pseudos
+                    .as_array()
+                    .iter()
+                    .flatten()
+                    .any(|style| changes_case(style))
+        })
+    })
 }
 
 /// [`resolve`] without the `text-transform` rewrite, for a pass that only
@@ -977,6 +1012,26 @@ mod text_transform_tests {
             .filter_map(|&child| doc.get_node(child)?.text_data())
             .map(|text| text.content.as_str())
             .collect()
+    }
+
+    /// The fast path of [`resolve`] reads a case transform on an element,
+    /// on a pseudo-element alone, and on no box of a document with none
+    /// (`full-width` changes no case).
+    #[test]
+    fn has_case_transform_finds_an_element_or_a_pseudo_element_with_a_case_keyword() {
+        let has = |css: &str| {
+            let html = format!(
+                "<!DOCTYPE html><html><head><style>{css}</style></head><body><p>a</p></body></html>"
+            );
+            let mut doc = parse(&html, 400.0, &[]);
+            doc.resolve_stylist(0.0);
+            has_case_transform(&doc)
+        };
+
+        assert!(!has(""));
+        assert!(!has("p{text-transform:full-width}"));
+        assert!(has("p{text-transform:lowercase}"));
+        assert!(has("p::before{content:\"x\";text-transform:uppercase}"));
     }
 
     #[test]
