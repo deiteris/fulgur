@@ -780,19 +780,16 @@ impl<'a> PaginationLayoutTree<'a> {
                 collect_inline_line_metrics(child)
             };
             if line_metrics.len() > 1 {
-                // fulgur-s67g Phase 2.2: if the paragraph cannot fit
-                // the remaining space on the current page strip but
-                // would fit (or at least start fresh) on a new page,
-                // advance the page boundary before calling
-                // `fragment_inline_root`. This is the "split before
-                // the child" fallback (CSS Fragmentation §4.2, class A
-                // break point) taken when the inline split path can't
-                // honour widow / orphan constraints within the strip.
-                let para_total_h = line_metrics
-                    .last()
-                    .map(|l| l.1 - line_metrics[0].0)
-                    .unwrap_or(child_h);
-                if cursor_y > 0.0 && cursor_y + para_total_h > self.page_height_px {
+                // fulgur-s67g Phase 2.2: if the paragraph crosses the
+                // foot of the current page strip and cannot split there
+                // within its `orphans` / `widows`, advance the page
+                // boundary before calling `fragment_inline_root`. This is
+                // the "split before the child" fallback (CSS
+                // Fragmentation §4.2, class A break point).
+                let limits = line_limits(self.doc, self.column_styles, child_id);
+                if cursor_y > 0.0
+                    && moves_whole_at_foot(&line_metrics, cursor_y, self.page_height_px, limits)
+                {
                     page_index += 1;
                     cursor_y = 0.0;
                 }
@@ -806,6 +803,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     page_index,
                     self.page_height_px,
                     &line_metrics,
+                    limits,
                 );
                 record_inline_root_descendants(
                     &mut self.geometry,
@@ -2997,17 +2995,15 @@ fn fragment_block_subtree_inner(
         };
         if line_metrics.len() > 1 {
             // Split-before fallback (CSS Fragmentation §4.2, class A
-            // break point): if the paragraph doesn't fit the remaining
-            // strip but something is already on this page, push to a
+            // break point): if the paragraph crosses the foot of the
+            // remaining strip, cannot split there within its `orphans` /
+            // `widows`, and something is already on this page, push to a
             // fresh page before splitting — mirrors body-direct's same
             // pre-check. When this container's first in-flow child is
             // itself this paragraph (`cursor_y == page_start_y`, the
             // fulgur-2s7p.1 repro shape), this is skipped and the split
             // begins right where the container currently sits.
-            let para_total_h = line_metrics
-                .last()
-                .map(|l| l.1 - line_metrics[0].0)
-                .unwrap_or(child_h);
+            let limits = line_limits(doc, column_styles, child_id);
             // codex P1: `entry_page_index` is captured *before* the
             // split-before advance below, so `new_page_index >
             // entry_page_index` (checked further down) is true whenever
@@ -3028,7 +3024,9 @@ fn fragment_block_subtree_inner(
             // "is there real content already on this page" (the
             // fulgur-2s7p.1 first-child exemption), which `cursor_y`
             // correctly proxies for regardless of row position.
-            if cursor_y > page_start_y && child_page_y + para_total_h > page_height_px {
+            if cursor_y > page_start_y
+                && moves_whole_at_foot(&line_metrics, child_page_y, page_height_px, limits)
+            {
                 let should_emit = row_state
                     .as_mut()
                     .map(|rs| rs.emitted_parent_pages.insert(page_index))
@@ -3099,6 +3097,7 @@ fn fragment_block_subtree_inner(
                 page_index,
                 page_height_px,
                 &line_metrics,
+                limits,
             );
             record_inline_root_descendants(
                 geometry,
@@ -3675,6 +3674,89 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// The `orphans` and `widows` of an inline root, as line counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineLimits {
+    orphans: usize,
+    widows: usize,
+}
+
+impl Default for LineLimits {
+    /// The initial values (CSS Fragmentation 3 §4.4): 2 and 2.
+    fn default() -> Self {
+        Self {
+            orphans: 2,
+            widows: 2,
+        }
+    }
+}
+
+/// The `orphans` and `widows` of the inline root `node_id`. Both properties
+/// are inherited, so each is the value its nearest element declares, from
+/// the node up through its ancestors (an `inherit` passes on to the
+/// parent), else the initial 2.
+fn line_limits(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node_id: usize,
+) -> LineLimits {
+    use crate::column_css::LineCount;
+
+    let mut orphans = None;
+    let mut widows = None;
+    let mut next = Some(node_id);
+    while let Some(id) = next {
+        if orphans.is_some() && widows.is_some() {
+            break;
+        }
+        if let Some(props) = column_styles.and_then(|table| table.get(&id)) {
+            if let (None, Some(LineCount::Lines(count))) = (orphans, props.orphans) {
+                orphans = Some(count);
+            }
+            if let (None, Some(LineCount::Lines(count))) = (widows, props.widows) {
+                widows = Some(count);
+            }
+        }
+        next = doc.get_node(id).and_then(|node| node.parent);
+    }
+    let initial = LineLimits::default();
+    let lines = |count: Option<u32>, initial: usize| {
+        count.map_or(initial, |count| {
+            usize::try_from(count).unwrap_or(usize::MAX)
+        })
+    };
+    LineLimits {
+        orphans: lines(orphans, initial.orphans),
+        widows: lines(widows, initial.widows),
+    }
+}
+
+/// fulgur-s67g Phase 2.2: whether an inline root whose first line starts
+/// at `top` on a page strip of `page_height_px`, below the top of the
+/// page, moves whole to the next page rather than split at the page foot:
+/// it does when it crosses the foot and fewer than `limits.orphans` of its
+/// lines fit above it once `limits.widows` lines are kept for the next
+/// page (CSS Fragmentation §4.4), as [`fragment_inline_root`] splits it.
+fn moves_whole_at_foot(
+    line_metrics: &[(f32, f32)],
+    top: f32,
+    page_height_px: f32,
+    limits: LineLimits,
+) -> bool {
+    let Some(&(first_top, _)) = line_metrics.first() else {
+        return false;
+    };
+    let fit = line_metrics
+        .iter()
+        .take_while(|line| top + (line.1 - first_top) <= page_height_px)
+        .count();
+    if fit == line_metrics.len() {
+        return false;
+    }
+    let split = fit.min(line_metrics.len().saturating_sub(limits.widows));
+    split == 0 || split < limits.orphans
+}
+
 /// fulgur-p55h: split a multi-line inline root across page boundaries
 /// at line edges, append one Fragment per page span to the geometry
 /// table, and return the updated `(page_index, cursor_y, fragments_emitted)`.
@@ -3688,8 +3770,8 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
 /// progress.
 ///
 /// fulgur-s67g Phase 2.1 (widow / orphan): the break goes after the last
-/// line that fits, pulled back so the remainder keeps `WIDOWS_MIN` lines
-/// (CSS Fragmentation §4.4). If that leaves fewer than `ORPHANS_MIN`
+/// line that fits, pulled back so the remainder keeps `limits.widows` lines
+/// (CSS Fragmentation §4.4). If that leaves fewer than `limits.orphans`
 /// lines in the fragment:
 ///
 /// - when the fragment starts below the top of a page, the whole
@@ -3698,8 +3780,7 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
 /// - at the top of a page moving gains nothing, so the minimums are
 ///   relaxed and the break goes after the lines that fit.
 ///
-/// CSS `orphans` / `widows` properties are not parsed today, so the
-/// fragmenter uses the CSS 3 Fragmentation defaults (`2` for both).
+/// `limits` are the paragraph's `orphans` and `widows` ([`line_limits`]).
 ///
 /// Once the next page would be `MAX_PAGES` the walk stops breaking and
 /// the rest of the paragraph accumulates into the final fragment.
@@ -3724,12 +3805,8 @@ fn fragment_inline_root(
     initial_page_index: u32,
     page_height_px: f32,
     line_metrics: &[(f32, f32)],
+    limits: LineLimits,
 ) -> (u32, f32, usize) {
-    /// CSS 3 Fragmentation default for `orphans`.
-    const ORPHANS_MIN: usize = 2;
-    /// CSS 3 Fragmentation default for `widows`.
-    const WIDOWS_MIN: usize = 2;
-
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0);
     }
@@ -3773,10 +3850,10 @@ fn fragment_inline_root(
             continue;
         }
 
-        // Lines [fragment_start_idx, i) fit. Keep WIDOWS_MIN lines for the
+        // Lines [fragment_start_idx, i) fit. Keep `widows` lines for the
         // remainder.
-        let widow_safe_split = i.min(total_lines.saturating_sub(WIDOWS_MIN));
-        let split = if widow_safe_split >= fragment_start_idx + ORPHANS_MIN {
+        let widow_safe_split = i.min(total_lines.saturating_sub(limits.widows));
+        let split = if widow_safe_split >= fragment_start_idx + limits.orphans {
             widow_safe_split
         } else if at_page_top {
             // css-break-3 §4.4: the minimums cannot be met and moving gains
@@ -9751,9 +9828,15 @@ h2 { string-set: chapter-title content(text); }
         // 225 > 200), leaving 1 line in the tail — widow violated.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
         let (new_page, new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, /*child_id=*/ 1, /*paragraph_x=*/ 0.0, /*width=*/ 100.0,
-            /*initial_cursor_y=*/ 0.0, /*initial_page_index=*/ 0,
-            /*page_height_px=*/ 200.0, &lines,
+            &mut geom,
+            /*child_id=*/ 1,
+            /*paragraph_x=*/ 0.0,
+            /*width=*/ 100.0,
+            /*initial_cursor_y=*/ 0.0,
+            /*initial_page_index=*/ 0,
+            /*page_height_px=*/ 200.0,
+            &lines,
+            super::LineLimits::default(),
         );
         assert_eq!(emitted, 2, "relaxed split → 2 fragments");
         assert_eq!(new_page, 1);
@@ -9778,8 +9861,17 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200 → natural split at line 2 (bottom 225 > 200).
         // first_size = 2 ≥ orphans, remaining_size = 2 ≥ widows. Split OK.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0), (225.0, 300.0)];
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 200.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            200.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
         let frags = &geom.get(&1).unwrap().fragments;
@@ -9808,8 +9900,17 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 100 → natural split at line 1 (bottom 150 > 100).
         // first_size = 1 < orphans=2, but the paragraph is at the page top.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, _new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 100.0, &lines);
+        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 3, "relaxed → one line per fragment");
         assert_eq!(new_page, 2);
         let frags = &geom.get(&1).unwrap().fragments;
@@ -11209,8 +11310,17 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn fragment_inline_root_empty_line_metrics_returns_early() {
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 42.0, 3, 800.0, &[]);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            42.0,
+            3,
+            800.0,
+            &[],
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 0, "empty metrics → no fragments emitted");
         assert_eq!(new_page, 3, "page unchanged");
         assert!(
@@ -11236,8 +11346,15 @@ h2 { string-set: chapter-title content(text); }
         let lines = vec![(0.0_f32, 25.0), (25.0, 50.0), (50.0, 75.0), (75.0, 100.0)];
         let mut geom = PaginationGeometryTable::new();
         let (new_page, new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, 1, 5.0, 100.0, /*initial_cursor_y=*/ 30.0,
-            /*initial_page_index=*/ 0, /*page_height_px=*/ 80.0, &lines,
+            &mut geom,
+            1,
+            5.0,
+            100.0,
+            /*initial_cursor_y=*/ 30.0,
+            /*initial_page_index=*/ 0,
+            /*page_height_px=*/ 80.0,
+            &lines,
+            super::LineLimits::default(),
         );
         assert_eq!(emitted, 2, "expected split into 2 fragments");
         assert_eq!(new_page, 1, "second fragment lands on page 1");
@@ -11285,8 +11402,17 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 50.0, i as f32 * 50.0 + 50.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 7, 0.0, 200.0, 0.0, 0, 100.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            7,
+            0.0,
+            200.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(
             emitted, 3,
             "six lines at 50px on a 100px page → 3 fragments"
@@ -11329,8 +11455,17 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 10.0, i as f32 * 10.0 + 10.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _new_cursor, _emitted) =
-            super::fragment_inline_root(&mut geom, 7, 0.0, 200.0, 0.0, 0, 25.0, &lines);
+        let (new_page, _new_cursor, _emitted) = super::fragment_inline_root(
+            &mut geom,
+            7,
+            0.0,
+            200.0,
+            0.0,
+            0,
+            25.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert!(
             new_page <= crate::MAX_PAGES,
             "fragment_inline_root must clamp page advancement to MAX_PAGES \
@@ -11364,7 +11499,15 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         let mut geom = PaginationGeometryTable::new();
         let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, 99, 0.0, 100.0, 0.0, /*initial_page_index=*/ 2, 100.0, &lines,
+            &mut geom,
+            99,
+            0.0,
+            100.0,
+            0.0,
+            /*initial_page_index=*/ 2,
+            100.0,
+            &lines,
+            super::LineLimits::default(),
         );
         assert_eq!(emitted, 2, "4 lines → 2 fragments");
         let frags = &geom.get(&99).unwrap().fragments;
@@ -11383,8 +11526,17 @@ h2 { string-set: chapter-title content(text); }
         // Starts at y=50 on an 80px page; 25px lines end at 75 (fits), 100.
         let lines = vec![(0.0_f32, 25.0), (25.0, 50.0), (50.0, 75.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 50.0, 0, 80.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            50.0,
+            0,
+            80.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 1, "the paragraph is not split");
         assert_eq!(new_page, 1, "the paragraph moves to the next page");
         let entry = geom.get(&1).unwrap();
@@ -11407,8 +11559,17 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 50.0, i as f32 * 50.0 + 50.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 200.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            200.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 2);
         assert_eq!(new_page, 1);
         let entry = geom.get(&1).unwrap();
@@ -11426,8 +11587,17 @@ h2 { string-set: chapter-title content(text); }
         // 75px lines on a 100px page: one line fits per page.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 100.0, &lines);
+        let (new_page, _cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         assert_eq!(emitted, 3, "one line per page");
         assert_eq!(new_page, 2);
         let entry = geom.get(&1).unwrap();
@@ -11442,8 +11612,17 @@ h2 { string-set: chapter-title content(text); }
     fn line_taller_than_an_empty_page_is_emitted_alone() {
         let lines = vec![(0.0, 150.0), (150.0, 175.0), (175.0, 200.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (_page, _cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 100.0, &lines);
+        let (_page, _cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::LineLimits::default(),
+        );
         let entry = geom.get(&1).unwrap();
         assert_eq!(emitted, entry.fragments.len());
         assert!((entry.fragments[0].height.to_f32() - 150.0).abs() < 0.01);
@@ -11475,6 +11654,7 @@ h2 { string-set: chapter-title content(text); }
                         0,
                         PAGE_H,
                         &lines,
+                        super::LineLimits::default(),
                     );
                     let entry = geom.get(&1).unwrap();
                     let ctx = format!("line_h={line_h} lines={lines_n} start={start}");
@@ -11498,6 +11678,98 @@ h2 { string-set: chapter-title content(text); }
                 }
             }
         }
+    }
+
+    /// fulgur-s67g Phase 2.2: a paragraph crossing the page foot below the
+    /// top of a page moves whole only when the lines that fit, less the
+    /// `widows` kept for the next page, are fewer than `orphans`. Six 20px
+    /// lines from y=90 on a 200px strip: five fit.
+    #[test]
+    fn moves_whole_at_foot_honours_orphans_and_widows() {
+        let lines: Vec<(f32, f32)> = (0..6)
+            .map(|i| (i as f32 * 20.0, (i + 1) as f32 * 20.0))
+            .collect();
+        let moves = |orphans, widows| {
+            super::moves_whole_at_foot(&lines, 90.0, 200.0, super::LineLimits { orphans, widows })
+        };
+        assert!(!moves(1, 1), "5 + 1");
+        assert!(!moves(2, 2), "4 + 2");
+        assert!(!moves(3, 3), "3 + 3");
+        assert!(moves(4, 4), "2 + 4 leaves two orphans");
+        assert!(moves(6, 1), "five lines fit, six wanted");
+        assert!(
+            !super::moves_whole_at_foot(&lines, 80.0, 200.0, super::LineLimits::default()),
+            "the paragraph fits whole"
+        );
+        assert!(
+            super::moves_whole_at_foot(
+                &lines,
+                185.0,
+                200.0,
+                super::LineLimits {
+                    orphans: 1,
+                    widows: 1
+                }
+            ),
+            "not even the first line fits"
+        );
+    }
+
+    /// The lines of each fragment of the inline root `id`.
+    fn line_partition(geom: &PaginationGeometryTable, id: usize) -> (Vec<u32>, Vec<usize>) {
+        let entry = geom.get(&id).expect("the paragraph is recorded");
+        (
+            entry.fragments.iter().map(|f| f.page_index).collect(),
+            entry.line_boundaries.clone(),
+        )
+    }
+
+    /// A body-level paragraph starting mid-page splits at the page foot by
+    /// its own `orphans` and `widows`: six 20px lines from y=90 on a 200px
+    /// strip split 3 + 3 at `3 / 3` and move whole at `4 / 4`.
+    #[test]
+    fn a_paragraph_mid_page_splits_at_the_foot_by_its_orphans_and_widows() {
+        let split = |limit: u32| {
+            let html = format!(
+                r#"<html><body style="margin:0">
+                  <div style="height:90px"></div>
+                  <p id="p" style="margin:0;line-height:20px;orphans:{limit};widows:{limit}">a<br>b<br>c<br>d<br>e<br>f</p>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let p_id = find_by_id(&doc, "p").expect("p#p");
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table_cs);
+            line_partition(&geom, p_id)
+        };
+        assert_eq!(split(3), (vec![0, 1], vec![0, 3, 6]), "3 + 3");
+        assert_eq!(split(4), (vec![1], vec![0, 6]), "moves whole");
+    }
+
+    /// A nested paragraph after content of its container takes `orphans`
+    /// and `widows` from an ancestor (both are inherited), past an
+    /// `inherit` of its own, and splits at the page foot by them.
+    #[test]
+    fn a_nested_paragraph_inherits_orphans_and_widows() {
+        let split = |limit: u32| {
+            let html = format!(
+                r#"<html><body style="margin:0">
+                  <div style="orphans:{limit};widows:{limit}"><div>
+                    <div style="height:90px"></div>
+                    <p id="p" style="margin:0;line-height:20px;orphans:inherit">a<br>b<br>c<br>d<br>e<br>f</p>
+                  </div></div>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let p_id = find_by_id(&doc, "p").expect("p#p");
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table_cs);
+            line_partition(&geom, p_id)
+        };
+        assert_eq!(split(1), (vec![0, 1], vec![0, 5, 6]), "5 + 1");
+        assert_eq!(split(4), (vec![1], vec![0, 6]), "moves whole");
     }
 
     // ── StringSetPageState / PageRunningState derived-trait coverage ─────────

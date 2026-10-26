@@ -111,6 +111,18 @@ pub enum BreakBorder {
     None,
 }
 
+/// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
+/// block container a fragment may hold at the foot of a page (`orphans`) or
+/// at the top of the next (`widows`). Both properties are inherited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineCount {
+    /// `inherit`, `unset`, `revert`, or `revert-layer`: the parent's value
+    /// (no style sheet of the user agent sets either property).
+    Inherit,
+    /// A positive `<integer>`; `initial` is 2.
+    Lines(u32),
+}
+
 /// `page` value (CSS Page 3, fulgur-uebl). `None` means the author did not
 /// declare the property; `Some(PageName::Auto)` means the author wrote
 /// `page: auto` explicitly (which is also the initial value, but we
@@ -154,6 +166,12 @@ pub struct ColumnStyleProps {
     /// `-fulgur-break-border: auto | none`, read on a table (see
     /// [`BreakBorder`]).
     pub break_border: Option<BreakBorder>,
+    /// `orphans` as declared on the element; `None` when it declares none.
+    /// The property is inherited, so the consumer looks at the ancestors
+    /// next (`pagination_layout::line_limits`).
+    pub orphans: Option<LineCount>,
+    /// `widows`, as [`Self::orphans`].
+    pub widows: Option<LineCount>,
 }
 
 impl ColumnStyleProps {
@@ -183,6 +201,12 @@ impl ColumnStyleProps {
         if other.break_border.is_some() {
             self.break_border = other.break_border;
         }
+        if other.orphans.is_some() {
+            self.orphans = other.orphans;
+        }
+        if other.widows.is_some() {
+            self.widows = other.widows;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -193,6 +217,8 @@ impl ColumnStyleProps {
             && self.break_before.is_none()
             && self.page.is_none()
             && self.break_border.is_none()
+            && self.orphans.is_none()
+            && self.widows.is_none()
     }
 }
 
@@ -516,6 +542,25 @@ fn parse_break_border_value<'i>(
     }
 }
 
+/// Parse the value side of `orphans` or `widows`: a positive `<integer>`,
+/// `initial` (2), or a keyword that takes the parent's value. Zero, a
+/// negative or fractional number, and any other value drop the declaration.
+fn parse_line_count_value<'i>(input: &mut Parser<'i, '_>) -> Result<LineCount, ParseError<'i, ()>> {
+    if let Ok(count) = input.try_parse(|input| input.expect_integer()) {
+        return u32::try_from(count)
+            .ok()
+            .filter(|&count| count >= 1)
+            .map(LineCount::Lines)
+            .ok_or_else(|| input.new_error(BasicParseErrorKind::QualifiedRuleInvalid));
+    }
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "initial" => Ok(LineCount::Lines(2)),
+        "inherit" | "unset" | "revert" | "revert-layer" => Ok(LineCount::Inherit),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// The page side a forced break value asks for, with a left-to-right page
 /// progression (`verso` is left, `recto` right); `None` for `always` and
 /// `page`.
@@ -703,6 +748,14 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-break-border") {
             if let Ok(v) = input.parse_entirely(parse_break_border_value) {
                 self.props.break_border = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("orphans") {
+            if let Ok(v) = input.parse_entirely(parse_line_count_value) {
+                self.props.orphans = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("widows") {
+            if let Ok(v) = input.parse_entirely(parse_line_count_value) {
+                self.props.widows = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1265,6 +1318,33 @@ mod tests {
         assert_eq!(read("-fulgur-break-border: none"), Some(BreakBorder::None));
         assert_eq!(read("-fulgur-break-border: auto"), Some(BreakBorder::Auto));
         assert_eq!(read("-fulgur-break-border: slice"), None);
+    }
+
+    #[test]
+    fn parse_orphans_and_widows_read_a_positive_integer_and_the_wide_keywords() {
+        let read = |css: &str| {
+            let props = parse_declaration_block(css);
+            (props.orphans, props.widows)
+        };
+        assert_eq!(
+            read("orphans: 3; widows: 1"),
+            (Some(LineCount::Lines(3)), Some(LineCount::Lines(1)))
+        );
+        assert_eq!(
+            read("orphans: initial; widows: INHERIT"),
+            (Some(LineCount::Lines(2)), Some(LineCount::Inherit))
+        );
+        assert_eq!(
+            read("orphans: unset; widows: revert"),
+            (Some(LineCount::Inherit), Some(LineCount::Inherit))
+        );
+        assert_eq!(read("orphans: 0; widows: -1"), (None, None));
+        assert_eq!(read("orphans: 2.5; widows: auto"), (None, None));
+        assert_eq!(
+            read("orphans: 4; orphans: 0"),
+            (Some(LineCount::Lines(4)), None),
+            "an invalid value overrides nothing"
+        );
     }
 
     #[test]
