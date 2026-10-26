@@ -760,10 +760,14 @@ impl<'a> PaginationLayoutTree<'a> {
                 page_index = page_on_side(self.doc, page_index, break_props.break_before_side);
             }
 
+            // `break-inside: avoid` keeps a child whole only when it fits a
+            // page (css-break-3 §3.3: avoiding is a preference); one taller
+            // than a page splits as if unkept, between its lines, as a kept
+            // table row does (`kept_table_row_bottom`).
             let avoid_inside = matches!(
                 break_props.break_inside,
                 Some(crate::draw_primitives::BreakInside::Avoid)
-            );
+            ) && child_h <= self.page_height_px + 1.0;
 
             // fulgur-p55h: if the child carries a Parley inline layout,
             // probe its line metrics and split at line boundaries —
@@ -2969,11 +2973,14 @@ fn fragment_block_subtree_inner(
         // A cell of a row kept whole places whole too, and the row's
         // extent, not the cell's, decides whether it moves on.
         let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
+        // A child taller than a page is not kept whole: it splits between
+        // its lines, as at the body level, instead of being placed as one
+        // fragment that runs past the page foot.
         let avoid_inside = kept_row_bottom.is_some()
-            || matches!(
+            || (matches!(
                 break_props.break_inside,
                 Some(crate::draw_primitives::BreakInside::Avoid)
-            );
+            ) && child_h <= page_height_px + 1.0);
         // A transformed subtree paints as a single atomic box (CSS
         // Transforms §6.1) — same exclusion as the oversized-child
         // atomic path (`has_transform` above in
@@ -10845,6 +10852,41 @@ h2 { string-set: chapter-title content(text); }
             "two short avoid-inside paragraphs on an 800px page must land on page 0; \
              geom={geom:?}"
         );
+    }
+
+    /// css-break-3 §3.3: `break-inside: avoid` is a preference. A paragraph
+    /// taller than a page cannot be kept whole, so it splits between its
+    /// lines as an unkept one does, inside a container and directly under
+    /// `body`, instead of being placed as one fragment that runs past the
+    /// page foot.
+    #[test]
+    fn break_inside_avoid_on_a_paragraph_taller_than_a_page_splits_it() {
+        let lines = (1..=12).map(|n| format!("L{n}")).collect::<Vec<_>>().join("<br>");
+        for wrap in [false, true] {
+            let paragraph = format!(r#"<p id="p" style="break-inside: avoid">{lines}</p>"#);
+            let body = if wrap { format!("<div>{paragraph}</div>") } else { paragraph };
+            let html = format!(
+                r#"<html><head><style>
+                  html, body {{ margin: 0; padding: 0; }}
+                  p {{ margin: 0; line-height: 30px; }}
+                </style></head><body>{body}</body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let p_id = find_by_id(doc.deref_mut(), "p").expect("p#p");
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+            let fragments: Vec<(u32, f32)> = geom[&p_id]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.height.to_f32()))
+                .collect();
+            assert_eq!(
+                fragments,
+                [(0, 180.0), (1, 180.0)],
+                "six lines on each page; wrapped: {wrap}; geom={geom:?}"
+            );
+        }
     }
 
     /// css-break-3 §3.3: `break-inside: avoid` on a table row keeps the row
