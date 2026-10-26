@@ -511,3 +511,88 @@ fn running_element_style_child_survives_serialization() {
         "<style> inside a running element stopped applying — CSS was corrupted by escaping"
     );
 }
+
+// A 1x1 red PNG.
+const MINIMAL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+    0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+    0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// The images painted in a 300pt x 200pt page with 40pt margins, `page_css`
+/// in its `@page` rule and `body` before one paragraph, `logo.png` in the
+/// bundle.
+fn images_in_margin_box_page(page_css: &str, body: &str) -> Vec<fulgur::inspect::ImageItem> {
+    let mut assets = AssetBundle::new();
+    assets.add_image("logo.png", MINIMAL_PNG.to_vec());
+    assets.add_css(format!(
+        ".logo {{ position: running(logo); }} @page {{ size: 300pt 200pt; margin: 40pt; {page_css} }}"
+    ));
+    let pdf = Engine::builder()
+        .assets(assets)
+        .build()
+        .render(&format!(
+            "<!DOCTYPE html><html><body>{body}<p>body</p></body></html>"
+        ))
+        .expect("render must succeed");
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), &pdf).unwrap();
+    fulgur::inspect::inspect(tmp.path()).unwrap().images
+}
+
+/// Whether `image` paints `(width, height)` points, within the rounding of
+/// the px-to-pt conversion.
+fn painted_size(image: &fulgur::inspect::ImageItem, (width, height): (f32, f32)) -> bool {
+    (image.width - width).abs() < 0.5 && (image.height - height).abs() < 0.5
+}
+
+/// An `<img>` in a running element paints in the margin box that takes the
+/// element, at the size its attributes give it, inline after the text before
+/// it. The margin-box documents used to be converted without the asset
+/// bundle, so every image in a margin box painted nothing.
+#[test]
+fn an_img_in_a_running_element_paints_in_its_margin_box() {
+    let logo = r#"<span class="logo"><img src="logo.png" width="20" height="20"></span>"#;
+    let images = images_in_margin_box_page(
+        r#"@bottom-center { content: "A " element(logo) " B"; }"#,
+        logo,
+    );
+    assert_eq!(images.len(), 1, "one image, in the margin box: {images:?}");
+    let image = &images[0];
+    assert_eq!(image.page, 1);
+    assert!(painted_size(image, (15.0, 15.0)), "20px is 15pt: {image:?}");
+    // PDF space: the bottom margin is the 40pt above the sheet's bottom. The
+    // image stands on the baseline of the box's first line, which lies in it.
+    assert!(
+        image.y > 0.0 && image.y < 40.0,
+        "the image stands in the bottom margin: {image:?}"
+    );
+    let alone =
+        images_in_margin_box_page(r#"@bottom-center { content: element(logo) " B"; }"#, logo);
+    assert_eq!(alone.len(), 1, "{alone:?}");
+    assert!(
+        image.x > alone[0].x,
+        "the image follows the text before it: {image:?}, alone {:?}",
+        alone[0]
+    );
+}
+
+/// A `background-image` on a margin box paints, as it does on a body box.
+#[test]
+fn a_margin_box_background_image_paints() {
+    let images = images_in_margin_box_page(
+        r#"@bottom-center { content: "x"; width: 20pt; height: 20pt;
+                            background: url(logo.png) no-repeat; background-size: 20pt 20pt; }"#,
+        "",
+    );
+    assert_eq!(images.len(), 1, "the margin box's background: {images:?}");
+    let image = &images[0];
+    assert_eq!(image.page, 1);
+    assert!(painted_size(image, (20.0, 20.0)), "{image:?}");
+    assert!(
+        image.y >= 0.0 && image.y + image.height <= 40.0,
+        "the background lies in the bottom margin: {image:?}"
+    );
+}

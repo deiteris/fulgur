@@ -915,6 +915,7 @@ impl Engine {
             &gcpm,
             &running_store,
             render_fonts,
+            self.assets.as_ref(),
             &string_set_for_render,
             &counter_ops_for_render,
             html_title,
