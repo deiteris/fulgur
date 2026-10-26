@@ -1803,6 +1803,49 @@ struct RowState {
     crossed_by_recursion: bool,
 }
 
+/// The bottom edge, in its table's coordinates, of the table row that `cell`
+/// belongs to when that row carries `break-inside: avoid` (css-break-3 §3.3)
+/// and fits a strip of `page_height_px`. `None` otherwise: a row taller than
+/// a page still has to split.
+///
+/// Blitz lays a table out as a grid of its cells, so the fragmenter walks
+/// the cells and never meets the row: each cell carries its row's `avoid`,
+/// and the row spans its cells' extent.
+fn kept_table_row_bottom(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    cell: &blitz_dom::Node,
+    page_height_px: f32,
+) -> Option<f32> {
+    let row = doc.get_node(cell.parent?)?;
+    let avoid = column_styles
+        .and_then(|styles| styles.get(&row.id))
+        .is_some_and(|props| {
+            matches!(
+                props.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        });
+    let displays = |node: &blitz_dom::Node, inside: DisplayInside| {
+        node.primary_styles()
+            .is_some_and(|s| s.clone_display().inside() == inside)
+    };
+    if !avoid || !displays(row, DisplayInside::TableRow) {
+        return None;
+    }
+    let (top, bottom) = row
+        .children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|node| displays(node, DisplayInside::TableCell))
+        .map(|node| {
+            let layout = node.final_layout;
+            (layout.location.y, layout.location.y + layout.size.height)
+        })
+        .reduce(|(top, bottom), (y, end)| (top.min(y), bottom.max(end)))?;
+    (bottom - top <= page_height_px + 1.0).then_some(bottom)
+}
+
 #[derive(Debug)]
 struct RepeatingTableHeader {
     table_id: usize,
@@ -2240,7 +2283,26 @@ fn fragment_repeating_table(
     // both rows on page 1). An orphaned header row is never useful output, and
     // css-tables-3 likewise bounds repetition to cases where it does not eat
     // the page.
-    let first_row_reserve = header.band_height_px + header.first_body_lead_px;
+    // A first body row kept whole (`break-inside: avoid`) has no smaller
+    // leading unit: the whole row has to clear the band.
+    let first_body_lead_px = header
+        .body_cell_ids
+        .first()
+        .and_then(|&id| doc.get_node(id))
+        .and_then(|cell| {
+            kept_table_row_bottom(
+                doc,
+                column_styles,
+                cell,
+                page_height_px - header.band_height_px,
+            )
+        })
+        .map_or(header.first_body_lead_px, |bottom| {
+            header
+                .first_body_lead_px
+                .max(bottom - header.body_origin_px)
+        });
+    let first_row_reserve = header.band_height_px + first_body_lead_px;
     let band_overflows = cursor_in + header.band_height_px > page_height_px;
     // The band fits but its first body row does not: starting here would emit
     // a header with nothing under it. Only worth moving if the pair actually
@@ -2834,10 +2896,14 @@ fn fragment_block_subtree_inner(
         // fragment, because `child_page_y > page_start_y` is false for
         // it and `would_split_block_subtree` only sees zero-height text
         // nodes as this node's DOM children).
-        let avoid_inside = matches!(
-            break_props.break_inside,
-            Some(crate::draw_primitives::BreakInside::Avoid)
-        );
+        // A cell of a row kept whole places whole too, and the row's
+        // extent, not the cell's, decides whether it moves on.
+        let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
+        let avoid_inside = kept_row_bottom.is_some()
+            || matches!(
+                break_props.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            );
         // A transformed subtree paints as a single atomic box (CSS
         // Transforms §6.1) — same exclusion as the oversized-child
         // atomic path (`has_transform` above in
@@ -3372,13 +3438,24 @@ fn fragment_block_subtree_inner(
         // Use `child_page_y + child_h` (the actual placement bottom)
         // rather than `cursor_y + child_h` so a parallel sibling
         // returning to a smaller page-local y is checked correctly.
-        if (child_page_y > page_start_y || (initial_page_occupied && page_index == page_in))
-            && child_page_y + child_h > page_height_px
+        //
+        // A cell of a row kept whole moves when the row does not fit, also
+        // as the first row of a table that starts on this page; the table
+        // then leaves nothing behind when no content of it precedes the row.
+        let child_extent =
+            kept_row_bottom.map_or(child_h, |bottom| child_h.max(bottom - this_top_in_parent));
+        let kept_row_moves = kept_row_bottom.is_some() && child_page_y > 0.0;
+        if (child_page_y > page_start_y
+            || (initial_page_occupied && page_index == page_in)
+            || kept_row_moves)
+            && child_page_y + child_extent > page_height_px
         {
-            let should_emit = row_state
-                .as_mut()
-                .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                .unwrap_or(true);
+            let leaves_parent = kept_row_bottom.is_none() || cursor_y > page_start_y;
+            let should_emit = leaves_parent
+                && row_state
+                    .as_mut()
+                    .map(|rs| rs.emitted_parent_pages.insert(page_index))
+                    .unwrap_or(true);
             if should_emit {
                 geometry
                     .entry(parent_id)
@@ -10456,6 +10533,37 @@ h2 { string-set: chapter-title content(text); }
             "two short avoid-inside paragraphs on an 800px page must land on page 0; \
              geom={geom:?}"
         );
+    }
+
+    /// css-break-3 §3.3: `break-inside: avoid` on a table row keeps the row
+    /// whole. The row does not fit the rest of the page, so it moves to the
+    /// next page with every cell, instead of splitting its tall cell between
+    /// blocks and leaving the short cell behind.
+    #[test]
+    fn break_inside_avoid_on_a_table_row_moves_the_row_whole() {
+        let html = r#"
+            <html><head><style>
+              html, body { margin: 0; padding: 0; }
+              table { border-spacing: 0; }
+              td { padding: 0; }
+              tr { break-inside: avoid; }
+            </style></head><body>
+              <div style="height: 120px"></div>
+              <table><tr>
+                <td id="short">x</td>
+                <td><div id="a" style="height: 30px"></div><div style="height: 30px"></div><div style="height: 30px"></div></td>
+              </tr></table>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 200.0);
+        let short_id = find_by_id(doc.deref_mut(), "short").expect("td#short");
+        let a_id = find_by_id(doc.deref_mut(), "a").expect("div#a");
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+        for id in [short_id, a_id] {
+            let pages: Vec<u32> = geom[&id].fragments.iter().map(|f| f.page_index).collect();
+            assert_eq!(pages, [1], "the whole row moves to page 1; geom={geom:?}");
+        }
     }
 
     // ── break-after: page after recursive split (lines 876-882) ──────────────
