@@ -72,7 +72,9 @@ pub fn resolve_content_to_string_with_anchor(
         match item {
             ContentItem::String(s) => out.push_str(s),
             ContentItem::Counter { name, style } => match name.as_str() {
-                "page" => out.push_str(&format_counter(page as i32, *style)),
+                "page" => {
+                    out.push_str(&format_counter(page_counter(page, custom_counters), *style))
+                }
                 "pages" => out.push_str(&format_counter(total_pages as i32, *style)),
                 _ => {
                     let value = custom_counters.get(name.as_str()).copied().unwrap_or(0);
@@ -231,7 +233,10 @@ pub fn resolve_content_to_html_with_anchor(
             match item {
                 ContentItem::String(s) => push_escaped_html_text(&mut out, s),
                 ContentItem::Counter { name, style } => match name.as_str() {
-                    "page" => out.push_str(&format_counter(page_num as i32, *style)),
+                    "page" => out.push_str(&format_counter(
+                        page_counter(page_num, custom_counters),
+                        *style,
+                    )),
                     "pages" => out.push_str(&format_counter(total_pages as i32, *style)),
                     _ => {
                         let value = custom_counters.get(name.as_str()).copied().unwrap_or(0);
@@ -357,7 +362,10 @@ pub fn resolve_content_to_html_with_anchor(
                 match other {
                     ContentItem::String(s) => push_escaped_html_text(&mut inner, s),
                     ContentItem::Counter { name, style } => match name.as_str() {
-                        "page" => inner.push_str(&format_counter(page_num as i32, *style)),
+                        "page" => inner.push_str(&format_counter(
+                            page_counter(page_num, custom_counters),
+                            *style,
+                        )),
                         "pages" => inner.push_str(&format_counter(total_pages as i32, *style)),
                         _ => {
                             let value = custom_counters.get(name.as_str()).copied().unwrap_or(0);
@@ -607,13 +615,21 @@ fn resolve_counters_margin_box(
     custom_counters: &BTreeMap<String, i32>,
 ) -> String {
     match name {
-        "page" => format_counter(page as i32, style),
+        "page" => format_counter(page_counter(page, custom_counters), style),
         "pages" => format_counter(total_pages as i32, style),
         _ => custom_counters
             .get(name)
             .map(|v| format_counter(*v, style))
             .unwrap_or_default(),
     }
+}
+
+/// The value of the `page` counter on a page: the page's counter
+/// snapshot carries it once an element or an `@page` rule can change it
+/// (`pagination_layout::collect_counter_states`), else it is the page
+/// number `page`.
+fn page_counter(page: usize, custom_counters: &BTreeMap<String, i32>) -> i32 {
+    custom_counters.get("page").copied().unwrap_or(page as i32)
 }
 
 /// Format a counter value according to the given [`CounterStyle`].

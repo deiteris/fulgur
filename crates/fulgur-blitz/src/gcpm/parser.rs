@@ -42,6 +42,7 @@ struct GcpmSheetParser<'a> {
     static_content_mappings: &'a mut Vec<StaticContentMapping>,
     page_settings: &'a mut Vec<PageSettingsRule>,
     bookmark_mappings: &'a mut Vec<BookmarkMapping>,
+    page_counter_ops: &'a mut Vec<CounterOp>,
 }
 
 /// Describes a region in the original CSS to edit when building `cleaned_css`.
@@ -91,7 +92,23 @@ impl<'i, 'a> AtRuleParser<'i> for GcpmSheetParser<'a> {
         let mut boxes = Vec::new();
         let mut size = None;
         let mut margin = PartialMargin::default();
-        parse_page_block(input, &page_selector, &mut boxes, &mut size, &mut margin);
+        // Counter properties of a selector-less `@page` cascade into the
+        // page context every page shares; a `:first` / `:left` / `:right`
+        // rule's are not applied.
+        let mut selected_counter_ops = Vec::new();
+        let counter_ops = if page_selector.is_none() {
+            &mut *self.page_counter_ops
+        } else {
+            &mut selected_counter_ops
+        };
+        parse_page_block(
+            input,
+            &page_selector,
+            &mut boxes,
+            &mut size,
+            &mut margin,
+            counter_ops,
+        );
 
         // Record the full @page rule span for removal.
         let start_offset = start.position().byte_index();
@@ -437,12 +454,14 @@ fn parse_page_block(
     boxes: &mut Vec<MarginBoxRule>,
     size: &mut Option<PageSizeDecl>,
     margin: &mut PartialMargin,
+    counter_ops: &mut Vec<CounterOp>,
 ) {
     let mut parser = PageRuleParser {
         page_selector,
         boxes,
         size,
         margin,
+        counter_ops,
     };
     let iter = RuleBodyParser::new(input, &mut parser);
     for item in iter {
@@ -455,6 +474,7 @@ struct PageRuleParser<'a> {
     boxes: &'a mut Vec<MarginBoxRule>,
     size: &'a mut Option<PageSizeDecl>,
     margin: &'a mut PartialMargin,
+    counter_ops: &'a mut Vec<CounterOp>,
 }
 
 impl<'i, 'a> AtRuleParser<'i> for PageRuleParser<'a> {
@@ -534,6 +554,11 @@ impl<'i, 'a> DeclarationParser<'i> for PageRuleParser<'a> {
             if let Some(v) = parse_page_margin_longhand_value(input) {
                 self.margin.left = Some(v);
             }
+        } else if name.eq_ignore_ascii_case("counter-reset")
+            || name.eq_ignore_ascii_case("counter-increment")
+            || name.eq_ignore_ascii_case("counter-set")
+        {
+            replace_counter_property(self.counter_ops, parse_counter_ops(input, &name));
         } else {
             // Skip unknown declarations
             while input.next().is_ok() {}
@@ -694,20 +719,7 @@ impl<'i, 'a> DeclarationParser<'i> for StyleRuleParser<'a> {
             || name.eq_ignore_ascii_case("counter-increment")
             || name.eq_ignore_ascii_case("counter-set")
         {
-            let ops = parse_counter_ops(input, &name);
-            // counter-reset / counter-increment / counter-set are independent
-            // CSS properties, so each must contribute to counter_ops. Apply
-            // last-declaration-wins per property by dropping prior ops of the
-            // same `CounterOp` variant before extending. `parse_counter_ops`
-            // produces ops of exactly one variant (matching the property
-            // name), so the discriminant of the first element identifies the
-            // property kind without re-inspecting the name.
-            if let Some(first) = ops.first() {
-                let kind = std::mem::discriminant(first);
-                self.counter_ops
-                    .retain(|op| std::mem::discriminant(op) != kind);
-                self.counter_ops.extend(ops);
-            }
+            replace_counter_property(self.counter_ops, parse_counter_ops(input, &name));
             let start = decl_start.position().byte_index();
             let end = input.position().byte_index();
             self.edits.push(CssEdit::Replace {
@@ -1046,6 +1058,23 @@ fn parse_bookmark_level_value<'i>(
     }
 }
 
+/// Apply one `counter-reset` / `counter-increment` / `counter-set`
+/// declaration's `ops` to the ops collected so far.
+///
+/// The three are independent CSS properties, so each contributes to
+/// `counter_ops`; within one property the last declaration wins, so the
+/// earlier ops of the same `CounterOp` variant are dropped first.
+/// `parse_counter_ops` produces ops of exactly one variant (matching the
+/// property name), so the discriminant of the first element identifies the
+/// property kind without re-inspecting the name.
+pub(super) fn replace_counter_property(counter_ops: &mut Vec<CounterOp>, ops: Vec<CounterOp>) {
+    if let Some(first) = ops.first() {
+        let kind = std::mem::discriminant(first);
+        counter_ops.retain(|op| std::mem::discriminant(op) != kind);
+        counter_ops.extend(ops);
+    }
+}
+
 /// Parse counter operations from `counter-reset`, `counter-increment`, or `counter-set`.
 fn parse_counter_ops(input: &mut Parser<'_, '_>, prop: &str) -> Vec<CounterOp> {
     let mut ops = Vec::new();
@@ -1325,6 +1354,7 @@ pub fn parse_gcpm(css: &str) -> GcpmContext {
     let mut static_content_mappings = Vec::new();
     let mut page_settings = Vec::new();
     let mut bookmark_mappings = Vec::new();
+    let mut page_counter_ops = Vec::new();
     let mut edits: Vec<CssEdit> = Vec::new();
 
     // Run the cssparser-based parse to collect GCPM data and edit spans.
@@ -1342,6 +1372,7 @@ pub fn parse_gcpm(css: &str) -> GcpmContext {
             static_content_mappings: &mut static_content_mappings,
             page_settings: &mut page_settings,
             bookmark_mappings: &mut bookmark_mappings,
+            page_counter_ops: &mut page_counter_ops,
         };
 
         let iter = StyleSheetParser::new(&mut input, &mut parser);
@@ -1362,6 +1393,7 @@ pub fn parse_gcpm(css: &str) -> GcpmContext {
         static_content_mappings,
         page_settings,
         bookmark_mappings,
+        page_counter_ops,
         cleaned_css,
     }
 }
@@ -2419,6 +2451,40 @@ mod tests {
             vec![CounterOp::Reset {
                 name: "chapter".into(),
                 value: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_page_rule_counter_ops_into_the_page_context() {
+        let css = "@page { counter-increment: run; counter-reset: x 2; } \
+                    @page :first { counter-increment: other; }";
+        let ctx = parse_gcpm(css);
+        assert_eq!(
+            ctx.page_counter_ops,
+            vec![
+                CounterOp::Increment {
+                    name: "run".into(),
+                    value: 1,
+                },
+                CounterOp::Reset {
+                    name: "x".into(),
+                    value: 2,
+                },
+            ]
+        );
+        assert!(ctx.counter_mappings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_page_rule_counter_property_last_declaration_wins() {
+        let css = "@page { counter-increment: a; } @page { counter-increment: b 3; }";
+        let ctx = parse_gcpm(css);
+        assert_eq!(
+            ctx.page_counter_ops,
+            vec![CounterOp::Increment {
+                name: "b".into(),
+                value: 3,
             }]
         );
     }

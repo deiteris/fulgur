@@ -17,9 +17,13 @@ pub struct AnchorMap {
 
 #[derive(Debug, Clone, Default)]
 pub struct AnchorEntry {
-    pub page_num: u32,
+    /// The `page` counter of the page where the element lands: the page
+    /// number that page's margin boxes print, which an element's
+    /// `counter-reset: page` / `counter-set: page` can change.
+    pub page_num: i32,
     /// Counter name -> outer-to-inner instance chain at the target
-    /// element. Mirrors `CounterState::chain_snapshot`.
+    /// element. Mirrors `CounterState::chain_snapshot`; a counter an
+    /// `@page` rule names holds its value on the element's page instead.
     pub counters: BTreeMap<String, Vec<i32>>,
     pub text: String,
     pub before_text: String,
@@ -68,13 +72,11 @@ pub fn resolve_target_counter(
         return String::new();
     };
     // CSS spec treats `page` as the implicit page counter. Resolve it
-    // straight from `entry.page_num` regardless of whether the snapshot
-    // happens to carry a user-defined `page` counter — `target-counter(..,
-    // page)` is documented to mean "the page number where this anchor
-    // lands", and giving precedence to a custom `counter-reset: page`
-    // produces a result that disagrees with the rendered page sequence.
+    // from `entry.page_num`, the page counter of the page where this
+    // anchor lands, not from the element's own `counter-reset: page`
+    // snapshot, so the result agrees with the rendered page sequence.
     if counter_name == "page" {
-        return format_counter(entry.page_num as i32, style);
+        return format_counter(entry.page_num, style);
     }
     let Some(chain) = entry.counters.get(counter_name) else {
         return String::new();
@@ -99,6 +101,11 @@ pub fn resolve_target_counters(
     let Some(entry) = map.get(frag) else {
         return String::new();
     };
+    // The page counter has one instance, the page context's: its value is
+    // the anchor page's `page_num`, as in `resolve_target_counter`.
+    if counter_name == "page" {
+        return format_counter(entry.page_num, style);
+    }
     let Some(chain) = entry.counters.get(counter_name) else {
         return String::new();
     };
@@ -267,10 +274,10 @@ mod tests {
 
     #[test]
     fn target_counter_page_name_ignores_user_defined_counter() {
-        // `target-counter(href, page)` always resolves to the actual
-        // page number where the anchor lands. A user-defined
-        // `counter-reset: page` on the target element must not shadow
-        // the implicit page counter.
+        // `target-counter(href, page)` resolves to `page_num`, the page
+        // counter of the page where the anchor lands, which a reset of
+        // `page` changes from that page on. The element's own snapshot of
+        // a `page` counter must not shadow it.
         let mut m = AnchorMap::new();
         let mut counters = BTreeMap::new();
         counters.insert("page".into(), vec![999]);
@@ -323,6 +330,31 @@ mod tests {
         assert_eq!(
             resolve_target_counters("#sec-1-2", "section", ".", CounterStyle::Decimal, &m),
             "1.2"
+        );
+    }
+
+    #[test]
+    fn target_counters_page_uses_page_num() {
+        // `target-counters(href, page, sep)` reads the page counter as
+        // `target-counter` does: `page_num`, not the element's snapshot.
+        let mut m = make_map();
+        m.insert(
+            "x",
+            AnchorEntry {
+                page_num: 5,
+                counters: BTreeMap::from([("page".into(), vec![1, 999])]),
+                text: String::new(),
+                before_text: String::new(),
+                after_text: String::new(),
+            },
+        );
+        assert_eq!(
+            resolve_target_counters("#x", "page", ".", CounterStyle::LowerRoman, &m),
+            "v"
+        );
+        assert_eq!(
+            resolve_target_counters("#sec-1-2", "page", ".", CounterStyle::Decimal, &m),
+            "7"
         );
     }
 

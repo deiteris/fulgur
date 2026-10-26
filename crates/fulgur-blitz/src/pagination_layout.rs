@@ -4029,6 +4029,16 @@ pub fn collect_running_element_states(
 /// replay counter operations in document order, returning the
 /// cumulative counter snapshot at the end of each page.
 ///
+/// Each page first applies the page context (css-page-3, page-based
+/// counters): the
+/// `page_ops` of the `@page` rules (resets, then increments, then
+/// sets) and the implicit `counter-increment: page 1` unless `page_ops`
+/// increment `page` themselves. Then the elements whose first fragment
+/// lands on the page apply theirs, so an element's `counter-reset: page
+/// N` or `counter-set: page N` numbers the page it starts on and the
+/// pages after it count on from there. The `page` entry of each
+/// snapshot is the number that page's margin boxes print.
+///
 /// Same source-order assumption as
 /// [`collect_string_set_states`]: the per-node counter ops are
 /// applied in the order they appear in the body's children list,
@@ -4039,6 +4049,7 @@ pub fn collect_running_element_states(
 pub fn collect_counter_states(
     geometry: &PaginationGeometryTable,
     counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
+    page_ops: &[crate::gcpm::CounterOp],
 ) -> Vec<BTreeMap<String, i32>> {
     use crate::gcpm::CounterOp;
     use crate::gcpm::counter::CounterState;
@@ -4062,10 +4073,31 @@ pub fn collect_counter_states(
         }
     }
 
+    let increments_page = page_ops
+        .iter()
+        .any(|op| matches!(op, CounterOp::Increment { name, .. } if name == "page"));
     let mut state = CounterState::new();
     let mut result: Vec<BTreeMap<String, i32>> = Vec::with_capacity(nodes_per_page.len());
 
     for nodes in &nodes_per_page {
+        for op in page_ops {
+            if let CounterOp::Reset { name, value } = op {
+                state.reset(name, *value);
+            }
+        }
+        if !increments_page {
+            state.increment("page", 1);
+        }
+        for op in page_ops {
+            if let CounterOp::Increment { name, value } = op {
+                state.increment(name, *value);
+            }
+        }
+        for op in page_ops {
+            if let CounterOp::Set { name, value } = op {
+                state.set(name, *value);
+            }
+        }
         for node_id in nodes {
             let Some(ops) = counter_ops_by_node.get(node_id) else {
                 continue;
@@ -10734,9 +10766,9 @@ h2 { string-set: chapter-title content(text); }
     fn counter_states_empty_geometry_returns_one_empty_page() {
         let geom = PaginationGeometryTable::new();
         let ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 1);
-        assert!(states[0].is_empty());
+        assert_eq!(states[0], BTreeMap::from([("page".to_string(), 1)]));
     }
 
     #[test]
@@ -10757,7 +10789,7 @@ h2 { string-set: chapter-title content(text); }
                 value: 3,
             }],
         );
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].get("chapter").copied(), Some(3));
     }
@@ -10789,7 +10821,7 @@ h2 { string-set: chapter-title content(text); }
                 value: 1,
             }],
         );
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].get("chapter").copied(), Some(1));
     }
@@ -10818,7 +10850,7 @@ h2 { string-set: chapter-title content(text); }
                 },
             ],
         );
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].get("idx").copied(), Some(7));
     }
@@ -10848,7 +10880,7 @@ h2 { string-set: chapter-title content(text); }
                 value: 1,
             }],
         );
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].get("chapter").copied(), Some(1));
         assert_eq!(states[1].get("chapter").copied(), Some(1));
@@ -10865,9 +10897,86 @@ h2 { string-set: chapter-title content(text); }
             height: 50.0_f32.as_px(),
         });
         let ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
-        let states = collect_counter_states(&geom, &ops);
+        let states = collect_counter_states(&geom, &ops, &[]);
         assert_eq!(states.len(), 1);
-        assert!(states[0].is_empty());
+        assert_eq!(states[0], BTreeMap::from([("page".to_string(), 1)]));
+    }
+
+    /// One geometry entry per `(node_id, page_index)`.
+    fn counter_geometry(nodes: &[(usize, u32)]) -> PaginationGeometryTable {
+        let mut geom = PaginationGeometryTable::new();
+        for &(node_id, page_index) in nodes {
+            geom.entry(node_id).or_default().fragments.push(Fragment {
+                page_index,
+                x: 0.0_f32.as_px(),
+                y: 0.0_f32.as_px(),
+                width: 100.0_f32.as_px(),
+                height: 50.0_f32.as_px(),
+            });
+        }
+        geom
+    }
+
+    #[test]
+    fn counter_states_page_counts_the_pages() {
+        let geom = counter_geometry(&[(10, 0), (20, 1), (30, 2)]);
+        let states = collect_counter_states(&geom, &BTreeMap::new(), &[]);
+        let pages: Vec<_> = states.iter().map(|s| s.get("page").copied()).collect();
+        assert_eq!(pages, [Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn counter_states_element_page_reset_numbers_its_page_and_the_pages_after() {
+        use crate::gcpm::CounterOp;
+        let geom = counter_geometry(&[(10, 0), (20, 1), (30, 2)]);
+        for op in [
+            CounterOp::Reset {
+                name: "page".into(),
+                value: 5,
+            },
+            CounterOp::Set {
+                name: "page".into(),
+                value: 5,
+            },
+        ] {
+            let ops = BTreeMap::from([(20, vec![op.clone()])]);
+            let states = collect_counter_states(&geom, &ops, &[]);
+            let pages: Vec<_> = states.iter().map(|s| s.get("page").copied()).collect();
+            assert_eq!(pages, [Some(1), Some(5), Some(6)], "{op:?}");
+        }
+    }
+
+    #[test]
+    fn counter_states_page_ops_count_before_the_elements_of_the_page() {
+        use crate::gcpm::CounterOp;
+        let geom = counter_geometry(&[(10, 0), (20, 1), (30, 2)]);
+        let page_ops = [CounterOp::Increment {
+            name: "run".into(),
+            value: 1,
+        }];
+        let ops = BTreeMap::from([(
+            20,
+            vec![CounterOp::Reset {
+                name: "run".into(),
+                value: 1,
+            }],
+        )]);
+        let states = collect_counter_states(&geom, &ops, &page_ops);
+        let runs: Vec<_> = states.iter().map(|s| s.get("run").copied()).collect();
+        assert_eq!(runs, [Some(1), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn counter_states_page_increment_of_page_replaces_the_implicit_one() {
+        use crate::gcpm::CounterOp;
+        let geom = counter_geometry(&[(10, 0), (20, 1)]);
+        let page_ops = [CounterOp::Increment {
+            name: "page".into(),
+            value: 2,
+        }];
+        let states = collect_counter_states(&geom, &BTreeMap::new(), &page_ops);
+        let pages: Vec<_> = states.iter().map(|s| s.get("page").copied()).collect();
+        assert_eq!(pages, [Some(2), Some(4)]);
     }
 
     // ── fragment_inline_root: additional branch coverage ────────────────────

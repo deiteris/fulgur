@@ -6793,6 +6793,7 @@ mod tests {
             static_content_mappings: vec![],
             page_settings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
 
@@ -6834,6 +6835,7 @@ mod tests {
             static_content_mappings: vec![],
             page_settings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
 
@@ -6969,6 +6971,7 @@ mod tests {
             static_content_mappings: vec![],
             page_settings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
 
@@ -6999,6 +7002,7 @@ mod tests {
             static_content_mappings: vec![],
             page_settings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
 

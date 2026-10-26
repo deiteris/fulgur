@@ -3800,15 +3800,18 @@ impl<'a> MarginBoxRenderer<'a> {
                 running_store,
             )
         };
-        let counter_states =
-            if gcpm.counter_mappings.is_empty() && gcpm.content_counter_mappings.is_empty() {
-                vec![BTreeMap::new(); total_pages]
-            } else {
-                crate::pagination_layout::collect_counter_states(
-                    pagination_geometry,
-                    counter_ops_by_node,
-                )
-            };
+        let counter_states = if gcpm.counter_mappings.is_empty()
+            && gcpm.content_counter_mappings.is_empty()
+            && gcpm.page_counter_ops.is_empty()
+        {
+            vec![BTreeMap::new(); total_pages]
+        } else {
+            crate::pagination_layout::collect_counter_states(
+                pagination_geometry,
+                counter_ops_by_node,
+                &gcpm.page_counter_ops,
+            )
+        };
         let margin_sheet = MarginSheet::new(strip_display_none(&gcpm.cleaned_css));
         Self {
             gcpm,

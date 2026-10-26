@@ -745,6 +745,13 @@ impl Engine {
             );
         }
 
+        // PR 8i: `convert::dom_to_drawables` no longer drains
+        // `counter_ops_by_node`, but we keep a pre-convert copy for the
+        // fragmenter-driven `collect_counter_states` calls: the anchor
+        // map's page counters below and the margin boxes in `render_v2`.
+        let counter_ops_for_render: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> =
+            counter_ops_by_node_vec.into_iter().collect();
+
         // Build the AnchorMap for `target-*` cross-references only when
         // pass 2 will actually consume it (parsed GCPM context contains
         // `target-*` AND this is pass 1, i.e. `anchor_map.is_none()`).
@@ -762,6 +769,11 @@ impl Engine {
                 &doc,
                 &pagination_geometry,
                 &counter_snapshots_for_anchor,
+                &PageCounters::new(
+                    &pagination_geometry,
+                    &counter_ops_for_render,
+                    &gcpm.page_counter_ops,
+                ),
                 &mut anchor_texts,
             )
         } else {
@@ -801,25 +813,18 @@ impl Engine {
         };
 
         // Build counter_ops_by_node map
-        let counter_ops_map: HashMap<usize, Vec<crate::gcpm::CounterOp>> = {
-            let mut map = HashMap::new();
-            for (node_id, ops) in counter_ops_by_node_vec {
-                map.insert(node_id, ops);
-            }
-            map
-        };
-
-        // PR 8i: `convert::dom_to_drawables` no longer drains
-        // `string_set_by_node` / `counter_ops_by_node`, but we keep the
-        // pre-convert clones for the fragmenter-driven `collect_*_states`
-        // calls in `render_v2` so those side-channel maps remain
-        // explicitly readable after convert returns. Each clone is small
-        // (one `Vec` per node that declares the property).
-        let string_set_for_render = string_set_by_node.clone();
-        let counter_ops_for_render: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = counter_ops_map
+        let counter_ops_map: HashMap<usize, Vec<crate::gcpm::CounterOp>> = counter_ops_for_render
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+
+        // PR 8i: `convert::dom_to_drawables` no longer drains
+        // `string_set_by_node`, but we keep the pre-convert clone for the
+        // fragmenter-driven `collect_string_set_states` call in
+        // `render_v2` so the side-channel map remains explicitly readable
+        // after convert returns. The clone is small (one `Vec` per node
+        // that declares the property).
+        let string_set_for_render = string_set_by_node.clone();
 
         let mut convert_ctx = ConvertContext {
             running_store: &running_store,
@@ -1226,6 +1231,7 @@ fn build_anchor_map(
     doc: &BaseDocument,
     pagination_geometry: &PaginationGeometryTable,
     counter_snapshots: &BTreeMap<usize, BTreeMap<String, Vec<i32>>>,
+    page_counters: &PageCounters<'_>,
     texts: &mut HashMap<usize, String>,
 ) -> AnchorMap {
     let mut map = AnchorMap::new();
@@ -1235,18 +1241,66 @@ fn build_anchor_map(
         0,
         pagination_geometry,
         counter_snapshots,
+        page_counters,
         texts,
         &mut map,
     );
     map
 }
 
+/// The page-context counters of each page
+/// ([`crate::pagination_layout::collect_counter_states`]), which
+/// `target-counter()` reads at an anchor: `page`, and each counter an
+/// `@page` rule names, take the value of the anchor's page, the value
+/// that page's margin boxes print.
+struct PageCounters<'a> {
+    states: Vec<BTreeMap<String, i32>>,
+    ops: &'a [crate::gcpm::CounterOp],
+}
+
+impl<'a> PageCounters<'a> {
+    fn new(
+        geometry: &PaginationGeometryTable,
+        counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
+        ops: &'a [crate::gcpm::CounterOp],
+    ) -> Self {
+        Self {
+            states: crate::pagination_layout::collect_counter_states(
+                geometry,
+                counter_ops_by_node,
+                ops,
+            ),
+            ops,
+        }
+    }
+
+    /// The `page` counter of the physical page `page` (1-based), after
+    /// writing that page's value of each counter the `@page` rules name
+    /// into `counters`.
+    fn apply(&self, page: u32, counters: &mut BTreeMap<String, Vec<i32>>) -> i32 {
+        let Some(state) = self.states.get(page.saturating_sub(1) as usize) else {
+            return page as i32;
+        };
+        for op in self.ops {
+            let (crate::gcpm::CounterOp::Reset { name, .. }
+            | crate::gcpm::CounterOp::Increment { name, .. }
+            | crate::gcpm::CounterOp::Set { name, .. }) = op;
+            if let Some(&value) = state.get(name) {
+                counters.insert(name.clone(), vec![value]);
+            }
+        }
+        state.get("page").copied().unwrap_or(page as i32)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk_anchors(
     doc: &BaseDocument,
     node_id: usize,
     depth: usize,
     geometry: &PaginationGeometryTable,
     snapshots: &BTreeMap<usize, BTreeMap<String, Vec<i32>>>,
+    page_counters: &PageCounters<'_>,
     texts: &mut HashMap<usize, String>,
     out: &mut AnchorMap,
 ) {
@@ -1263,9 +1317,10 @@ fn walk_anchors(
     // an empty resolution and can fall back to plain text.
     if let Some(elem) = node.element_data()
         && let Some(frag) = get_attr(elem, "id")
-        && let Some(page_num) = page_for_node(geometry, node_id)
+        && let Some(page) = page_for_node(geometry, node_id)
     {
-        let counters = snapshots.get(&node_id).cloned().unwrap_or_default();
+        let mut counters = snapshots.get(&node_id).cloned().unwrap_or_default();
+        let page_num = page_counters.apply(page, &mut counters);
         let text = texts.remove(&node_id).unwrap_or_default();
         let before_text = collect_pseudo_text(doc, node.before, elem);
         let after_text = collect_pseudo_text(doc, node.after, elem);
@@ -1282,7 +1337,16 @@ fn walk_anchors(
     }
     let children: Vec<usize> = node.children.clone();
     for c in children {
-        walk_anchors(doc, c, depth + 1, geometry, snapshots, texts, out);
+        walk_anchors(
+            doc,
+            c,
+            depth + 1,
+            geometry,
+            snapshots,
+            page_counters,
+            texts,
+            out,
+        );
     }
 }
 
@@ -2195,6 +2259,62 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF"));
     }
 
+    #[test]
+    fn anchor_map_page_follows_a_page_counter_reset() {
+        // `target-counter(attr(href), page)` reads the anchor map's
+        // `page_num`: the page counter of the anchor's page. Three
+        // sections on pages 1 to 3, the second resetting `page` to 5:
+        // the anchors read 1, 5, 6, the numbers their pages print.
+        let html = r##"<html><body>
+            <section id="s1">one</section>
+            <section id="s2">two</section>
+            <section id="s3">three</section>
+        </body></html>"##;
+        let doc = crate::blitz_adapter::parse(html, 400.0, &[]);
+        fn sections(doc: &blitz_dom::BaseDocument, node_id: usize, out: &mut Vec<usize>) {
+            let Some(node) = doc.get_node(node_id) else {
+                return;
+            };
+            if let Some(elem) = node.element_data()
+                && elem.name.local.as_ref() == "section"
+            {
+                out.push(node_id);
+            }
+            for c in node.children.iter().copied() {
+                sections(doc, c, out);
+            }
+        }
+        let mut ids = Vec::new();
+        sections(&doc, doc.root_element().id, &mut ids);
+        assert_eq!(ids.len(), 3, "expected three <section> elements");
+        let geometry = geometry_with_anchor_pages(&ids, &[0, 1, 2]);
+        let ops = BTreeMap::from([(
+            ids[1],
+            vec![crate::gcpm::CounterOp::Reset {
+                name: "page".into(),
+                value: 5,
+            }],
+        )]);
+        let page_counters = PageCounters::new(&geometry, &ops, &[]);
+        let map = build_anchor_map(
+            &doc,
+            &geometry,
+            &BTreeMap::new(),
+            &page_counters,
+            &mut HashMap::new(),
+        );
+
+        let page = |href: &str| {
+            crate::gcpm::target_ref::resolve_target_counter(
+                href,
+                "page",
+                crate::gcpm::CounterStyle::Decimal,
+                &map,
+            )
+        };
+        assert_eq!([page("#s1"), page("#s2"), page("#s3")], ["1", "5", "6"]);
+    }
+
     // ── GCPM: static-content mappings (lines 330-335) ────────────────────
 
     #[test]
@@ -2346,5 +2466,36 @@ mod tests {
             .render(html)
             .expect("bookmarks + target-refs render should succeed");
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn render_target_counter_in_margin_box_follows_a_page_counter_reset() {
+        // The margin box's `target-counter(attr(href), page)` takes the
+        // page's first link (`#sec`, on page 1); a `counter-reset: page 5`
+        // on the target makes its page 5, so the box prints `5`, as a
+        // literal "5" does.
+        let render = |css: &str| {
+            let mut assets = AssetBundle::new();
+            assets.add_css(css);
+            let html = "<body>\
+                <p><a href=\"#sec\">go to section</a></p>\
+                <h2 id=\"sec\">Section</h2>\
+                </body>";
+            Engine::builder()
+                .assets(assets)
+                .bookmarks(true)
+                .build()
+                .render(html)
+                .expect("render")
+        };
+        let target = "@page { @bottom-center { content: target-counter(attr(href), page); } }";
+
+        let reset = render(&format!("h2 {{ counter-reset: page 5; }} {target}"));
+
+        assert_ne!(reset, render(target), "the reset changes the number");
+        assert_eq!(
+            reset,
+            render("h2 { counter-reset: page 5; } @page { @bottom-center { content: \"5\"; } }"),
+        );
     }
 }

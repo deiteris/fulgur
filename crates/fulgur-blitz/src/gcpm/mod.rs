@@ -450,6 +450,11 @@ pub struct GcpmContext {
     pub page_settings: Vec<PageSettingsRule>,
     /// Mappings from CSS selectors to counter operations.
     pub counter_mappings: Vec<CounterMapping>,
+    /// The `counter-reset` / `counter-increment` / `counter-set`
+    /// operations of `@page` rules without a page selector (css-page-3
+    /// page context), applied at the start of every page. The implicit
+    /// `counter-increment: page` is not stored here.
+    pub page_counter_ops: Vec<CounterOp>,
     /// Mappings from CSS selectors + pseudo-elements to content items with counter().
     pub content_counter_mappings: Vec<ContentCounterMapping>,
     /// Mappings from CSS selectors + pseudo-elements to flattened *static*
@@ -480,6 +485,7 @@ impl GcpmContext {
             && self.string_set_mappings.is_empty()
             && self.page_settings.is_empty()
             && self.counter_mappings.is_empty()
+            && self.page_counter_ops.is_empty()
             && self.content_counter_mappings.is_empty()
     }
 
@@ -491,12 +497,25 @@ impl GcpmContext {
     /// margin-box rendering. Keeping the merge in one place means
     /// adding a new field to `GcpmContext` only requires touching this
     /// method (and `is_empty`) — call sites stay unchanged.
+    ///
+    /// `other` is the later stylesheet, so its `@page` counter properties
+    /// cascade over `self`'s: each property `other` declares replaces the
+    /// one `self` holds, as a later declaration does within one sheet.
     pub fn extend_from(&mut self, other: GcpmContext) {
         self.margin_boxes.extend(other.margin_boxes);
         self.running_mappings.extend(other.running_mappings);
         self.string_set_mappings.extend(other.string_set_mappings);
         self.page_settings.extend(other.page_settings);
         self.counter_mappings.extend(other.counter_mappings);
+        let mut later = other.page_counter_ops;
+        while let Some(first) = later.first() {
+            let kind = std::mem::discriminant(first);
+            let (property, rest) = later
+                .into_iter()
+                .partition(|op| std::mem::discriminant(op) == kind);
+            parser::replace_counter_property(&mut self.page_counter_ops, property);
+            later = rest;
+        }
         self.content_counter_mappings
             .extend(other.content_counter_mappings);
         self.static_content_mappings
@@ -539,6 +558,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
         assert!(ctx.is_empty());
@@ -563,6 +583,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
         assert!(!ctx.is_empty());
@@ -582,6 +603,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
         assert!(!ctx.is_empty());
@@ -601,6 +623,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: "body { color: red; }".to_string(),
         };
         let b = GcpmContext {
@@ -620,6 +643,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: "p { margin: 0; }".to_string(),
         };
 
@@ -641,6 +665,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: String::new(),
         };
         let b = GcpmContext {
@@ -652,6 +677,7 @@ mod tests {
             content_counter_mappings: vec![],
             static_content_mappings: vec![],
             bookmark_mappings: vec![],
+            page_counter_ops: vec![],
             cleaned_css: "body { color: blue; }".to_string(),
         };
 
@@ -659,6 +685,34 @@ mod tests {
 
         // No leading newline when target was empty.
         assert_eq!(a.cleaned_css, "body { color: blue; }");
+    }
+
+    #[test]
+    fn test_gcpm_context_extend_from_cascades_page_counter_properties() {
+        let mut a = parser::parse_gcpm("@page { counter-increment: a; counter-reset: r 2; }");
+        let b = parser::parse_gcpm("@page { counter-increment: b 3; counter-set: s 1; }");
+
+        a.extend_from(b);
+
+        // `b`'s `counter-increment` replaces `a`'s; `a`'s `counter-reset`
+        // stays, and `b`'s `counter-set` joins it.
+        assert_eq!(
+            a.page_counter_ops,
+            vec![
+                CounterOp::Reset {
+                    name: "r".into(),
+                    value: 2,
+                },
+                CounterOp::Increment {
+                    name: "b".into(),
+                    value: 3,
+                },
+                CounterOp::Set {
+                    name: "s".into(),
+                    value: 1,
+                },
+            ]
+        );
     }
 
     #[test]
