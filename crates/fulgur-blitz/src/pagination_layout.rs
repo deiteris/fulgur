@@ -226,7 +226,7 @@ pub struct PaginationLayoutTree<'a> {
 /// `ColumnStyleTable` are honoured.
 #[cfg(test)]
 pub fn run_pass(doc: &mut BaseDocument, page_height_px: f32) -> PaginationGeometryTable {
-    run_pass_inner(doc, page_height_px, None, None)
+    run_pass_inner(doc, page_height_px, None, None).0
 }
 
 /// fulgur-k0g0 variant: thread the document's `break-before` /
@@ -240,7 +240,7 @@ pub fn run_pass_with_break_styles<'a>(
     page_height_px: crate::units::Px,
     column_styles: &'a crate::column_css::ColumnStyleTable,
 ) -> PaginationGeometryTable {
-    run_pass_inner(doc, page_height_px.to_f32(), Some(column_styles), None)
+    run_pass_inner(doc, page_height_px.to_f32(), Some(column_styles), None).0
 }
 
 /// fulgur-s67g Phase 2.2 variant: extends
@@ -248,19 +248,24 @@ pub fn run_pass_with_break_styles<'a>(
 /// running()` element instances. Running children are skipped during
 /// the body walk so they do not contribute to body cursor or page
 /// fragments — per-page placement is handled by
-/// [`collect_running_element_states`].
+/// [`collect_running_element_states`]. Also returns the used page-name
+/// table the pass computed, which [`collect_page_facts`] reads.
 pub fn run_pass_with_break_and_running<'a>(
     doc: &'a mut BaseDocument,
     page_height_px: f32,
     column_styles: &'a crate::column_css::ColumnStyleTable,
     running_store: &'a crate::gcpm::running::RunningElementStore,
-) -> PaginationGeometryTable {
-    run_pass_inner(
+) -> (
+    PaginationGeometryTable,
+    crate::blitz_adapter::UsedPageNameTable,
+) {
+    let (geometry, used_page_names) = run_pass_inner(
         doc,
         page_height_px,
         Some(column_styles),
         Some(running_store),
-    )
+    );
+    (geometry, used_page_names.unwrap_or_default())
 }
 
 fn run_pass_inner<'a>(
@@ -268,7 +273,10 @@ fn run_pass_inner<'a>(
     page_height_px: f32,
     column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
-) -> PaginationGeometryTable {
+) -> (
+    PaginationGeometryTable,
+    Option<crate::blitz_adapter::UsedPageNameTable>,
+) {
     // fulgur-uebl: pre-compute the used page-name table when column
     // styles are available. The walk takes one DOM pass and produces a
     // `BTreeMap` keyed by node id, matching the determinism convention
@@ -299,7 +307,7 @@ fn run_pass_inner<'a>(
         // layout is what actually does the pagination work.
         tree.fragment_pagination_root();
     }
-    tree.take_geometry()
+    (tree.take_geometry(), tree.used_page_names.take())
 }
 
 impl<'a> PaginationLayoutTree<'a> {
@@ -4116,6 +4124,68 @@ pub fn collect_counter_states(
     result
 }
 
+/// What a margin box's `@page` selector reads of one page, besides its
+/// number (`gcpm::margin_box::page_selector_specificity`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageFacts {
+    /// The page name (css-page-3 §5.3), which selects `@page <name>` rules.
+    pub name: Option<String>,
+    /// No in-flow fragment lands on the page: it is a page a forced side
+    /// break (`break-before: right`) leaves empty, which `@page :blank`
+    /// selects.
+    pub blank: bool,
+}
+
+/// The [`PageFacts`] of each page. A page's name is the start page name
+/// (`used_page_names`, from `blitz_adapter::compute_used_page_names`) of
+/// the first node, in NodeId (≈ source) order, whose first fragment lands
+/// on it. A page where no node starts keeps the name of the page before
+/// it: it continues that page's content, or it is a blank page a side
+/// break leaves, which counts with the pages before it (see
+/// [`collect_counter_states`]); it does not take the name of the page the
+/// break leads to. A page is blank when no fragment lands on it at all.
+/// Repeated fragments (`position: fixed`, a repeated table header) start
+/// nothing and leave no page blank.
+pub fn collect_page_facts(
+    geometry: &PaginationGeometryTable,
+    used_page_names: &crate::blitz_adapter::UsedPageNameTable,
+) -> Vec<PageFacts> {
+    let pages = implied_page_count(geometry) as usize;
+    let mut started: Vec<Option<Option<String>>> = vec![None; pages];
+    let mut blank = vec![true; pages];
+    for (node_id, geom) in geometry {
+        if geom.is_repeat {
+            continue;
+        }
+        for fragment in &geom.fragments {
+            if let Some(page) = blank.get_mut(fragment.page_index as usize) {
+                *page = false;
+            }
+        }
+        if let Some(first) = geom.fragments.first()
+            && let Some(slot) = started.get_mut(first.page_index as usize)
+            && slot.is_none()
+            && let Some((start, _)) = used_page_names.get(node_id)
+        {
+            *slot = Some(start.clone());
+        }
+    }
+    let mut carry = None;
+    started
+        .into_iter()
+        .zip(blank)
+        .map(|(start, blank)| {
+            if let Some(name) = start {
+                carry = name;
+            }
+            PageFacts {
+                name: carry.clone(),
+                blank,
+            }
+        })
+        .collect()
+}
+
 /// fulgur-jkl5: enumerate `position: fixed` elements and emit one
 /// fragment per page so downstream rendering can repeat them on every
 /// page (Chrome-compatible behaviour for paged media — see WPT
@@ -7054,7 +7124,7 @@ h2 { string-set: chapter-title content(text); }
         blitz_adapter::resolve(&mut doc);
         let column_styles = blitz_adapter::extract_column_style_table(&doc, &[]);
 
-        let geometry = run_pass_with_break_and_running(
+        let (geometry, _) = run_pass_with_break_and_running(
             doc.deref_mut(),
             800.0_f32.as_pt().in_px().to_f32(),
             &column_styles,
@@ -9556,6 +9626,50 @@ h2 { string-set: chapter-title content(text); }
             height: 1.0_f32.as_px(),
         });
         assert_eq!(super::implied_page_count(&geom), 3);
+    }
+
+    /// Five pages: node 1 (`a`) starts on page 1 and runs on to page 2;
+    /// page 3 holds only the repeated node 4 (`x`, on every page); nodes 5
+    /// (`c`) and 7 (`d`) start on page 4; node 8 (unnamed) on page 5.
+    #[test]
+    fn collect_page_facts_names_each_page_by_its_first_start_and_finds_the_blank_ones() {
+        let fragment = |page_index: u32| Fragment {
+            page_index,
+            x: 0.0_f32.as_px(),
+            y: 0.0_f32.as_px(),
+            width: 1.0_f32.as_px(),
+            height: 1.0_f32.as_px(),
+        };
+        let mut geom = PaginationGeometryTable::new();
+        let mut names = crate::blitz_adapter::UsedPageNameTable::new();
+        for (node, start, pages) in [
+            (8, None, vec![4]),
+            (7, Some("d"), vec![3]),
+            (5, Some("c"), vec![3]),
+            (1, Some("a"), vec![0, 1]),
+        ] {
+            geom.entry(node).or_default().fragments = pages.into_iter().map(fragment).collect();
+            names.insert(node, (start.map(str::to_string), None));
+        }
+        let repeat = geom.entry(4).or_default();
+        repeat.is_repeat = true;
+        repeat.fragments = (0..5).map(fragment).collect();
+        names.insert(4, (Some("x".to_string()), None));
+
+        let facts = |name: Option<&str>, blank| super::PageFacts {
+            name: name.map(str::to_string),
+            blank,
+        };
+        assert_eq!(
+            super::collect_page_facts(&geom, &names),
+            [
+                facts(Some("a"), false),
+                facts(Some("a"), false),
+                facts(Some("a"), true),
+                facts(Some("c"), false),
+                facts(None, false),
+            ]
+        );
     }
 
     /// fulgur-s67g Phase 2.1: a 3-line paragraph at the top of a page

@@ -69,6 +69,7 @@ struct LayoutArtifacts {
     html_title: Option<String>,
     html_lang: Option<String>,
     implicit_href_map: BTreeMap<usize, String>,
+    page_facts: Vec<crate::pagination_layout::PageFacts>,
     collected_anchor_map: AnchorMap,
     needs_pass_two: bool,
 }
@@ -692,12 +693,13 @@ impl Engine {
         // here so the fragmenter, fixed-element layout, and viewport
         // sizing all share a single content box — see the resolve block
         // up at the start of this function.
-        let mut pagination_geometry = crate::pagination_layout::run_pass_with_break_and_running(
-            doc.deref_mut(),
-            resolved_content_height_px,
-            &column_styles,
-            &running_store,
-        );
+        let (mut pagination_geometry, used_page_names) =
+            crate::pagination_layout::run_pass_with_break_and_running(
+                doc.deref_mut(),
+                resolved_content_height_px,
+                &column_styles,
+                &running_store,
+            );
 
         // fulgur-rpvu: append per-page fragments for every `position:
         // fixed` element so v2's geometry-driven dispatch repeats them
@@ -744,6 +746,20 @@ impl Engine {
                 resolved_content_height_px,
             );
         }
+
+        // The name of each page, and whether it is blank, select the
+        // margin boxes of `@page <name>` and `@page :blank` rules; skip the
+        // geometry walk when every margin box selector is plain, `:first`,
+        // `:left`, or `:right`.
+        let page_facts = if gcpm.margin_boxes.iter().any(|rule| {
+            rule.page_selector
+                .as_deref()
+                .is_some_and(|selector| !matches!(selector, ":first" | ":left" | ":right"))
+        }) {
+            crate::pagination_layout::collect_page_facts(&pagination_geometry, &used_page_names)
+        } else {
+            Vec::new()
+        };
 
         // PR 8i: `convert::dom_to_drawables` no longer drains
         // `counter_ops_by_node`, but we keep a pre-convert copy for the
@@ -861,6 +877,7 @@ impl Engine {
             html_title,
             html_lang,
             implicit_href_map,
+            page_facts,
             collected_anchor_map,
             needs_pass_two: needs_anchor_map_for_pass_two,
         })
@@ -886,6 +903,7 @@ impl Engine {
             html_title,
             html_lang,
             implicit_href_map,
+            page_facts,
             ..
         } = artifacts;
 
@@ -927,6 +945,7 @@ impl Engine {
             self.serialize_settings.clone(),
             anchor_map,
             &implicit_href_map,
+            page_facts,
         )
     }
 

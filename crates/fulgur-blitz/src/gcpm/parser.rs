@@ -71,16 +71,22 @@ impl<'i, 'a> AtRuleParser<'i> for GcpmSheetParser<'a> {
             return Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)));
         }
 
-        // Optional page selector like `:first`
-        let page_selector = input
-            .try_parse(|input| -> Result<String, ParseError<'i, ()>> {
-                input.expect_colon()?;
-                let ident = input.expect_ident()?.clone();
-                Ok(format!(":{}", &*ident))
-            })
-            .ok();
+        // Optional page selector (css-page-3): a page name, kept as
+        // written, then pseudo-classes, which are ASCII case-insensitive
+        // and kept in lower case: `:first`, `chapter`, `chapter:left`
+        // (`chapter:LEFT` too).
+        let mut page_selector = input
+            .try_parse(|input| input.expect_ident().map(|name| name.to_string()))
+            .unwrap_or_default();
+        while let Ok(pseudo) = input.try_parse(|input| -> Result<String, ParseError<'i, ()>> {
+            input.expect_colon()?;
+            Ok(input.expect_ident()?.to_ascii_lowercase())
+        }) {
+            page_selector.push(':');
+            page_selector.push_str(&pseudo);
+        }
 
-        Ok(page_selector)
+        Ok((!page_selector.is_empty()).then_some(page_selector))
     }
 
     fn parse_block<'t>(
@@ -94,7 +100,7 @@ impl<'i, 'a> AtRuleParser<'i> for GcpmSheetParser<'a> {
         let mut margin = PartialMargin::default();
         // Counter properties of a selector-less `@page` cascade into the
         // page context every page shares; a `:first` / `:left` / `:right`
-        // rule's are not applied.
+        // or named page rule's are not applied.
         let mut selected_counter_ops = Vec::new();
         let counter_ops = if page_selector.is_none() {
             &mut *self.page_counter_ops
@@ -2156,6 +2162,38 @@ mod tests {
             ctx.margin_boxes[1].page_selector,
             Some(":right".to_string())
         );
+    }
+
+    #[test]
+    fn test_named_page_selectors() {
+        let css = r#"
+        @page chapter { margin: 1in; @bottom-left { content: counter(page); } }
+        @page chapter:left { @bottom-left { content: "L"; } }
+        @page chapter:FIRST:Right { counter-increment: run; @top-center { content: "F"; } }
+    "#;
+        let ctx = parse_gcpm(css);
+        let selectors: Vec<_> = ctx
+            .margin_boxes
+            .iter()
+            .map(|rule| rule.page_selector.as_deref())
+            .collect();
+        // The page name keeps its case; the pseudo-classes are lowered.
+        assert_eq!(
+            selectors,
+            [
+                Some("chapter"),
+                Some("chapter:left"),
+                Some("chapter:first:right")
+            ]
+        );
+        assert_eq!(ctx.page_settings.len(), 1);
+        assert_eq!(
+            ctx.page_settings[0].page_selector.as_deref(),
+            Some("chapter")
+        );
+        // A named page rule's counter properties are not the page context.
+        assert!(ctx.page_counter_ops.is_empty());
+        assert!(!ctx.cleaned_css.contains("@page"));
     }
 
     #[test]

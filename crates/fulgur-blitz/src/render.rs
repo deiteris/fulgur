@@ -34,6 +34,7 @@ pub fn render_v2(
     serialize_settings: SerializeSettings,
     anchor_map: Option<&AnchorMap>,
     implicit_href_by_page: &BTreeMap<usize, String>,
+    page_facts: Vec<crate::pagination_layout::PageFacts>,
 ) -> Result<Vec<u8>> {
     let mut document = if config.effective_tagging() {
         let configuration = if config.pdf_ua {
@@ -155,6 +156,7 @@ pub fn render_v2(
         counter_ops_by_node,
         page_count,
         implicit_href_by_page,
+        page_facts,
     );
 
     // Page-independent skip sets. These reference only `drawables.*`
@@ -3767,6 +3769,11 @@ pub(crate) struct MarginBoxRenderer<'a> {
     /// `target-*(attr(href), ...)` evaluated inside `@page` margin
     /// boxes. Built once per render pass by `engine::Engine::layout_to_drawables`.
     pub implicit_href_by_page: &'a BTreeMap<usize, String>,
+    /// The name of each page and whether it is blank
+    /// (`pagination_layout::collect_page_facts`), which select the margin
+    /// boxes of `@page <name>` and `@page :blank` rules; empty when every
+    /// margin box selector is plain, `:first`, `:left`, or `:right`.
+    pub page_facts: Vec<crate::pagination_layout::PageFacts>,
 }
 
 impl<'a> MarginBoxRenderer<'a> {
@@ -3784,6 +3791,7 @@ impl<'a> MarginBoxRenderer<'a> {
         counter_ops_by_node: &BTreeMap<usize, Vec<crate::gcpm::CounterOp>>,
         total_pages: usize,
         implicit_href_by_page: &'a BTreeMap<usize, String>,
+        page_facts: Vec<crate::pagination_layout::PageFacts>,
     ) -> Self {
         let string_set_states = if gcpm.string_set_mappings.is_empty() {
             vec![BTreeMap::new(); total_pages]
@@ -3828,6 +3836,7 @@ impl<'a> MarginBoxRenderer<'a> {
             height_cache: HashMap::new(),
             render_cache: HashMap::new(),
             implicit_href_by_page,
+            page_facts,
         }
     }
 
@@ -3835,9 +3844,9 @@ impl<'a> MarginBoxRenderer<'a> {
     /// `canvas`. Mirrors the per-page block from
     /// `render_to_pdf_with_gcpm`'s pre-Phase-4 implementation:
     ///
-    /// 1. Filter `gcpm.margin_boxes` by `@page` selector matching
-    ///    (`:first` / `:left` / `:right`), preferring more-specific
-    ///    selectors over the default.
+    /// 1. Filter `gcpm.margin_boxes` by `@page` selector matching (a
+    ///    page name, `:first`, `:blank`, `:left`, `:right`), preferring
+    ///    the more specific selector, then the later rule.
     /// 2. Resolve each box's HTML content (substituting `counter()` /
     ///    `element()` / `string()` from per-page state).
     /// 3. Measure max-content width (top/bottom) or height (left/right).
@@ -3881,32 +3890,29 @@ impl<'a> MarginBoxRenderer<'a> {
         content_width: f32,
         anchor_map: Option<&AnchorMap>,
     ) -> bool {
-        // Resolve effective boxes: pick the most specific matching rule
-        // per position. Pseudo-class selectors (`:first`, `:left`,
-        // `:right`) override the default `@page` rule.
-        let mut effective_boxes: BTreeMap<MarginBoxPosition, &crate::gcpm::MarginBoxRule> =
-            BTreeMap::new();
+        // Resolve effective boxes: per position, the matching rule of the
+        // highest css-page-3 specificity (a page name, then `:first` and
+        // `:blank`, then `:left` and `:right`); among rules of equal
+        // specificity the later one wins, as for style rules.
+        let no_facts = crate::pagination_layout::PageFacts::default();
+        let page = self.page_facts.get(page_idx).unwrap_or(&no_facts);
+        let mut effective_boxes: BTreeMap<
+            MarginBoxPosition,
+            ((u8, u8, u8), &crate::gcpm::MarginBoxRule),
+        > = BTreeMap::new();
         for margin_box in &self.gcpm.margin_boxes {
-            let matches = match &margin_box.page_selector {
-                None => true,
-                Some(sel) => match sel.as_str() {
-                    ":first" => page_num == 1,
-                    ":left" => page_num.is_multiple_of(2),
-                    ":right" => !page_num.is_multiple_of(2),
-                    _ => true,
-                },
-            };
-            if !matches {
+            let Some(specificity) = crate::gcpm::margin_box::page_selector_specificity(
+                margin_box.page_selector.as_deref(),
+                page,
+                page_num,
+            ) else {
                 continue;
-            }
+            };
             let should_replace = effective_boxes
                 .get(&margin_box.position)
-                .map(|existing| {
-                    existing.page_selector.is_none() && margin_box.page_selector.is_some()
-                })
-                .unwrap_or(true);
+                .is_none_or(|(existing, _)| specificity >= *existing);
             if should_replace {
-                effective_boxes.insert(margin_box.position, margin_box);
+                effective_boxes.insert(margin_box.position, (specificity, margin_box));
             }
         }
 
@@ -3918,7 +3924,7 @@ impl<'a> MarginBoxRenderer<'a> {
             .get(&page_idx)
             .map(String::as_str);
         let mut resolved_htmls: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
-        for (&pos, rule) in &effective_boxes {
+        for (&pos, (_, rule)) in &effective_boxes {
             let content_html = resolve_content_to_html_with_anchor(
                 &rule.content,
                 self.running_store,
@@ -6075,6 +6081,7 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+            Vec::new(),
         );
     }
 
@@ -6102,6 +6109,7 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+            Vec::new(),
         );
     }
 
@@ -6132,6 +6140,7 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+            Vec::new(),
         );
     }
 
@@ -6164,6 +6173,7 @@ mod tests {
             &BTreeMap::new(),
             1,
             &implicit,
+            Vec::new(),
         );
         check(&renderer);
     }

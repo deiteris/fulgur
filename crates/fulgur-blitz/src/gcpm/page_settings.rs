@@ -166,6 +166,10 @@ fn should_warn_once(name: &str) -> bool {
 /// - `:left`  — even pages in LTR, odd pages in RTL (CSS Paged Media §5:
 ///   RTL documents start on a `:left` page)
 /// - `:right` — odd pages in LTR, even pages in RTL
+///
+/// A selector with a page name (`chapter`, `chapter:left`) matches no page:
+/// the size and margin of a named page are not applied (its margin boxes
+/// are, see `MarginBoxRenderer::render_page`).
 fn selector_matches(selector: &str, page_num: usize, first_page_is_left: bool) -> bool {
     match selector {
         ":first" => page_num == 1,

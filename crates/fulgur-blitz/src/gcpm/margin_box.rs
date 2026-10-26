@@ -397,6 +397,51 @@ pub fn compute_edge_layout(
     result
 }
 
+/// The specificity with which a margin box's `@page` selector selects page
+/// `page_num` (1-based), or `None` when it does not select the page. `page`
+/// is what [`crate::pagination_layout::collect_page_facts`] knows of the
+/// page: its page name, and whether it is blank.
+///
+/// The specificity is css-page-3's: whether the selector names a page, then
+/// its count of `:first` and `:blank`, then its count of `:left` and
+/// `:right`. A more specific rule wins a position; among rules of equal
+/// specificity the later one wins, as for style rules.
+///
+/// `selector` is the prelude as the parser keeps it: an optional page name,
+/// then pseudo-classes in lower case (`:first`, `chapter`, `chapter:left`).
+/// A page name selects the pages of that name only. `:first` selects page 1,
+/// `:left` the even pages, `:right` the odd ones, and `:blank` the pages a
+/// side break leaves empty; any other pseudo-class selects no page.
+pub(crate) fn page_selector_specificity(
+    selector: Option<&str>,
+    page: &crate::pagination_layout::PageFacts,
+    page_num: usize,
+) -> Option<(u8, u8, u8)> {
+    let Some(selector) = selector else {
+        return Some((0, 0, 0));
+    };
+    let mut parts = selector.split(':');
+    let name = parts.next().unwrap_or_default();
+    if !name.is_empty() && page.name.as_deref() != Some(name) {
+        return None;
+    }
+    let mut specificity = (u8::from(!name.is_empty()), 0_u8, 0_u8);
+    for pseudo in parts {
+        let (selects, count) = match pseudo {
+            "first" => (page_num == 1, &mut specificity.1),
+            "blank" => (page.blank, &mut specificity.1),
+            "left" => (page_num.is_multiple_of(2), &mut specificity.2),
+            "right" => (!page_num.is_multiple_of(2), &mut specificity.2),
+            _ => return None,
+        };
+        if !selects {
+            return None;
+        }
+        *count = count.saturating_add(1);
+    }
+    Some(specificity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +451,68 @@ mod tests {
     /// after the `units::Pt` migration.
     fn pt(v: f32) -> Pt {
         v.as_pt()
+    }
+
+    /// A page of name `name`, blank or not.
+    fn page(name: Option<&str>, blank: bool) -> crate::pagination_layout::PageFacts {
+        crate::pagination_layout::PageFacts {
+            name: name.map(str::to_string),
+            blank,
+        }
+    }
+
+    #[test]
+    fn a_page_selector_selects_by_name_and_pseudo_classes() {
+        let a = page(Some("a"), false);
+        let plain = page(None, false);
+        let select =
+            |selector: &str, page: &crate::pagination_layout::PageFacts, page_num: usize| {
+                page_selector_specificity(Some(selector), page, page_num)
+            };
+        assert_eq!(page_selector_specificity(None, &a, 2), Some((0, 0, 0)));
+        assert_eq!(select(":left", &a, 2), Some((0, 0, 1)));
+        assert_eq!(select(":left", &plain, 3), None);
+        assert_eq!(select("a", &a, 3), Some((1, 0, 0)));
+        assert_eq!(select("a", &page(Some("b"), false), 3), None);
+        assert_eq!(select("a", &plain, 3), None);
+        assert_eq!(select("a:left", &a, 2), Some((1, 0, 1)));
+        assert_eq!(select("a:left", &a, 3), None);
+        assert_eq!(select("a:first:right", &a, 1), Some((1, 1, 1)));
+        assert_eq!(select("a:first:right", &a, 3), None);
+    }
+
+    #[test]
+    fn blank_selects_a_blank_page_and_an_unknown_pseudo_class_none() {
+        assert_eq!(
+            page_selector_specificity(Some(":blank"), &page(None, true), 2),
+            Some((0, 1, 0))
+        );
+        assert_eq!(
+            page_selector_specificity(Some(":blank"), &page(None, false), 2),
+            None
+        );
+        assert_eq!(
+            page_selector_specificity(Some("a:blank:left"), &page(Some("a"), true), 2),
+            Some((1, 1, 1))
+        );
+        for selector in [":nth", ":recto", ":first:nth"] {
+            assert_eq!(
+                page_selector_specificity(Some(selector), &page(None, true), 1),
+                None,
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_name_outranks_first_and_blank_which_outrank_a_side() {
+        let a = page(Some("a"), true);
+        let select = |selector: &str| page_selector_specificity(Some(selector), &a, 1);
+        assert!(select("a") > select(":first:right"));
+        assert!(select(":first") > select(":right"));
+        assert!(select(":first") == page_selector_specificity(Some(":blank"), &a, 2));
+        assert!(select("a:first") > select("a:right"));
+        assert!(select(":right") > page_selector_specificity(None, &a, 1));
     }
 
     #[test]
