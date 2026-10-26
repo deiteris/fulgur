@@ -1558,6 +1558,52 @@ fn draw_border_line(
     }
 }
 
+/// Stroke the rounded border `path` (the outline inset by half the
+/// uniform width `width`) in `colour` and `style`.
+fn stroke_rounded_border(
+    canvas: &mut Canvas<'_, '_>,
+    path: &krilla::geom::Path,
+    colour: &[u8; 4],
+    style: BorderStyleValue,
+    width: f32,
+) {
+    let base = krilla::paint::Stroke {
+        paint: krilla::color::rgb::Color::new(colour[0], colour[1], colour[2]).into(),
+        width,
+        opacity: alpha_to_opacity(colour[3]),
+        ..Default::default()
+    };
+    if let Some(styled) = apply_border_style(base, style, width) {
+        canvas.surface.set_stroke(Some(styled));
+        canvas.surface.draw_path(path);
+        canvas.surface.set_stroke(None);
+    }
+}
+
+/// The regions of the box `x`, `y`, `w`, `h` that belong to its top,
+/// right, bottom, and left borders: each a trapezoid from its side to the
+/// lines that leave the corners at 45 degrees, which meet on the box's
+/// centre line, so the four tile the box. `None` for a region of no area.
+fn border_side_regions(x: f32, y: f32, w: f32, h: f32) -> [Option<krilla::geom::Path>; 4] {
+    let d = w.min(h) / 2.0;
+    let (x2, y2) = (x + w, y + h);
+    let polygon = |points: [(f32, f32); 4]| {
+        let mut pb = krilla::geom::PathBuilder::new();
+        pb.move_to(points[0].0, points[0].1);
+        for (px, py) in &points[1..] {
+            pb.line_to(*px, *py);
+        }
+        pb.close();
+        pb.finish()
+    };
+    [
+        polygon([(x, y), (x2, y), (x2 - d, y + d), (x + d, y + d)]),
+        polygon([(x2, y), (x2, y2), (x2 - d, y2 - d), (x2 - d, y + d)]),
+        polygon([(x2, y2), (x, y2), (x + d, y2 - d), (x2 - d, y2 - d)]),
+        polygon([(x, y2), (x, y), (x + d, y + d), (x + d, y2 - d)]),
+    ]
+}
+
 pub(crate) fn draw_block_border(
     canvas: &mut Canvas<'_, '_>,
     style: &BlockStyle,
@@ -1576,11 +1622,13 @@ pub(crate) fn draw_block_border(
 
     let uniform_width = bt == br && br == bb && bb == bl;
     let uniform_style = st == sr && sr == sb && sb == sl;
-    // One path in one colour only when every side agrees; otherwise each
-    // side is stroked on its own (and a radius is not followed, as for
-    // mixed widths or styles).
-    let uniform = uniform_width && uniform_style && ct == cr && cr == cb && cb == cl;
-    if style.has_radius() && uniform && st != BorderStyleValue::None {
+    let uniform_colour = ct == cr && cr == cb && cb == cl;
+    // One path in one colour only when every side agrees. A rounded box
+    // whose sides differ in colour alone strokes that path once per side;
+    // any other box strokes each side on its own (and a radius is not
+    // followed, as for mixed widths or styles).
+    let uniform = uniform_width && uniform_style && uniform_colour;
+    if style.has_radius() && uniform_width && uniform_style && st != BorderStyleValue::None {
         let inset = bt / 2.0;
         let inset_radii = style.border_radii.map(|[rx, ry]| {
             [
@@ -1595,17 +1643,23 @@ pub(crate) fn draw_block_border(
             h - inset * 2.0,
             &inset_radii,
         ) {
-            let base = krilla::paint::Stroke {
-                paint: krilla::color::rgb::Color::new(bc[0], bc[1], bc[2]).into(),
-                width: bt,
-                opacity: alpha_to_opacity(bc[3]),
-                ..Default::default()
-            };
-            if let Some(styled) = apply_border_style(base, st, bt) {
-                canvas.surface.set_fill(None);
-                canvas.surface.set_stroke(Some(styled));
-                canvas.surface.draw_path(&path);
-                canvas.surface.set_stroke(None);
+            canvas.surface.set_fill(None);
+            if uniform_colour {
+                stroke_rounded_border(canvas, &path, bc, st, bt);
+            } else {
+                // Each side's stretch of the outline in its own colour,
+                // clipped to that side's region of the box. Equal widths
+                // meet at 45 degrees (css-backgrounds-3 §4.4), so the
+                // regions are split by the corners' diagonals.
+                let sides = [ct, cr, cb, cl];
+                for (colour, region) in sides.into_iter().zip(border_side_regions(x, y, w, h)) {
+                    let Some(region) = region else { continue };
+                    canvas
+                        .surface
+                        .push_clip_path(&region, &krilla::paint::FillRule::NonZero);
+                    stroke_rounded_border(canvas, &path, colour, st, bt);
+                    canvas.surface.pop();
+                }
             }
         }
     } else if !style.has_radius()
@@ -2898,6 +2952,28 @@ mod dp_unit_tests {
         };
         with_canvas_smoke(|canvas| {
             draw_block_border(canvas, &style, 0.0, 0.0, 80.0, 80.0);
+        });
+    }
+
+    #[test]
+    fn draw_block_border_rounded_mixed_colours_smoke() {
+        // has_radius && uniform_width && uniform_style, colours differ
+        // → the rounded path stroked once per side, clipped to each side's
+        // region (`border_side_regions`), on a box wider than tall.
+        let style = BlockStyle {
+            border_colors: [
+                [255, 0, 0, 255],
+                [255, 0, 0, 255],
+                [0, 0, 255, 255],
+                [0, 160, 0, 255],
+            ],
+            border_widths: [2.0, 2.0, 2.0, 2.0].map(|v| v.as_pt()),
+            border_styles: [BorderStyleValue::Dashed; 4],
+            border_radii: [[4.0, 4.0]; 4].map(|p| p.map(|v| v.as_pt())),
+            ..Default::default()
+        };
+        with_canvas_smoke(|canvas| {
+            draw_block_border(canvas, &style, 0.0, 0.0, 80.0, 40.0);
         });
     }
 
