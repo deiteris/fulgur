@@ -51,12 +51,21 @@ fn convert_table(
     let mark = clipping.then(|| out.draw_mark());
 
     // Walk table children to recurse cells.
+    let mut body_cells = Vec::new();
     for &child_id in &node.children {
         let Some(child_node) = doc.get_node(child_id) else {
             continue;
         };
         let is_thead = is_table_section(child_node, "thead");
-        collect_table_cells(doc, child_id, is_thead, ctx, depth, out);
+        collect_table_cells(doc, child_id, is_thead, ctx, depth, out, &mut body_cells);
+    }
+
+    let break_border = ctx
+        .column_styles
+        .get(&node.id)
+        .and_then(|props| props.break_border);
+    if break_border == Some(crate::column_css::BreakBorder::None) {
+        mark_open_bottom_cells(&body_cells, &ctx.pagination_geometry, out);
     }
 
     if let Some(mark) = mark {
@@ -67,6 +76,49 @@ fn convert_table(
             .collect();
         if let Some(entry) = out.tables.get_mut(&node.id) {
             entry.clip_descendants = descendants;
+        }
+    }
+}
+
+/// Records in `out.open_bottom_cells` the cells of `cells` (a table's body
+/// and footer cells) that end a fragment of the table on a page before its
+/// last: on each such page, the cells of the last row that starts there,
+/// told by the top of their fragment, the lowest on the page. A cell's own
+/// bottom does not tell its row: an explicit `height` shorter than the row
+/// ends it higher, and a cell that cannot split runs past the page foot. A
+/// repeated header is no body cell, so it keeps its border on every page.
+fn mark_open_bottom_cells(
+    cells: &[usize],
+    geometry: &crate::pagination_layout::PaginationGeometryTable,
+    out: &mut crate::drawables::Drawables,
+) {
+    // Cells of one row start within rounding of each other.
+    const SAME_TOP_PX: f32 = 0.5;
+    let placed: Vec<(usize, u32, f32)> = cells
+        .iter()
+        .filter_map(|&id| Some((id, geometry.get(&id)?)))
+        .flat_map(|(id, geom)| {
+            geom.fragments
+                .iter()
+                .filter(|frag| frag.height > Px::ZERO)
+                .map(move |frag| (id, frag.page_index, frag.y.to_f32()))
+        })
+        .collect();
+    let Some(last_page) = placed.iter().map(|&(_, page, _)| page).max() else {
+        return;
+    };
+    let mut last_row_top = std::collections::BTreeMap::<u32, f32>::new();
+    for &(_, page, top) in &placed {
+        let row_top = last_row_top.entry(page).or_insert(top);
+        *row_top = row_top.max(top);
+    }
+    for &(id, page, top) in &placed {
+        if page < last_page
+            && last_row_top
+                .get(&page)
+                .is_some_and(|&row_top| top >= row_top - SAME_TOP_PX)
+        {
+            out.open_bottom_cells.insert((id, page));
         }
     }
 }
@@ -86,6 +138,7 @@ fn collect_table_cells(
     ctx: &mut ConvertContext<'_>,
     depth: usize,
     out: &mut crate::drawables::Drawables,
+    body_cells: &mut Vec<usize>,
 ) {
     if depth >= MAX_DOM_DEPTH {
         return;
@@ -118,7 +171,15 @@ fn collect_table_cells(
             .is_empty();
         if ch == Pt::ZERO && cw == Pt::ZERO && !child_effective_is_empty {
             let child_is_header = is_header || is_table_section(child_node, "thead");
-            collect_table_cells(doc, child_id, child_is_header, ctx, depth + 1, out);
+            collect_table_cells(
+                doc,
+                child_id,
+                child_is_header,
+                ctx,
+                depth + 1,
+                out,
+                body_cells,
+            );
             continue;
         }
 
@@ -129,6 +190,9 @@ fn collect_table_cells(
         // Actual cell — recurse via convert_node so its block / paragraph
         // entries land in the standard maps.
         convert_node(doc, child_id, ctx, depth + 1, out);
+        if !is_header {
+            body_cells.push(child_id);
+        }
     }
 }
 
@@ -284,5 +348,49 @@ mod tests {
             "cell content must be converted to paragraph drawables, \
              proving collect_table_cells walked past the comment node"
         );
+    }
+
+    // A table with `-fulgur-break-border: none` leaves the bottom border of
+    // the cells that end each fragment but the last out: two cells per row,
+    // two rows on page 0, one on page 1; the cells of page 0's second row
+    // are open at the bottom, and none of page 1's. That row's cells end
+    // unevenly, one 10 px tall (an explicit height shorter than the row),
+    // the other 70 px (a cell that runs past the page foot): the row, not
+    // the bottom, picks them.
+    #[test]
+    fn the_cells_of_the_last_row_of_each_page_but_the_last_are_open_at_the_bottom() {
+        use crate::pagination_layout::{Fragment, PaginationGeometry, PaginationGeometryTable};
+        use crate::units::F32Units;
+
+        let frag = |page_index: u32, y: f32, height: f32| Fragment {
+            page_index,
+            x: 0.0_f32.as_px(),
+            y: y.as_px(),
+            width: 50.0_f32.as_px(),
+            height: height.as_px(),
+        };
+        let mut geometry = PaginationGeometryTable::new();
+        for (id, fragment) in [
+            (1, frag(0, 0.0, 30.0)),
+            (2, frag(0, 0.0, 30.0)),
+            (3, frag(0, 30.0, 10.0)),
+            (4, frag(0, 30.0, 70.0)),
+            (5, frag(1, 0.0, 30.0)),
+            (6, frag(1, 0.0, 30.0)),
+        ] {
+            geometry.insert(
+                id,
+                PaginationGeometry {
+                    fragments: vec![fragment],
+                    ..Default::default()
+                },
+            );
+        }
+        let mut out = crate::drawables::Drawables::new();
+
+        super::mark_open_bottom_cells(&[1, 2, 3, 4, 5, 6], &geometry, &mut out);
+
+        let open: Vec<(usize, u32)> = out.open_bottom_cells.into_iter().collect();
+        assert_eq!(open, [(3, 0), (4, 0)]);
     }
 }

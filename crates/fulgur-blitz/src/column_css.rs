@@ -100,6 +100,17 @@ pub enum ColumnFill {
     Auto,
 }
 
+/// `-fulgur-break-border` on a table: whether the cells that end a fragment
+/// of the table which continues on a later page paint their bottom border.
+/// `auto`, the initial value, paints it; `none` leaves it out, so a table
+/// broken across pages shows its last row on each page open at the bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BreakBorder {
+    #[default]
+    Auto,
+    None,
+}
+
 /// `page` value (CSS Page 3, fulgur-uebl). `None` means the author did not
 /// declare the property; `Some(PageName::Auto)` means the author wrote
 /// `page: auto` explicitly (which is also the initial value, but we
@@ -140,6 +151,9 @@ pub struct ColumnStyleProps {
     /// resolution happens later in `compute_used_page_names`, this field
     /// stores only the author's declared value.
     pub page: Option<PageName>,
+    /// `-fulgur-break-border: auto | none`, read on a table (see
+    /// [`BreakBorder`]).
+    pub break_border: Option<BreakBorder>,
 }
 
 impl ColumnStyleProps {
@@ -166,6 +180,9 @@ impl ColumnStyleProps {
         if other.page.is_some() {
             self.page = other.page;
         }
+        if other.break_border.is_some() {
+            self.break_border = other.break_border;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -175,6 +192,7 @@ impl ColumnStyleProps {
             && self.break_after.is_none()
             && self.break_before.is_none()
             && self.page.is_none()
+            && self.break_border.is_none()
     }
 }
 
@@ -483,6 +501,21 @@ fn parse_break_inside_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-break-border: auto | none`; any other
+/// value drops the declaration.
+fn parse_break_border_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<BreakBorder, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    if ident.eq_ignore_ascii_case("auto") {
+        Ok(BreakBorder::Auto)
+    } else if ident.eq_ignore_ascii_case("none") {
+        Ok(BreakBorder::None)
+    } else {
+        Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
+    }
+}
+
 /// The page side a forced break value asks for, with a left-to-right page
 /// progression (`verso` is left, `recto` right); `None` for `always` and
 /// `page`.
@@ -666,6 +699,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("page") {
             if let Ok(v) = input.parse_entirely(parse_page_value) {
                 self.props.page = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-break-border") {
+            if let Ok(v) = input.parse_entirely(parse_break_border_value) {
+                self.props.break_border = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1220,6 +1257,14 @@ mod tests {
         let rules = parse_stylesheet(".keep { break-inside: avoid; }");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].props.break_inside, Some(BreakInside::Avoid));
+    }
+
+    #[test]
+    fn parse_break_border_reads_auto_and_none_and_drops_other_values() {
+        let read = |css: &str| parse_declaration_block(css).break_border;
+        assert_eq!(read("-fulgur-break-border: none"), Some(BreakBorder::None));
+        assert_eq!(read("-fulgur-break-border: auto"), Some(BreakBorder::Auto));
+        assert_eq!(read("-fulgur-break-border: slice"), None);
     }
 
     #[test]

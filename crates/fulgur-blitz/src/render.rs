@@ -633,13 +633,13 @@ fn draw_v2_page(
             // already painted by the main loop, causing a double
             // paint. See the `clipped_descendants` collection block
             // for the rest of the body-overflow rationale.
-            if let Some(block) = drawables.block_styles.get(&node_id)
+            if let Some(block) = block_on_page(drawables, node_id, page_index)
                 && block.style.has_overflow_clip()
                 && Some(node_id) != drawables.body_id
             {
                 draw_under_clip(
                     canvas,
-                    block,
+                    &block,
                     node_id,
                     geom,
                     frag,
@@ -695,15 +695,13 @@ fn draw_v2_page(
             // normally. Without this exclusion `body { opacity: 0.5 }`
             // would silently blank pages 1+. (PR #314 follow-up Devin
             // Review)
-            if let Some(block) = drawables
-                .block_styles
-                .get(&node_id)
+            if let Some(block) = block_on_page(drawables, node_id, page_index)
                 .filter(|b| !b.opacity_descendants.is_empty())
                 .filter(|_| Some(node_id) != drawables.body_id)
             {
                 draw_under_opacity(
                     canvas,
-                    block,
+                    &block,
                     node_id,
                     geom,
                     frag,
@@ -816,12 +814,12 @@ pub(crate) fn dispatch_inline_box_content(
         );
         return;
     }
-    if let Some(block) = drawables.block_styles.get(&content_id)
+    if let Some(block) = block_on_page(drawables, content_id, page_index)
         && block.style.has_overflow_clip()
     {
         draw_under_clip(
             canvas,
-            block,
+            &block,
             content_id,
             content_geom,
             content_frag,
@@ -835,12 +833,12 @@ pub(crate) fn dispatch_inline_box_content(
         );
         return;
     }
-    if let Some(block) = drawables.block_styles.get(&content_id)
+    if let Some(block) = block_on_page(drawables, content_id, page_index)
         && !block.opacity_descendants.is_empty()
     {
         draw_under_opacity(
             canvas,
-            block,
+            &block,
             content_id,
             content_geom,
             content_frag,
@@ -1078,6 +1076,25 @@ fn finish_tagged(
     }
 }
 
+/// The block of `node_id` as its fragment on `page_index` paints: a table
+/// cell in `Drawables::open_bottom_cells` (it ends a fragment of a table
+/// with `-fulgur-break-border: none` that continues) without its bottom
+/// border.
+fn block_on_page(
+    drawables: &Drawables,
+    node_id: usize,
+    page_index: u32,
+) -> Option<std::borrow::Cow<'_, crate::drawables::BlockEntry>> {
+    let block = drawables.block_styles.get(&node_id)?;
+    if !drawables.open_bottom_cells.contains(&(node_id, page_index)) {
+        return Some(std::borrow::Cow::Borrowed(block));
+    }
+    let mut open = block.clone();
+    // `border_styles` is top, right, bottom, left.
+    open.style.border_styles[2] = crate::draw_primitives::BorderStyleValue::None;
+    Some(std::borrow::Cow::Owned(open))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_fragment(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
@@ -1141,7 +1158,8 @@ pub(crate) fn dispatch_fragment(
     // Block + inner content (paragraph / image / svg) sharing the
     // same node_id: combine into one `draw_with_opacity` group. See
     // `draw_block_with_inner_content` for the v1 mirror.
-    if let Some(block) = drawables.block_styles.get(&node_id) {
+    if let Some(block) = block_on_page(drawables, node_id, frag.page_index) {
+        let block = block.as_ref();
         // Suppress the inline-paragraph branch of
         // `draw_block_with_inner_content` when paragraph_slices owns
         // this NodeId (Case A: container is itself the inline root, so
@@ -1641,9 +1659,7 @@ fn draw_under_transform(
                     margin_top_pt,
                     page_index,
                 );
-            } else if let Some(desc_block) = drawables
-                .block_styles
-                .get(&desc_id)
+            } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                 .filter(|b| b.style.has_overflow_clip())
                 .filter(|_| Some(desc_id) != drawables.body_id)
             {
@@ -1656,7 +1672,7 @@ fn draw_under_transform(
                 // (PR #309 follow-up Devin).
                 draw_under_clip(
                     canvas,
-                    desc_block,
+                    &desc_block,
                     desc_id,
                     desc_geom,
                     desc_frag,
@@ -1693,9 +1709,7 @@ fn draw_under_transform(
                     margin_top_pt,
                     page_index,
                 );
-            } else if let Some(desc_block) = drawables
-                .block_styles
-                .get(&desc_id)
+            } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                 .filter(|b| !b.opacity_descendants.is_empty())
             {
                 // Opacity-scoped descendant inside this transform.
@@ -1707,7 +1721,7 @@ fn draw_under_transform(
                 // (fulgur-gdb9)
                 draw_under_opacity(
                     canvas,
-                    desc_block,
+                    &desc_block,
                     desc_id,
                     desc_geom,
                     desc_frag,
@@ -2068,9 +2082,7 @@ fn draw_under_clip(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| b.style.has_overflow_clip())
                     .filter(|_| Some(desc_id) != drawables.body_id)
                 {
@@ -2084,7 +2096,7 @@ fn draw_under_clip(
                     // (PR #309 follow-up Devin).
                     draw_under_clip(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,
@@ -2118,9 +2130,7 @@ fn draw_under_clip(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| !b.opacity_descendants.is_empty())
                 {
                     // Nested opacity-scoped block — recurse so its
@@ -2128,7 +2138,7 @@ fn draw_under_clip(
                     // wrap. (fulgur-gdb9)
                     draw_under_opacity(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,
@@ -2422,15 +2432,13 @@ fn draw_under_opacity(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| b.style.has_overflow_clip())
                     .filter(|_| Some(desc_id) != drawables.body_id)
                 {
                     draw_under_clip(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,
@@ -2462,14 +2470,12 @@ fn draw_under_opacity(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| !b.opacity_descendants.is_empty())
                 {
                     draw_under_opacity(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,
@@ -3076,15 +3082,13 @@ fn draw_under_clip_table(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| b.style.has_overflow_clip())
                     .filter(|_| Some(desc_id) != drawables.body_id)
                 {
                     draw_under_clip(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,
@@ -3114,14 +3118,12 @@ fn draw_under_clip_table(
                         margin_top_pt,
                         page_index,
                     );
-                } else if let Some(desc_block) = drawables
-                    .block_styles
-                    .get(&desc_id)
+                } else if let Some(desc_block) = block_on_page(drawables, desc_id, page_index)
                     .filter(|b| !b.opacity_descendants.is_empty())
                 {
                     draw_under_opacity(
                         canvas,
-                        desc_block,
+                        &desc_block,
                         desc_id,
                         desc_geom,
                         desc_frag,

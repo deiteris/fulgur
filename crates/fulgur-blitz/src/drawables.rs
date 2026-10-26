@@ -443,6 +443,11 @@ pub struct Drawables {
     pub images: TrackedMap<ImageEntry>,
     pub svgs: TrackedMap<SvgEntry>,
     pub tables: TrackedMap<TableEntry>,
+    /// The table cells, with the page, whose fragment there paints no bottom
+    /// border: under `-fulgur-break-border: none` on their table, the cells
+    /// that end a fragment of a table that continues on a later page
+    /// (`convert::table`).
+    pub open_bottom_cells: std::collections::BTreeSet<(NodeId, u32)>,
     pub list_items: TrackedMap<ListItemEntry>,
     pub multicol_rules: BTreeMap<NodeId, MulticolRuleEntry>,
     pub transforms: BTreeMap<NodeId, TransformEntry>,
@@ -493,6 +498,7 @@ impl Default for Drawables {
             images: TrackedMap::default(),
             svgs: TrackedMap::default(),
             tables: TrackedMap::default(),
+            open_bottom_cells: std::collections::BTreeSet::new(),
             list_items: TrackedMap::default(),
             multicol_rules: BTreeMap::new(),
             transforms: BTreeMap::new(),
