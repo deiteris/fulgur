@@ -174,3 +174,56 @@ fn double_per_edge_below_3px_falls_back_to_solid() {
         counts.l,
     );
 }
+
+/// The RGB operands of every stroke colour (`RG`) on the first page.
+fn stroke_colours(pdf: &[u8]) -> Vec<[f32; 3]> {
+    let document = lopdf::Document::load_mem(pdf).expect("PDF should parse");
+    let page_id = *document.get_pages().get(&1).expect("page 1 should exist");
+    let bytes = document.get_page_content(page_id);
+    let content =
+        lopdf::content::Content::decode(&bytes).expect("page content stream should decode");
+    content
+        .operations
+        .iter()
+        .filter(|op| op.operator == "RG")
+        .filter_map(|op| {
+            let channels: Vec<f32> = op
+                .operands
+                .iter()
+                .filter_map(|o| match o {
+                    lopdf::Object::Integer(i) => Some(*i as f32),
+                    lopdf::Object::Real(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            <[f32; 3]>::try_from(channels).ok()
+        })
+        .collect()
+}
+
+#[test]
+fn each_border_side_strokes_in_its_own_colour() {
+    // `border-right-color`, `border-bottom-color`, and `border-left-color`
+    // were ignored: every side stroked in the top colour. A uniform border
+    // whose bottom colour differs must leave the one-colour rect path, and a
+    // cell's bottom and right borders must not take its (unpainted) top
+    // border's colour.
+    let cases = [
+        (
+            ".b { width: 200px; height: 100px; border: 2px solid #ff0000; border-bottom-color: #0000ff; }",
+            r#"<div class="b"></div>"#,
+        ),
+        (
+            "table { border-spacing: 0; } td { border-bottom: 2px solid #ff0000; border-right: 2px solid #0000ff; }",
+            "<table><tr><td>A</td></tr></table>",
+        ),
+    ];
+    for (css, body) in cases {
+        let html = format!("<html><head><style>{css}</style></head><body>{body}</body></html>");
+        let engine = Engine::builder().page_size(PageSize::A4).build();
+        let colours = stroke_colours(&engine.render(&html).unwrap());
+        assert!(colours.contains(&[1.0, 0.0, 0.0]), "{css}: {colours:?}");
+        assert!(colours.contains(&[0.0, 0.0, 1.0]), "{css}: {colours:?}");
+        assert!(!colours.contains(&[0.0, 0.0, 0.0]), "{css}: {colours:?}");
+    }
+}
