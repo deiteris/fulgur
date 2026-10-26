@@ -1816,13 +1816,16 @@ struct RowState {
 }
 
 /// The bottom edge, in its table's coordinates, of the table row that `cell`
-/// belongs to when that row carries `break-inside: avoid` (css-break-3 §3.3)
-/// and fits a strip of `page_height_px`. `None` otherwise: a row taller than
-/// a page still has to split.
+/// belongs to when that row is kept whole and fits a strip of
+/// `page_height_px`. `None` otherwise: a row taller than a page still has to
+/// split.
 ///
 /// Blitz lays a table out as a grid of its cells, so the fragmenter walks
 /// the cells and never meets the row: each cell carries its row's `avoid`,
-/// and the row spans its cells' extent.
+/// and the row spans its cells' extent. A row is kept whole when it carries
+/// `break-inside: avoid` (css-break-3 §3.3) or holds a cell with `rowspan`;
+/// such a cell reaches down through the rows it spans, so they move with it
+/// and the cell is never cut at a page foot apart from its rows.
 fn kept_table_row_bottom(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -1842,14 +1845,24 @@ fn kept_table_row_bottom(
         node.primary_styles()
             .is_some_and(|s| s.clone_display().inside() == inside)
     };
-    if !avoid || !displays(row, DisplayInside::TableRow) {
+    if !displays(row, DisplayInside::TableRow) {
         return None;
     }
-    let (top, bottom) = row
+    let cells = row
         .children
         .iter()
         .filter_map(|&id| doc.get_node(id))
-        .filter(|node| displays(node, DisplayInside::TableCell))
+        .filter(|node| displays(node, DisplayInside::TableCell));
+    let spans_rows = |node: &blitz_dom::Node| {
+        node.element_data()
+            .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|rowspan| rowspan > 1)
+    };
+    if !avoid && !cells.clone().any(spans_rows) {
+        return None;
+    }
+    let (top, bottom) = cells
         .map(|node| {
             let layout = node.final_layout;
             (layout.location.y, layout.location.y + layout.size.height)
@@ -10714,6 +10727,35 @@ h2 { string-set: chapter-title content(text); }
         for id in [short_id, a_id] {
             let pages: Vec<u32> = geom[&id].fragments.iter().map(|f| f.page_index).collect();
             assert_eq!(pages, [1], "the whole row moves to page 1; geom={geom:?}");
+        }
+    }
+
+    /// A row holding a cell with `rowspan` is kept whole with the rows the
+    /// cell spans: without `break-inside: avoid`, the row does not fit the
+    /// rest of the page and moves to the next with every cell, instead of
+    /// splitting its tall cell between blocks.
+    #[test]
+    fn a_row_holding_a_rowspan_cell_moves_whole_with_the_rows_it_spans() {
+        let html = r#"
+            <html><head><style>
+              html, body { margin: 0; padding: 0; }
+              table { border-spacing: 0; }
+              td { padding: 0; }
+            </style></head><body>
+              <div style="height: 120px"></div>
+              <table><tr>
+                <td id="span" rowspan="2">x</td>
+                <td><div id="a" style="height: 30px"></div><div style="height: 30px"></div><div style="height: 30px"></div></td>
+              </tr><tr><td id="next">y</td></tr></table>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 200.0);
+        let ids = ["span", "a", "next"].map(|id| find_by_id(doc.deref_mut(), id).expect(id));
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+        for id in ids {
+            let pages: Vec<u32> = geom[&id].fragments.iter().map(|f| f.page_index).collect();
+            assert_eq!(pages, [1], "the spanned rows move to page 1; geom={geom:?}");
         }
     }
 
