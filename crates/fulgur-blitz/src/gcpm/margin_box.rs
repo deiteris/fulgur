@@ -459,8 +459,8 @@ mod tests {
         v.as_pt()
     }
 
-    /// A page of name `name`, blank or not.
-    fn page(name: Option<&str>, blank: bool) -> crate::pagination_layout::PageFacts {
+    /// The facts of a page of name `name`, blank or not.
+    fn facts(name: Option<&str>, blank: bool) -> crate::pagination_layout::PageFacts {
         crate::pagination_layout::PageFacts {
             name: name.map(str::to_string),
             blank,
@@ -469,8 +469,8 @@ mod tests {
 
     #[test]
     fn a_page_selector_selects_by_name_and_pseudo_classes() {
-        let a = page(Some("a"), false);
-        let plain = page(None, false);
+        let a = facts(Some("a"), false);
+        let plain = facts(None, false);
         let select =
             |selector: &str, page: &crate::pagination_layout::PageFacts, page_num: usize| {
                 page_selector_specificity(Some(selector), page, page_num, false)
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(select(":left", &a, 2), Some((0, 0, 1)));
         assert_eq!(select(":left", &plain, 3), None);
         assert_eq!(select("a", &a, 3), Some((1, 0, 0)));
-        assert_eq!(select("a", &page(Some("b"), false), 3), None);
+        assert_eq!(select("a", &facts(Some("b"), false), 3), None);
         assert_eq!(select("a", &plain, 3), None);
         assert_eq!(select("a:left", &a, 2), Some((1, 0, 1)));
         assert_eq!(select("a:left", &a, 3), None);
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn under_a_right_to_left_root_left_selects_the_odd_pages() {
-        let plain = page(None, false);
+        let plain = facts(None, false);
         let rtl = |selector: &str, page_num: usize| {
             page_selector_specificity(Some(selector), &plain, page_num, true)
         };
@@ -506,20 +506,20 @@ mod tests {
     #[test]
     fn blank_selects_a_blank_page_and_an_unknown_pseudo_class_none() {
         assert_eq!(
-            page_selector_specificity(Some(":blank"), &page(None, true), 2, false),
+            page_selector_specificity(Some(":blank"), &facts(None, true), 2, false),
             Some((0, 1, 0))
         );
         assert_eq!(
-            page_selector_specificity(Some(":blank"), &page(None, false), 2, false),
+            page_selector_specificity(Some(":blank"), &facts(None, false), 2, false),
             None
         );
         assert_eq!(
-            page_selector_specificity(Some("a:blank:left"), &page(Some("a"), true), 2, false),
+            page_selector_specificity(Some("a:blank:left"), &facts(Some("a"), true), 2, false),
             Some((1, 1, 1))
         );
         for selector in [":nth", ":recto", ":first:nth"] {
             assert_eq!(
-                page_selector_specificity(Some(selector), &page(None, true), 1, false),
+                page_selector_specificity(Some(selector), &facts(None, true), 1, false),
                 None,
                 "{selector}"
             );
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn a_page_name_outranks_first_and_blank_which_outrank_a_side() {
-        let a = page(Some("a"), true);
+        let a = facts(Some("a"), true);
         let select = |selector: &str| page_selector_specificity(Some(selector), &a, 1, false);
         assert!(select("a") > select(":first:right"));
         assert!(select(":first") > select(":right"));
