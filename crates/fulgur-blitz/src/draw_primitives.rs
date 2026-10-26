@@ -284,6 +284,15 @@ pub enum BreakAfter {
     Page,
 }
 
+/// The page side a forced break asks for (`left`, `right`, `recto`,
+/// `verso`; CSS Fragmentation 3 §3.1). With a left-to-right page
+/// progression `recto` is `Right` and `verso` is `Left`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSide {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakInside {
     Auto,

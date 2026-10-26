@@ -50,7 +50,7 @@ use cssparser::{
     color::{parse_hash_color, parse_named_color},
 };
 
-use crate::draw_primitives::{BreakAfter, BreakBefore, BreakInside};
+use crate::draw_primitives::{BreakAfter, BreakBefore, BreakInside, PageSide};
 use crate::units::F32Units;
 
 // ---------------------------------------------------------------------------
@@ -127,8 +127,14 @@ pub struct ColumnStyleProps {
     pub break_inside: Option<BreakInside>,
     /// `break-after` / `page-break-after` resolved by the sniffer.
     pub break_after: Option<BreakAfter>,
+    /// The page side `break_after` asks for (`left`, `right`, `recto`,
+    /// `verso`); `None` for any other value. Set and merged with
+    /// `break_after`.
+    pub break_after_side: Option<PageSide>,
     /// `break-before` / `page-break-before` resolved by the sniffer.
     pub break_before: Option<BreakBefore>,
+    /// The page side `break_before` asks for, as `break_after_side`.
+    pub break_before_side: Option<PageSide>,
     /// `page: auto | <custom-ident>` (CSS Page 3). Drives implicit forced
     /// page breaks where adjacent boxes have different used page-names —
     /// resolution happens later in `compute_used_page_names`, this field
@@ -151,9 +157,11 @@ impl ColumnStyleProps {
         }
         if other.break_after.is_some() {
             self.break_after = other.break_after;
+            self.break_after_side = other.break_after_side;
         }
         if other.break_before.is_some() {
             self.break_before = other.break_before;
+            self.break_before_side = other.break_before_side;
         }
         if other.page.is_some() {
             self.page = other.page;
@@ -475,24 +483,39 @@ fn parse_break_inside_value<'i>(
     }
 }
 
+/// The page side a forced break value asks for, with a left-to-right page
+/// progression (`verso` is left, `recto` right); `None` for `always` and
+/// `page`.
+fn break_side(value: &str) -> Option<PageSide> {
+    match value {
+        "left" | "verso" => Some(PageSide::Left),
+        "right" | "recto" => Some(PageSide::Right),
+        _ => None,
+    }
+}
+
 fn parse_break_after_value<'i>(
     input: &mut Parser<'i, '_>,
-) -> Result<BreakAfter, ParseError<'i, ()>> {
+) -> Result<(BreakAfter, Option<PageSide>), ParseError<'i, ()>> {
     let ident = input.expect_ident()?.clone();
     match ident.as_ref().to_ascii_lowercase().as_str() {
-        "always" | "page" | "left" | "right" | "recto" | "verso" => Ok(BreakAfter::Page),
-        "auto" => Ok(BreakAfter::Auto),
+        value @ ("always" | "page" | "left" | "right" | "recto" | "verso") => {
+            Ok((BreakAfter::Page, break_side(value)))
+        }
+        "auto" => Ok((BreakAfter::Auto, None)),
         _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
 }
 
 fn parse_break_before_value<'i>(
     input: &mut Parser<'i, '_>,
-) -> Result<BreakBefore, ParseError<'i, ()>> {
+) -> Result<(BreakBefore, Option<PageSide>), ParseError<'i, ()>> {
     let ident = input.expect_ident()?.clone();
     match ident.as_ref().to_ascii_lowercase().as_str() {
-        "always" | "page" | "left" | "right" | "recto" | "verso" => Ok(BreakBefore::Page),
-        "auto" => Ok(BreakBefore::Auto),
+        value @ ("always" | "page" | "left" | "right" | "recto" | "verso") => {
+            Ok((BreakBefore::Page, break_side(value)))
+        }
+        "auto" => Ok((BreakBefore::Auto, None)),
         _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
 }
@@ -629,14 +652,16 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("break-after")
             || name.eq_ignore_ascii_case("page-break-after")
         {
-            if let Ok(v) = input.parse_entirely(parse_break_after_value) {
+            if let Ok((v, side)) = input.parse_entirely(parse_break_after_value) {
                 self.props.break_after = Some(v);
+                self.props.break_after_side = side;
             }
         } else if name.eq_ignore_ascii_case("break-before")
             || name.eq_ignore_ascii_case("page-break-before")
         {
-            if let Ok(v) = input.parse_entirely(parse_break_before_value) {
+            if let Ok((v, side)) = input.parse_entirely(parse_break_before_value) {
                 self.props.break_before = Some(v);
+                self.props.break_before_side = side;
             }
         } else if name.eq_ignore_ascii_case("page") {
             if let Ok(v) = input.parse_entirely(parse_page_value) {
@@ -1784,6 +1809,18 @@ mod tests {
         let p2 = parse_inline_style("break-after: right");
         assert_eq!(p1.break_after, Some(BreakAfter::Page));
         assert_eq!(p2.break_after, Some(BreakAfter::Page));
+        assert_eq!(p1.break_after_side, Some(PageSide::Left));
+        assert_eq!(p2.break_after_side, Some(PageSide::Right));
+    }
+
+    /// A later rule's break replaces the side of an earlier one with its own.
+    #[test]
+    fn merge_replaces_a_break_side_with_the_later_break() {
+        let mut props = parse_inline_style("break-before: right; break-after: left");
+        props.merge(parse_inline_style("break-before: page"));
+        assert_eq!(props.break_before, Some(BreakBefore::Page));
+        assert_eq!(props.break_before_side, None);
+        assert_eq!(props.break_after_side, Some(PageSide::Left));
     }
 
     #[test]
@@ -2450,6 +2487,8 @@ mod tests {
         let p2 = parse_declaration_block("break-before: right");
         assert_eq!(p1.break_before, Some(BreakBefore::Page), "left");
         assert_eq!(p2.break_before, Some(BreakBefore::Page), "right");
+        assert_eq!(p1.break_before_side, Some(PageSide::Left), "left");
+        assert_eq!(p2.break_before_side, Some(PageSide::Right), "right");
     }
 
     #[test]
@@ -2458,6 +2497,8 @@ mod tests {
         let p2 = parse_declaration_block("break-before: verso");
         assert_eq!(p1.break_before, Some(BreakBefore::Page), "recto");
         assert_eq!(p2.break_before, Some(BreakBefore::Page), "verso");
+        assert_eq!(p1.break_before_side, Some(PageSide::Right), "recto");
+        assert_eq!(p2.break_before_side, Some(PageSide::Left), "verso");
     }
 
     /// An unrecognised `break-before` value drops the declaration silently,

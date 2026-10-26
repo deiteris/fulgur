@@ -255,7 +255,7 @@ pub fn dom_to_drawables(
     convert_node(doc.deref(), root.id, ctx, 0, &mut drawables);
     drawables.bookmark_anchors = extract_bookmark_anchors(doc, &bookmark_snapshot, ctx.assets);
     drawables.body_offset_pt = extract_body_offset_pt(doc);
-    drawables.root_dir_rtl = extract_root_dir_rtl(doc);
+    drawables.root_dir_rtl = extract_root_dir_rtl(doc.deref());
     drawables.root_id = Some(root.id);
     drawables.body_id = find_body_id_in_dom(doc);
     record_semantics_pass(doc, &mut drawables);
@@ -310,13 +310,13 @@ fn extract_body_offset_pt(doc: &HtmlDocument) -> (crate::units::Pt, crate::units
 }
 
 /// Return `true` when the root `<html>` element has `direction: rtl`.
-/// Used by `render_v2` to determine which page is the first `:left` page
-/// (CSS Paged Media §5: RTL docs start on a `:left` page, LTR on `:right`).
-fn extract_root_dir_rtl(doc: &HtmlDocument) -> bool {
+/// Used by `render_v2` to determine which page is the first `:left` page,
+/// and by the fragmenter for the side of a `left` / `right` break (CSS
+/// Paged Media §5: RTL docs start on a `:left` page, LTR on `:right`).
+pub(crate) fn extract_root_dir_rtl(doc: &BaseDocument) -> bool {
     use ::style::properties::longhands::direction::computed_value::T as Dir;
-    let base = doc.deref();
-    base.get_node(doc.root_element().id)
-        .and_then(|n| n.primary_styles())
+    doc.root_element()
+        .primary_styles()
         .is_some_and(|s| matches!(s.get_inherited_box().clone_direction(), Dir::Rtl))
 }
 

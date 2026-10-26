@@ -657,8 +657,12 @@ impl<'a> PaginationLayoutTree<'a> {
                     Some(crate::draw_primitives::BreakBefore::Page)
                 ) || zero_page_name_changed;
                 if zero_force_break && cursor_y > 0.0 {
-                    page_index += 1;
+                    page_index =
+                        page_on_side(self.doc, page_index + 1, zero_break_props.break_before_side);
                     cursor_y = 0.0;
+                } else if page_index > 0 && cursor_y <= 0.0 {
+                    page_index =
+                        page_on_side(self.doc, page_index, zero_break_props.break_before_side);
                 }
                 if child.element_data().is_some() {
                     self.geometry
@@ -681,7 +685,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     zero_break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index += 1;
+                    page_index =
+                        page_on_side(self.doc, page_index + 1, zero_break_props.break_after_side);
                     cursor_y = 0.0;
                 }
                 continue;
@@ -734,12 +739,17 @@ impl<'a> PaginationLayoutTree<'a> {
                 && child_h >= self.page_height_px * 0.9
                 && gap + child_h <= self.page_height_px + 0.5;
             if (explicit_break_before || page_name_changed) && emitted > 0 && cursor_y > 0.0 {
-                page_index += 1;
+                page_index = page_on_side(self.doc, page_index + 1, break_props.break_before_side);
                 cursor_y = if explicit_break_before && page_filling_break_child {
                     gap
                 } else {
                     0.0
                 };
+            } else if page_index > 0 && cursor_y <= 0.0 {
+                // Nothing is placed on this page yet (a `break-after`
+                // moved here, and no margin gap was added above): a side
+                // break only moves on to its side.
+                page_index = page_on_side(self.doc, page_index, break_props.break_before_side);
             }
 
             let avoid_inside = matches!(
@@ -807,7 +817,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index += 1;
+                    page_index =
+                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
                     cursor_y = 0.0;
                 }
                 continue;
@@ -938,7 +949,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index += 1;
+                    page_index =
+                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
                     cursor_y = 0.0;
                 }
                 continue;
@@ -1121,7 +1133,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index += 1;
+                    page_index =
+                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
                     cursor_y = 0.0;
                 }
                 continue;
@@ -1180,12 +1193,35 @@ impl<'a> PaginationLayoutTree<'a> {
                 break_props.break_after,
                 Some(crate::draw_primitives::BreakAfter::Page)
             ) {
-                page_index += 1;
+                page_index = page_on_side(self.doc, page_index + 1, break_props.break_after_side);
                 cursor_y = 0.0;
             }
         }
 
         emitted
+    }
+}
+
+/// The page that content after a forced break starts on, given the page
+/// `page_index` the break reached: one page further when the break asks for
+/// a side (`left`, `right`, `recto`, `verso`) that `page_index` is not (CSS
+/// Fragmentation 3 §3.1). The page skipped holds no fragment, so it prints
+/// only the page box's margin boxes and still counts in `counter(page)`.
+/// Page index 0 is a right page, or a left page under a right-to-left root
+/// (as the `@page :left` / `:right` settings, CSS Paged Media §5).
+fn page_on_side(
+    doc: &BaseDocument,
+    page_index: u32,
+    side: Option<crate::draw_primitives::PageSide>,
+) -> u32 {
+    let Some(side) = side else {
+        return page_index;
+    };
+    let is_right = page_index.is_multiple_of(2) != crate::convert::extract_root_dir_rtl(doc);
+    if (side == crate::draw_primitives::PageSide::Right) == is_right {
+        page_index
+    } else {
+        page_index + 1
     }
 }
 
@@ -2664,13 +2700,19 @@ fn fragment_block_subtree_inner(
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
                     });
-                page_index += 1;
+                page_index = page_on_side(doc, page_index + 1, break_props.break_before_side);
                 cursor_y = 0.0;
                 page_start_y = 0.0;
                 // Zero-height break-before: this child IS the first
                 // on the new page — apply origin rebase eagerly.
                 page_taffy_origin = this_top_in_parent;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
+            } else if !suppress_page_check
+                && !initial_page_occupied
+                && page_index > 0
+                && cursor_y <= 0.0
+            {
+                page_index = page_on_side(doc, page_index, break_props.break_before_side);
             }
             if child.element_data().is_some() {
                 geometry
@@ -2700,7 +2742,7 @@ fn fragment_block_subtree_inner(
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
                     });
-                page_index += 1;
+                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
                 cursor_y = 0.0;
                 page_start_y = 0.0;
                 // Zero-height break-after: NEXT child is the first
@@ -2745,7 +2787,7 @@ fn fragment_block_subtree_inner(
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
                 });
-            page_index += 1;
+            page_index = page_on_side(doc, page_index + 1, break_props.break_before_side);
             cursor_y = 0.0;
             page_start_y = 0.0;
             // The breaking child is the first in-flow child on the
@@ -2755,6 +2797,14 @@ fn fragment_block_subtree_inner(
             // Fragmentation §3 (margins at forced breaks truncate).
             page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
+        } else if !suppress_page_check
+            && !initial_page_occupied
+            && page_index > 0
+            && cursor_y <= 0.0
+        {
+            // Nothing is placed on this page yet, here or above: a side
+            // break only moves on to its side, as at the body level.
+            page_index = page_on_side(doc, page_index, break_props.break_before_side);
         }
 
         // (Strip-overflow page cut moved below the recursion gate as
@@ -3058,7 +3108,7 @@ fn fragment_block_subtree_inner(
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
                     });
-                page_index += 1;
+                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
                 cursor_y = 0.0;
                 page_start_y = 0.0;
                 (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
@@ -3296,7 +3346,7 @@ fn fragment_block_subtree_inner(
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
                     });
-                page_index += 1;
+                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
                 cursor_y = 0.0;
                 page_start_y = 0.0;
                 (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
@@ -3399,7 +3449,7 @@ fn fragment_block_subtree_inner(
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
                 });
-            page_index += 1;
+            page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
             cursor_y = 0.0;
             page_start_y = 0.0;
             (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
@@ -10058,6 +10108,72 @@ h2 { string-set: chapter-title content(text); }
             "break-after: page on a zero-height nested child must advance to page 1; \
              geom={geom:?}"
         );
+    }
+
+    /// `left`, `right`, `recto`, and `verso` breaks skip one page when the
+    /// next page is of the other side (index 0 is a right page): before and
+    /// after, at the body level and nested, zero-height or not, and on a
+    /// page a `break-after: page` reached with nothing on it yet. A skipped
+    /// page holds no fragment, not even one of the nested breaks' parents.
+    #[test]
+    fn side_breaks_skip_a_page_to_the_wanted_side() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0">
+              <div id="a" style="height: 100px"></div>
+              <div id="b" style="height: 100px; break-before: right"></div>
+              <div id="c" style="height: 100px; break-before: verso"></div>
+              <div id="d" style="height: 100px; break-after: left"></div>
+              <div id="e" style="height: 100px; break-after: page"></div>
+              <div id="f" style="height: 100px; break-before: verso"></div>
+              <div id="p1">
+                <div id="g" style="height: 100px"></div>
+                <div id="h" style="height: 100px; break-before: left"></div>
+              </div>
+              <div>
+                <div id="i" style="height: 100px; break-after: page"></div>
+                <div id="j" style="height: 100px; break-before: left"></div>
+              </div>
+              <div id="k" style="height: 0px; break-before: left"></div>
+              <div>
+                <div id="l" style="height: 100px"></div>
+                <div id="m" style="height: 0px; break-before: recto"></div>
+              </div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 800.0_f32.as_px(), &table);
+        let pages = |id: &str| -> Vec<u32> {
+            let node = find_by_id(&*doc, id).expect(id);
+            geom[&node].fragments.iter().map(|f| f.page_index).collect()
+        };
+        let firsts: Vec<u32> = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+        ]
+        .into_iter()
+        .map(|id| pages(id)[0])
+        .collect();
+        assert_eq!(
+            firsts,
+            [0, 2, 3, 3, 5, 7, 7, 9, 9, 11, 13, 13, 14],
+            "geom={geom:?}"
+        );
+        assert_eq!(pages("p1"), [7, 9], "geom={geom:?}");
+    }
+
+    #[test]
+    fn page_on_side_moves_one_page_to_the_wanted_side() {
+        use crate::draw_primitives::PageSide::{Left, Right};
+        let ltr = parse("<html><body></body></html>", 600.0);
+        assert_eq!(super::page_on_side(&ltr, 1, Some(Right)), 2);
+        assert_eq!(super::page_on_side(&ltr, 2, Some(Right)), 2);
+        assert_eq!(super::page_on_side(&ltr, 2, Some(Left)), 3);
+        assert_eq!(super::page_on_side(&ltr, 1, Some(Left)), 1);
+        assert_eq!(super::page_on_side(&ltr, 1, None), 1);
+        let rtl = parse(r#"<html dir="rtl"><body></body></html>"#, 600.0);
+        assert_eq!(super::page_on_side(&rtl, 1, Some(Left)), 2);
+        assert_eq!(super::page_on_side(&rtl, 2, Some(Left)), 2);
+        assert_eq!(super::page_on_side(&rtl, 2, Some(Right)), 3);
     }
 
     // ── record_subtree_walk: position:fixed skip (line 3386) ────────────────────
