@@ -10397,7 +10397,8 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(super::page_on_side(&ltr, 2, Some(Left)), 3);
         assert_eq!(super::page_on_side(&ltr, 1, Some(Left)), 1);
         assert_eq!(super::page_on_side(&ltr, 1, None), 1);
-        let rtl = parse(r#"<html dir="rtl"><body></body></html>"#, 600.0);
+        // `direction: rtl` on the root; Blitz maps no `dir` attribute to it.
+        let rtl = parse(r#"<html style="direction:rtl"><body></body></html>"#, 600.0);
         assert_eq!(super::page_on_side(&rtl, 1, Some(Left)), 2);
         assert_eq!(super::page_on_side(&rtl, 2, Some(Left)), 2);
         assert_eq!(super::page_on_side(&rtl, 2, Some(Right)), 3);
