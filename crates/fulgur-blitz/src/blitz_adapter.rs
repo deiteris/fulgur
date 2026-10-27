@@ -3065,6 +3065,27 @@ impl DomPass for CaptionRestructurePass {
     }
 }
 
+/// The table in the box [`CaptionRestructurePass`] wraps around a table and
+/// its caption, when `node` is such a box: its element children are one
+/// `caption` and one `table`. Only the pass puts a `caption` outside a
+/// `table`, since the HTML parser drops a `caption` tag outside table
+/// context.
+pub(crate) fn captioned_table_of(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize> {
+    let mut caption = false;
+    let mut table = None;
+    for &child_id in &node.children {
+        let Some(element) = doc.get_node(child_id).and_then(|n| n.element_data()) else {
+            continue;
+        };
+        match element.name.local.as_ref() {
+            "caption" if !caption => caption = true,
+            "table" if table.is_none() => table = Some(child_id),
+            _ => return None,
+        }
+    }
+    table.filter(|_| caption)
+}
+
 /// Read the resolved `caption-side` of a caption node. Returns `true` for
 /// `bottom`, `false` for `top` (the default, also used when styles are
 /// unavailable).

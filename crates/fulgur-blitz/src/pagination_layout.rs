@@ -6601,18 +6601,24 @@ mod tests {
     const NOTE_THEN_H: &str = r#"<tr style="-fulgur-header-repeat: skip-first"><th id="note">continued</th></tr><tr><th id="h">H</th></tr>"#;
 
     /// `body` laid out with the document's break styles on pages
-    /// `page_height` px tall, with 20 px cells and 20 px `div`s.
+    /// `page_height` px tall, with 20 px cells, captions, and `div`s, its
+    /// captions moved out of their tables as the engine moves them.
     fn header_pass(body: &str, page_height: f32) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        use crate::blitz_adapter::DomPass as _;
         let html = format!(
             r#"<!doctype html>
             <html><head><style>
               html, body {{ margin: 0; padding: 0; }}
               table {{ margin: 0; border-spacing: 0; width: 100px; }}
               th, td {{ box-sizing: border-box; height: 20px; padding: 0; }}
+              caption {{ height: 20px; padding: 0; }}
               .s {{ height: 20px; }}
             </style></head><body>{body}</body></html>"#
         );
-        let mut doc = parse(&html, 200.0);
+        let mut doc = blitz_adapter::parse(&html, 200.0, &[]);
+        blitz_adapter::CaptionRestructurePass
+            .apply(&mut doc, &blitz_adapter::PassContext { font_data: &[] });
+        blitz_adapter::resolve(&mut doc);
         let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
         let geometry =
             super::run_pass_with_break_styles(doc.deref_mut(), page_height.as_px(), &styles);
@@ -6737,6 +6743,40 @@ mod tests {
             assert_eq!(placements(&doc, &geometry, "b5"), [(1, 100.0)], "{body}");
             assert!(placements(&doc, &geometry, "note").is_empty(), "{body}");
         }
+    }
+
+    /// A table kept whole (`break-inside: avoid`) that does not fit the rest
+    /// of the page moves to the next page with its caption, at the body
+    /// level or nested, with a skipped header row or without: the caption
+    /// lies outside the table's box, in the box around both. A kept table
+    /// taller than a page splits where it stands, under its caption.
+    #[test]
+    fn a_table_kept_whole_moves_with_its_caption() {
+        let table = |head: &str, body_rows: usize| {
+            header_table(r#" style="break-inside: avoid""#, head, body_rows).replacen(
+                "<thead>",
+                r#"<caption id="c">C</caption><thead>"#,
+                1,
+            )
+        };
+        let h = r#"<tr><th id="h">H</th></tr>"#;
+        let spacer = r#"<div style="height: 100px"></div>"#;
+        for body in [
+            format!("{spacer}{}", table(h, 3)),
+            format!("<div>{spacer}{}</div>", table(h, 3)),
+            format!("{spacer}{}", table(NOTE_THEN_H, 3)),
+            format!("<div>{spacer}{}</div>", table(NOTE_THEN_H, 3)),
+        ] {
+            let (doc, geometry) = header_pass(&body, 200.0);
+
+            assert_eq!(placements(&doc, &geometry, "c"), [(1, 0.0)], "{body}");
+            assert_eq!(placements(&doc, &geometry, "h"), [(1, 20.0)], "{body}");
+            assert_eq!(placements(&doc, &geometry, "b3"), [(1, 80.0)], "{body}");
+        }
+
+        let (doc, geometry) = header_pass(&format!("{spacer}{}", table(h, 10)), 200.0);
+        assert_eq!(placements(&doc, &geometry, "c"), [(0, 100.0)]);
+        assert_eq!(placements(&doc, &geometry, "h"), [(0, 120.0), (1, 0.0)]);
     }
 
     /// A `skip-first` row below a header row that prints is placed on the

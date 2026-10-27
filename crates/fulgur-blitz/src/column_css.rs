@@ -1254,6 +1254,16 @@ fn walk(
         }
     }
 
+    // The box the caption pass wraps around a table and its caption stands
+    // for the table in the flow, so it takes the table's `break-inside`: a
+    // table kept whole moves with its caption.
+    if is_element
+        && let Some(table_id) = crate::blitz_adapter::captioned_table_of(doc, node)
+        && let Some(break_inside) = table.get(&table_id).and_then(|props| props.break_inside)
+    {
+        table.entry(node_id).or_default().break_inside = Some(break_inside);
+    }
+
     is_element
 }
 
