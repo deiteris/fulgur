@@ -913,16 +913,24 @@ impl<'a> PaginationLayoutTree<'a> {
                     })
                 });
             let available_strip = (self.page_height_px - cursor_y).max(0.0);
-            // `avoid_inside` already holds only for a child that fits a page.
-            let needs_recursion = has_splittable_children
-                && (!is_multicol || multicol_has_span_all)
-                && (must_fragment_below(self.doc, child_id, self.column_styles, 0)
-                    || has_page_name_change_below(
+            let recursable = has_splittable_children && (!is_multicol || multicol_has_span_all);
+            let below = if recursable {
+                fragmentation_below(self.doc, child_id, self.column_styles, 0)
+            } else {
+                Below::Nothing
+            };
+            let forced = below == Below::ForcedBreak
+                || (recursable
+                    && has_page_name_change_below(
                         self.doc,
                         child_id,
                         self.used_page_names.as_ref(),
                         0,
-                    )
+                    ));
+            // `avoid_inside` already holds only for a child that fits a page.
+            let needs_recursion = recursable
+                && (forced
+                    || below == Below::SkippedHeaderRow
                     || (!avoid_inside
                         && would_split_block_subtree(
                             self.doc,
@@ -931,8 +939,22 @@ impl<'a> PaginationLayoutTree<'a> {
                             self.page_height_px,
                             0,
                         )));
+            // A box kept whole that is entered only for a skipped header row
+            // moves whole first, as one not entered would.
+            if needs_recursion
+                && !forced
+                && avoid_inside
+                && cursor_y > 0.0
+                && cursor_y + child_h > self.page_height_px
+            {
+                page_index += 1;
+                cursor_y = 0.0;
+            }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
+                // The body level places what follows by the cursor, so it
+                // needs no lift.
+                let mut lifted = 0.0;
                 let (new_page, new_cursor) = fragment_block_subtree(
                     &mut self.geometry,
                     self.doc,
@@ -947,6 +969,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     0,
                     false,
                     &mut remaining_repeat_budget,
+                    &mut lifted,
                 );
                 page_index = new_page;
                 cursor_y = new_cursor;
@@ -1567,52 +1590,38 @@ fn has_forced_break_below(
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     depth: usize,
 ) -> bool {
-    any_in_flow_below(doc, node_id, column_styles, depth, &forces_page_break)
+    fragmentation_below(doc, node_id, column_styles, depth) == Below::ForcedBreak
 }
 
-/// Whether the fragmenter has to walk into `node_id` even when it fits the
-/// strip: a forced break below it ([`has_forced_break_below`]), or a header
-/// row that skips its table's first page (`-fulgur-header-repeat:
-/// skip-first`), which only the table's own fragmentation
-/// ([`fragment_repeating_table`]) leaves off that page.
-fn must_fragment_below(
+/// What in flow below a node makes the fragmenter walk into it even when it
+/// fits the strip, the strongest reason found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Below {
+    Nothing,
+    /// A header row that skips its table's first page
+    /// (`-fulgur-header-repeat: skip-first`), which only the table's own
+    /// fragmentation ([`fragment_repeating_table`]) leaves off that page.
+    SkippedHeaderRow,
+    /// A forced page break.
+    ForcedBreak,
+}
+
+/// What below `node_id` makes the fragmenter walk into it ([`Below`]): a
+/// forced break ends the walk; a skipped header row is remembered while the
+/// walk looks on for a break.
+fn fragmentation_below(
     doc: &BaseDocument,
     node_id: usize,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     depth: usize,
-) -> bool {
-    any_in_flow_below(doc, node_id, column_styles, depth, &|props| {
-        forces_page_break(props)
-            || props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst)
-    })
-}
-
-/// Whether `props` force a page break before or after their element.
-fn forces_page_break(props: &crate::column_css::ColumnStyleProps) -> bool {
-    matches!(
-        props.break_before,
-        Some(crate::draw_primitives::BreakBefore::Page)
-    ) || matches!(
-        props.break_after,
-        Some(crate::draw_primitives::BreakAfter::Page)
-    )
-}
-
-/// Whether an element in flow below `node_id` has properties that pass
-/// `test`.
-fn any_in_flow_below(
-    doc: &BaseDocument,
-    node_id: usize,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    depth: usize,
-    test: &dyn Fn(&crate::column_css::ColumnStyleProps) -> bool,
-) -> bool {
+) -> Below {
     if depth >= crate::MAX_DOM_DEPTH {
-        return false;
+        return Below::Nothing;
     }
     let Some(node) = doc.get_node(node_id) else {
-        return false;
+        return Below::Nothing;
     };
+    let mut found = Below::Nothing;
     for &child_id in &node.children {
         // A break declared inside an out-of-flow subtree is never honoured —
         // the fragmenter skips absolute / fixed / floated children entirely —
@@ -1625,17 +1634,27 @@ fn any_in_flow_below(
         {
             continue;
         }
-        if column_styles
-            .and_then(|t| t.get(&child_id))
-            .is_some_and(test)
-        {
-            return true;
+        if let Some(props) = column_styles.and_then(|t| t.get(&child_id)) {
+            if matches!(
+                props.break_before,
+                Some(crate::draw_primitives::BreakBefore::Page)
+            ) || matches!(
+                props.break_after,
+                Some(crate::draw_primitives::BreakAfter::Page)
+            ) {
+                return Below::ForcedBreak;
+            }
+            if props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst) {
+                found = Below::SkippedHeaderRow;
+            }
         }
-        if any_in_flow_below(doc, child_id, column_styles, depth + 1, test) {
-            return true;
+        match fragmentation_below(doc, child_id, column_styles, depth + 1) {
+            Below::ForcedBreak => return Below::ForcedBreak,
+            Below::SkippedHeaderRow => found = Below::SkippedHeaderRow,
+            Below::Nothing => {}
         }
     }
-    false
+    found
 }
 
 /// fulgur-uebl: true if any sibling pair inside `node_id`'s subtree
@@ -2256,6 +2275,7 @@ fn fragment_block_subtree(
     depth: usize,
     initial_page_occupied: bool,
     remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
 ) -> (u32, f32) {
     if depth < crate::MAX_DOM_DEPTH
         && let Some(header) = repeating_table_header(doc, parent_id, depth + 1, column_styles)
@@ -2275,6 +2295,7 @@ fn fragment_block_subtree(
             depth,
             initial_page_occupied,
             remaining_repeat_budget,
+            lifted,
         );
     }
     fragment_block_subtree_inner(
@@ -2294,6 +2315,7 @@ fn fragment_block_subtree(
         false,
         initial_page_occupied,
         remaining_repeat_budget,
+        lifted,
     )
 }
 
@@ -2439,6 +2461,7 @@ fn fragment_repeating_table(
     depth: usize,
     initial_page_occupied: bool,
     remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
 ) -> (u32, f32) {
     if header.band_height_px >= page_height_px {
         log::warn!(
@@ -2462,6 +2485,7 @@ fn fragment_repeating_table(
             false,
             initial_page_occupied,
             remaining_repeat_budget,
+            lifted,
         );
     }
 
@@ -2555,6 +2579,8 @@ fn fragment_repeating_table(
         true,
         first_table_top > 0.0,
         remaining_repeat_budget,
+        // The rows place their cells side by side and apply no lift.
+        &mut 0.0,
     );
 
     // Pages that actually carry body content. A forced break after the last
@@ -2695,6 +2721,11 @@ fn fragment_repeating_table(
     } else {
         body_end_cursor
     };
+    // A table that ends on its first page ends higher than its layout box by
+    // the skipped rows; what follows it on that page moves up with it.
+    if body_end_page == first_page {
+        *lifted += lift;
+    }
     (body_end_page, end_cursor)
 }
 
@@ -2716,6 +2747,7 @@ fn fragment_block_subtree_inner(
     co_split_rows: bool,
     mut initial_page_occupied: bool,
     remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
 ) -> (u32, f32) {
     if depth >= crate::MAX_DOM_DEPTH {
         // Bailed: emit a single whole-fragment for the parent at its
@@ -3443,10 +3475,17 @@ fn fragment_block_subtree_inner(
         // before branch above leaves a sliver of its background behind
         // on the current page instead of moving the whole box.
         let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
-        let needs_recursion = !child.children.is_empty()
-            && !is_multicol
-            && (must_fragment_below(doc, child_id, column_styles, 0)
-                || has_page_name_change_below(doc, child_id, used_page_names, 0)
+        let recursable = !child.children.is_empty() && !is_multicol;
+        let below = if recursable {
+            fragmentation_below(doc, child_id, column_styles, 0)
+        } else {
+            Below::Nothing
+        };
+        let forced = below == Below::ForcedBreak
+            || (recursable && has_page_name_change_below(doc, child_id, used_page_names, 0));
+        let needs_recursion = recursable
+            && (forced
+                || below == Below::SkippedHeaderRow
                 || (!avoid_fits_whole_page
                     && would_split_block_subtree(
                         doc,
@@ -3455,6 +3494,41 @@ fn fragment_block_subtree_inner(
                         page_height_px,
                         0,
                     )));
+        // A box kept whole that is entered only for a skipped header row
+        // moves whole to the next page first, as one not entered would (the
+        // strip-overflow cut below), and is entered there.
+        // A cell of a row kept whole is moved with its row instead.
+        if needs_recursion
+            && !forced
+            && avoid_fits_whole_page
+            && kept_row_bottom.is_none()
+            && (child_page_y > page_start_y || (initial_page_occupied && page_index == page_in))
+            && child_page_y + child_h > page_height_px
+        {
+            let should_emit = row_state
+                .as_mut()
+                .map(|rs| rs.emitted_parent_pages.insert(page_index))
+                .unwrap_or(true);
+            if should_emit {
+                geometry
+                    .entry(parent_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index,
+                        x: parent_x_in_body.as_px(),
+                        y: page_start_y.as_px(),
+                        width: parent_w.as_px(),
+                        height: (cursor_y - page_start_y).as_px(),
+                    });
+            }
+            page_index += 1;
+            cursor_y = 0.0;
+            page_start_y = 0.0;
+            page_taffy_origin = this_top_in_parent;
+            child_page_y = 0.0;
+            initial_page_occupied = false;
+        }
         if needs_recursion {
             let occupied_before_recursion = initial_page_occupied;
             let row_started_on_occupied_strip = row_state
@@ -3472,6 +3546,7 @@ fn fragment_block_subtree_inner(
             // below the previous one instead of beside it. Using
             // `child_page_y` keeps each cell's recursion strip aligned to
             // the row's y on the current page.
+            let mut child_lift = 0.0;
             let (np, nc) = fragment_block_subtree(
                 geometry,
                 doc,
@@ -3486,6 +3561,7 @@ fn fragment_block_subtree_inner(
                 depth + 1,
                 initial_page_occupied,
                 remaining_repeat_budget,
+                &mut child_lift,
             );
             let occupied_page_extent = if occupied_before_recursion || row_started_on_occupied_strip
             {
@@ -3523,6 +3599,15 @@ fn fragment_block_subtree_inner(
             } else {
                 nc
             };
+            // A child that ended on this page higher than its layout box (a
+            // table without its skipped header rows) takes the siblings
+            // after it up with it, here and, through `lifted`, in the
+            // parent's own siblings. Cells side by side in a row are not
+            // moved: the row's height is not this child's alone.
+            if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
+                page_taffy_origin += child_lift;
+                *lifted += child_lift;
+            }
             // If the recursion crossed a boundary, the parent's
             // current-page fragment must restart at y=0 on the new
             // page. Defensive `nc < page_start_y` guards against
@@ -5877,6 +5962,7 @@ mod tests {
             crate::MAX_DOM_DEPTH, // depth → trips the guard immediately
             false,
             &mut remaining_repeat_budget,
+            &mut 0.0,
         );
 
         // The bail pushes exactly ONE whole fragment for parent_id at its
@@ -5951,6 +6037,7 @@ mod tests {
             crate::MAX_DOM_DEPTH,
             false,
             &mut remaining_repeat_budget,
+            &mut 0.0,
         );
 
         assert_eq!(page_out, 0);
@@ -6491,36 +6578,45 @@ mod tests {
         assert_eq!(header.fragments.len(), 1);
     }
 
-    /// A table of 20 px rows whose header group holds a `skip-first` row
-    /// (`note`) above a heading row (`h`), followed by a 20 px block, laid
-    /// out on 80 px pages with the document's break styles.
-    fn skip_first_header_pass(
-        body_rows: usize,
-    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+    /// A table of 20 px rows whose header group holds `head` (the rows
+    /// `note`, which skips the first page, and `h`, in some order) and
+    /// `body_rows` body rows `b1`, `b2`, ...
+    fn header_table(attrs: &str, head: &str, body_rows: usize) -> String {
         let rows = (1..=body_rows)
             .map(|n| format!(r#"<tr><td id="b{n}">{n}</td></tr>"#))
             .collect::<String>();
+        format!(r#"<table id="t"{attrs}><thead>{head}</thead><tbody>{rows}</tbody></table>"#)
+    }
+
+    /// The note row that skips the first page, above the heading row.
+    const NOTE_THEN_H: &str = r#"<tr style="-fulgur-header-repeat: skip-first"><th id="note">continued</th></tr><tr><th id="h">H</th></tr>"#;
+
+    /// `body` laid out with the document's break styles on pages
+    /// `page_height` px tall, with 20 px cells and 20 px `div`s.
+    fn header_pass(body: &str, page_height: f32) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
         let html = format!(
             r#"<!doctype html>
             <html><head><style>
               html, body {{ margin: 0; padding: 0; }}
               table {{ margin: 0; border-spacing: 0; width: 100px; }}
               th, td {{ box-sizing: border-box; height: 20px; padding: 0; }}
-            </style></head><body>
-              <table id="t">
-                <thead>
-                  <tr style="-fulgur-header-repeat: skip-first"><th id="note">continued</th></tr>
-                  <tr><th id="h">H</th></tr>
-                </thead>
-                <tbody>{rows}</tbody>
-              </table>
-              <div id="after" style="height: 20px"></div>
-            </body></html>"#
+              .s {{ height: 20px; }}
+            </style></head><body>{body}</body></html>"#
         );
         let mut doc = parse(&html, 200.0);
         let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
-        let geometry = super::run_pass_with_break_styles(doc.deref_mut(), 80.0_f32.as_px(), &styles);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), page_height.as_px(), &styles);
         (doc, geometry)
+    }
+
+    /// The skip-first table of `body_rows` rows, then a 20 px block, on 80 px
+    /// pages.
+    fn skip_first_header_pass(
+        body_rows: usize,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let table = header_table("", NOTE_THEN_H, body_rows);
+        header_pass(&format!(r#"{table}<div id="after" class="s"></div>"#), 80.0)
     }
 
     /// `(page, y)` of each fragment of `id`.
@@ -6580,6 +6676,79 @@ mod tests {
             super::unsplit_table_lift_px(&doc, table_id, &styles, &geometry),
             20.0
         );
+    }
+
+    /// A one-page table nested in blocks takes what follows it up with it,
+    /// in its own block and in each block around it: the siblings are
+    /// placed by their layout offsets, which count the skipped row.
+    #[test]
+    fn a_nested_one_page_table_takes_what_follows_it_up_by_the_skipped_row() {
+        let table = header_table("", NOTE_THEN_H, 1);
+        let (doc, geometry) = header_pass(
+            &format!(
+                r#"<div><div>{table}<div id="in" class="s"></div></div><div id="out" class="s"></div></div>"#
+            ),
+            200.0,
+        );
+
+        assert!(placements(&doc, &geometry, "note").is_empty());
+        assert_eq!(placements(&doc, &geometry, "b1"), [(0, 20.0)]);
+        assert_eq!(placements(&doc, &geometry, "in"), [(0, 40.0)]);
+        assert_eq!(placements(&doc, &geometry, "out"), [(0, 60.0)]);
+    }
+
+    /// A table kept whole (`break-inside: avoid`), on itself or on a block
+    /// around it, at the body level or nested, that does not fit the rest of
+    /// the page moves whole to the next page, where it starts without its
+    /// skipped row, as it would move without one.
+    #[test]
+    fn a_table_kept_whole_with_a_skipped_header_row_moves_whole() {
+        let kept = r#" style="break-inside: avoid""#;
+        let spacer = r#"<div style="height: 100px"></div>"#;
+        for body in [
+            format!("{spacer}{}", header_table(kept, NOTE_THEN_H, 5)),
+            format!("{spacer}<div{kept}>{}</div>", header_table("", NOTE_THEN_H, 5)),
+            format!("<div>{spacer}{}</div>", header_table(kept, NOTE_THEN_H, 5)),
+        ] {
+            let (doc, geometry) = header_pass(&body, 200.0);
+
+            assert_eq!(placements(&doc, &geometry, "h"), [(1, 0.0)], "{body}");
+            assert_eq!(placements(&doc, &geometry, "b5"), [(1, 100.0)], "{body}");
+            assert!(placements(&doc, &geometry, "note").is_empty(), "{body}");
+        }
+    }
+
+    /// A `skip-first` row below a header row that prints is placed on the
+    /// first page too: leaving it out would leave a gap.
+    #[test]
+    fn a_skip_first_row_below_a_row_that_prints_is_placed_on_the_first_page() {
+        let head = r#"<tr><th id="h">H</th></tr><tr style="-fulgur-header-repeat: skip-first"><th id="note">continued</th></tr>"#;
+        let (doc, geometry) = header_pass(&header_table("", head, 1), 200.0);
+
+        assert_eq!(placements(&doc, &geometry, "h"), [(0, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "note"), [(0, 20.0)]);
+        assert_eq!(placements(&doc, &geometry, "b1"), [(0, 40.0)]);
+    }
+
+    /// A table that starts mid-page lifts its first page's rows from where it
+    /// starts, and its later pages carry the whole band.
+    #[test]
+    fn a_table_starting_mid_page_skips_the_row_on_its_first_page() {
+        let table = header_table("", NOTE_THEN_H, 6);
+        let (doc, geometry) =
+            header_pass(&format!(r#"<div style="height: 30px"></div>{table}"#), 80.0);
+
+        assert_eq!(
+            placements(&doc, &geometry, "h"),
+            [(0, 30.0), (1, 20.0), (2, 20.0), (3, 20.0)]
+        );
+        assert_eq!(
+            placements(&doc, &geometry, "note"),
+            [(1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+        assert_eq!(placements(&doc, &geometry, "b1"), [(0, 50.0)]);
+        assert_eq!(placements(&doc, &geometry, "b2"), [(1, 40.0)]);
+        assert_eq!(placements(&doc, &geometry, "b6"), [(3, 40.0)]);
     }
 
     #[test]
@@ -7055,12 +7224,14 @@ mod tests {
         append_repeated_header_fragments(
             &mut first,
             &template,
+            &template,
             &table_pages,
             10.0,
             &mut remaining_repeat_budget,
         );
         append_repeated_header_fragments(
             &mut second,
+            &template,
             &template,
             &table_pages,
             10.0,
