@@ -916,7 +916,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // `avoid_inside` already holds only for a child that fits a page.
             let needs_recursion = has_splittable_children
                 && (!is_multicol || multicol_has_span_all)
-                && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
+                && (must_fragment_below(self.doc, child_id, self.column_styles, 0)
                     || has_page_name_change_below(
                         self.doc,
                         child_id,
@@ -1567,6 +1567,46 @@ fn has_forced_break_below(
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     depth: usize,
 ) -> bool {
+    any_in_flow_below(doc, node_id, column_styles, depth, &forces_page_break)
+}
+
+/// Whether the fragmenter has to walk into `node_id` even when it fits the
+/// strip: a forced break below it ([`has_forced_break_below`]), or a header
+/// row that skips its table's first page (`-fulgur-header-repeat:
+/// skip-first`), which only the table's own fragmentation
+/// ([`fragment_repeating_table`]) leaves off that page.
+fn must_fragment_below(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    depth: usize,
+) -> bool {
+    any_in_flow_below(doc, node_id, column_styles, depth, &|props| {
+        forces_page_break(props)
+            || props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst)
+    })
+}
+
+/// Whether `props` force a page break before or after their element.
+fn forces_page_break(props: &crate::column_css::ColumnStyleProps) -> bool {
+    matches!(
+        props.break_before,
+        Some(crate::draw_primitives::BreakBefore::Page)
+    ) || matches!(
+        props.break_after,
+        Some(crate::draw_primitives::BreakAfter::Page)
+    )
+}
+
+/// Whether an element in flow below `node_id` has properties that pass
+/// `test`.
+fn any_in_flow_below(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    depth: usize,
+    test: &dyn Fn(&crate::column_css::ColumnStyleProps) -> bool,
+) -> bool {
     if depth >= crate::MAX_DOM_DEPTH {
         return false;
     }
@@ -1585,18 +1625,13 @@ fn has_forced_break_below(
         {
             continue;
         }
-        if let Some(props) = column_styles.and_then(|t| t.get(&child_id))
-            && (matches!(
-                props.break_before,
-                Some(crate::draw_primitives::BreakBefore::Page)
-            ) || matches!(
-                props.break_after,
-                Some(crate::draw_primitives::BreakAfter::Page)
-            ))
+        if column_styles
+            .and_then(|t| t.get(&child_id))
+            .is_some_and(test)
         {
             return true;
         }
-        if has_forced_break_below(doc, child_id, column_styles, depth + 1) {
+        if any_in_flow_below(doc, child_id, column_styles, depth + 1, test) {
             return true;
         }
     }
@@ -1927,6 +1962,15 @@ struct RepeatingTableHeader {
     body_cell_ids: Vec<usize>,
     body_origin_px: f32,
     band_height_px: f32,
+    /// The header cells placed on the table's first page: every one but
+    /// those of the rows at the top of the group that skip it
+    /// (`-fulgur-header-repeat: skip-first`), which print only where the
+    /// header repeats.
+    first_page_cell_ids: Vec<usize>,
+    /// How much shorter the band is on the table's first page: from the top
+    /// of the skipped rows to the top of the first row that prints there (or
+    /// of the body, when every header row skips). Zero when no row skips.
+    first_page_lift_px: f32,
     /// Smallest leading fragmentable unit of the first body row. The band
     /// alone fitting is not enough to start the table on a page — if not even
     /// this clears the band, the page carries only a repeated header.
@@ -2001,6 +2045,7 @@ fn repeating_table_header(
     doc: &BaseDocument,
     table_id: usize,
     child_depth: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
 ) -> Option<RepeatingTableHeader> {
     if child_depth >= crate::MAX_DOM_DEPTH {
         return None;
@@ -2074,6 +2119,36 @@ fn repeating_table_header(
         return None;
     }
 
+    // A row that skips the first page (`-fulgur-header-repeat: skip-first`)
+    // is left out there only above every row that prints: lifting the rest
+    // of the table by its height leaves no gap. One lower down prints.
+    let skips_first = |cell_id: usize| {
+        doc.get_node(cell_id)
+            .and_then(|cell| cell.parent)
+            .and_then(|row_id| column_styles?.get(&row_id))
+            .is_some_and(|props| {
+                props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst)
+            })
+    };
+    let cell_top = |cell_id: usize| doc.get_node(cell_id).map(|n| n.final_layout.location.y);
+    let first_shown_top_px = header_cell_ids
+        .iter()
+        .filter(|&&id| !skips_first(id))
+        .filter_map(|&id| cell_top(id))
+        .fold(body_origin_px, f32::min);
+    let first_page_cell_ids: Vec<usize> = header_cell_ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            !(skips_first(id) && cell_top(id).is_some_and(|top| top < first_shown_top_px - 0.5))
+        })
+        .collect();
+    let first_page_lift_px = if first_page_cell_ids.len() < header_cell_ids.len() {
+        (first_shown_top_px - header_top_px).max(0.0)
+    } else {
+        0.0
+    };
+
     // Cells sharing the body's top edge form the first body row. What has to
     // clear the band is not the whole row but its smallest leading
     // fragmentable unit — a cell whose content splits can put its first block
@@ -2130,8 +2205,40 @@ fn repeating_table_header(
         body_cell_ids,
         body_origin_px,
         band_height_px,
+        first_page_cell_ids,
+        first_page_lift_px,
         first_body_lead_px,
     })
+}
+
+/// How much shorter than its layout box a table on one page is: the header
+/// rows that skip its first page (`-fulgur-header-repeat: skip-first`) take
+/// no room there. The frame of a table that is not split is painted at the
+/// layout height, so it has to leave them out. Zero for a split table, whose
+/// fragments carry their heights, and for one whose header was not placed
+/// as a repeating band (its rows then all print).
+pub(crate) fn unsplit_table_lift_px(
+    doc: &BaseDocument,
+    table_id: usize,
+    column_styles: &crate::column_css::ColumnStyleTable,
+    geometry: &PaginationGeometryTable,
+) -> f32 {
+    if geometry.get(&table_id).is_none_or(PaginationGeometry::is_split) {
+        return 0.0;
+    }
+    let Some(header) = repeating_table_header(doc, table_id, 1, Some(column_styles)) else {
+        return 0.0;
+    };
+    let skipped = header
+        .header_cell_ids
+        .iter()
+        .filter(|id| !header.first_page_cell_ids.contains(id))
+        .any(|id| geometry.get(id).is_none_or(|g| g.fragments.is_empty()));
+    if skipped {
+        header.first_page_lift_px
+    } else {
+        0.0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2151,7 +2258,7 @@ fn fragment_block_subtree(
     remaining_repeat_budget: &mut usize,
 ) -> (u32, f32) {
     if depth < crate::MAX_DOM_DEPTH
-        && let Some(header) = repeating_table_header(doc, parent_id, depth + 1)
+        && let Some(header) = repeating_table_header(doc, parent_id, depth + 1, column_styles)
         && header_band_is_repeatable(doc, &header, column_styles, used_page_names, depth + 1)
     {
         return fragment_repeating_table(
@@ -2233,13 +2340,13 @@ fn fragmented_descendant_page_extent(
 fn record_header_template(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
-    header: &RepeatingTableHeader,
+    header_cell_ids: &[usize],
     page_index: u32,
     table_x: f32,
     table_y: f32,
     depth: usize,
 ) {
-    for &cell_id in &header.header_cell_ids {
+    for &cell_id in header_cell_ids {
         let Some(cell) = doc.get_node(cell_id) else {
             continue;
         };
@@ -2269,21 +2376,29 @@ fn record_header_template(
     }
 }
 
+/// Places the header on the table's pages: `first_page` (recorded on the
+/// first of `table_pages`) as it is, and `template` (recorded on the same
+/// page at `first_table_top`) copied onto each later page. The two differ
+/// when header rows skip the first page.
 fn append_repeated_header_fragments(
     geometry: &mut PaginationGeometryTable,
+    first_page: &PaginationGeometryTable,
     template: &PaginationGeometryTable,
     table_pages: &[(u32, f32)],
     first_table_top: f32,
     remaining_repeat_budget: &mut usize,
 ) {
     let repeats = table_pages.len() > 1;
-    for (&node_id, source) in template {
+    for (&node_id, source) in first_page {
         let target = geometry.entry(node_id).or_default();
         target.is_repeat |= source.is_repeat || repeats;
         target.fragments.extend(source.fragments.iter().cloned());
     }
     if !repeats {
         return;
+    }
+    for (&node_id, source) in template {
+        geometry.entry(node_id).or_default().is_repeat |= source.is_repeat || repeats;
     }
 
     let fragments_per_header = template.values().map(|g| g.fragments.len()).sum::<usize>();
@@ -2376,8 +2491,11 @@ fn fragment_repeating_table(
                 .first_body_lead_px
                 .max(bottom - header.body_origin_px)
         });
-    let first_row_reserve = header.band_height_px + first_body_lead_px;
-    let band_overflows = cursor_in + header.band_height_px > page_height_px;
+    // The band the table's first page carries, without the rows that skip it.
+    let lift = header.first_page_lift_px;
+    let first_band = header.band_height_px - lift;
+    let first_row_reserve = first_band + first_body_lead_px;
+    let band_overflows = cursor_in + first_band > page_height_px;
     // The band fits but its first body row does not: starting here would emit
     // a header with nothing under it. Only worth moving if the pair actually
     // fits on an empty page — an oversized first row has to start somewhere,
@@ -2390,16 +2508,33 @@ fn fragment_repeating_table(
     } else {
         (page_in, cursor_in)
     };
+    // Where the table would start were the skipped rows on its first page:
+    // the body and the header rows below them are placed from here, so they
+    // lift by the rows' height (above the page top when the table starts
+    // there).
+    let full_band_top = first_table_top - lift;
     let mut header_template = PaginationGeometryTable::new();
     record_header_template(
         &mut header_template,
         doc,
-        header,
+        &header.header_cell_ids,
         first_page,
         parent_x_in_body,
         first_table_top,
         depth,
     );
+    let mut first_page_template = PaginationGeometryTable::new();
+    if lift > 0.0 {
+        record_header_template(
+            &mut first_page_template,
+            doc,
+            &header.first_page_cell_ids,
+            first_page,
+            parent_x_in_body,
+            full_band_top,
+            depth,
+        );
+    }
 
     let body_page_height = page_height_px - header.band_height_px;
     let mut body_geometry = PaginationGeometryTable::new();
@@ -2412,7 +2547,7 @@ fn fragment_repeating_table(
         parent_w,
         parent_x_in_body,
         first_page,
-        first_table_top,
+        full_band_top,
         body_page_height,
         depth,
         Some(&header.body_cell_ids),
@@ -2471,7 +2606,16 @@ fn fragment_repeating_table(
                     || body_content_pages.contains(&fragment.page_index)
             });
             for fragment in &mut source.fragments {
-                fragment.height = (fragment.height.to_f32() + header.band_height_px).as_px();
+                // The first page's fragment starts at `full_band_top`; the
+                // table itself starts below the rows that skip it.
+                let lifted = if fragment.page_index == first_page {
+                    lift
+                } else {
+                    0.0
+                };
+                fragment.y = (fragment.y.to_f32() + lifted).as_px();
+                fragment.height =
+                    (fragment.height.to_f32() + header.band_height_px - lifted).as_px();
                 let table_top = fragment.y.to_f32();
                 table_pages
                     .entry(fragment.page_index)
@@ -2522,7 +2666,7 @@ fn fragment_repeating_table(
                     x: parent_x_in_body.as_px(),
                     y: first_table_top.as_px(),
                     width: parent_w.as_px(),
-                    height: header.band_height_px.as_px(),
+                    height: first_band.as_px(),
                 },
             );
         first_table_top
@@ -2530,6 +2674,11 @@ fn fragment_repeating_table(
     let table_pages = table_pages.into_iter().collect::<Vec<_>>();
     append_repeated_header_fragments(
         geometry,
+        if lift > 0.0 {
+            &first_page_template
+        } else {
+            &header_template
+        },
         &header_template,
         &table_pages,
         first_table_top,
@@ -3296,7 +3445,7 @@ fn fragment_block_subtree_inner(
         let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
         let needs_recursion = !child.children.is_empty()
             && !is_multicol
-            && (has_forced_break_below(doc, child_id, column_styles, 0)
+            && (must_fragment_below(doc, child_id, column_styles, 0)
                 || has_page_name_change_below(doc, child_id, used_page_names, 0)
                 || (!avoid_fits_whole_page
                     && would_split_block_subtree(
@@ -5973,7 +6122,7 @@ mod tests {
         // The body now starts at the demoted second header group, not at `b1`.
         let body_y = doc.get_node(h2).unwrap().final_layout.location.y;
 
-        let metadata = repeating_table_header(&doc, table_id, 1).unwrap();
+        let metadata = repeating_table_header(&doc, table_id, 1, None).unwrap();
 
         assert_eq!(metadata.table_id, table_id);
         // Only `<thead>`'s cells are headers; `tbody.repeat` is demoted.
@@ -6005,7 +6154,7 @@ mod tests {
         );
         let table_id = find_by_id(&doc, "t").unwrap();
 
-        assert!(repeating_table_header(&doc, table_id, 1).is_none());
+        assert!(repeating_table_header(&doc, table_id, 1, None).is_none());
     }
 
     #[test]
@@ -6028,7 +6177,7 @@ mod tests {
         );
         let parent_id = find_by_id(&doc, "not-table").unwrap();
 
-        assert!(repeating_table_header(&doc, parent_id, 1).is_none());
+        assert!(repeating_table_header(&doc, parent_id, 1, None).is_none());
     }
 
     #[test]
@@ -6050,7 +6199,7 @@ mod tests {
         );
         let table_id = find_by_id(&doc, "t").unwrap();
 
-        assert!(repeating_table_header(&doc, table_id, crate::MAX_DOM_DEPTH).is_none());
+        assert!(repeating_table_header(&doc, table_id, crate::MAX_DOM_DEPTH, None).is_none());
     }
 
     #[test]
@@ -6340,6 +6489,97 @@ mod tests {
 
         assert!(!header.is_repeat);
         assert_eq!(header.fragments.len(), 1);
+    }
+
+    /// A table of 20 px rows whose header group holds a `skip-first` row
+    /// (`note`) above a heading row (`h`), followed by a 20 px block, laid
+    /// out on 80 px pages with the document's break styles.
+    fn skip_first_header_pass(
+        body_rows: usize,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let rows = (1..=body_rows)
+            .map(|n| format!(r#"<tr><td id="b{n}">{n}</td></tr>"#))
+            .collect::<String>();
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              th, td {{ box-sizing: border-box; height: 20px; padding: 0; }}
+            </style></head><body>
+              <table id="t">
+                <thead>
+                  <tr style="-fulgur-header-repeat: skip-first"><th id="note">continued</th></tr>
+                  <tr><th id="h">H</th></tr>
+                </thead>
+                <tbody>{rows}</tbody>
+              </table>
+              <div id="after" style="height: 20px"></div>
+            </body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry = super::run_pass_with_break_styles(doc.deref_mut(), 80.0_f32.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    /// `(page, y)` of each fragment of `id`.
+    fn placements(
+        doc: &blitz_dom::BaseDocument,
+        geometry: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<(u32, f32)> {
+        let node_id = find_by_id(doc, id).unwrap();
+        geometry.get(&node_id).map_or_else(Vec::new, |g| {
+            g.fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32()))
+                .collect()
+        })
+    }
+
+    /// A header row with `-fulgur-header-repeat: skip-first` is left off the
+    /// table's first page and placed above the other header rows on each page
+    /// the header repeats on. On the first page the rows below it lift into
+    /// its place, and the body fills the room it leaves: a 20 px band there
+    /// holds three 20 px rows on an 80 px page, the 40 px band of the later
+    /// pages two.
+    #[test]
+    fn a_header_row_that_skips_the_first_page_is_placed_where_the_header_repeats() {
+        let (doc, geometry) = skip_first_header_pass(6);
+
+        assert_eq!(placements(&doc, &geometry, "note"), [(1, 0.0), (2, 0.0)]);
+        assert_eq!(
+            placements(&doc, &geometry, "h"),
+            [(0, 0.0), (1, 20.0), (2, 20.0)]
+        );
+        assert!(geometry[&find_by_id(&doc, "note").unwrap()].is_repeat);
+        assert_eq!(placements(&doc, &geometry, "b1"), [(0, 20.0)]);
+        assert_eq!(placements(&doc, &geometry, "b3"), [(0, 60.0)]);
+        assert_eq!(placements(&doc, &geometry, "b4"), [(1, 40.0)]);
+        assert_eq!(placements(&doc, &geometry, "b6"), [(2, 40.0)]);
+        let table = &geometry[&find_by_id(&doc, "t").unwrap()].fragments[0];
+        assert_eq!((table.page_index, table.y.to_f32()), (0, 0.0));
+        assert_eq!(placements(&doc, &geometry, "after"), [(2, 60.0)]);
+    }
+
+    /// A table on one page never places a `skip-first` header row: the rows
+    /// below it lift into its place, the block after the table follows the
+    /// last row, and the table's frame is that much shorter than its layout.
+    #[test]
+    fn a_header_row_that_skips_the_first_page_is_not_placed_on_a_one_page_table() {
+        let (doc, geometry) = skip_first_header_pass(1);
+
+        assert!(placements(&doc, &geometry, "note").is_empty());
+        assert_eq!(placements(&doc, &geometry, "h"), [(0, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "b1"), [(0, 20.0)]);
+        assert_eq!(placements(&doc, &geometry, "after"), [(0, 40.0)]);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let table_id = find_by_id(&doc, "t").unwrap();
+        assert_eq!(
+            super::unsplit_table_lift_px(&doc, table_id, &styles, &geometry),
+            20.0
+        );
     }
 
     #[test]

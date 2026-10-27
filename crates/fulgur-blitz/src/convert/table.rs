@@ -29,7 +29,14 @@ fn convert_table(
     depth: usize,
     out: &mut crate::drawables::Drawables,
 ) {
-    let (width, height) = size_in_pt(node.final_layout.size);
+    let mut size = node.final_layout.size;
+    size.height -= crate::pagination_layout::unsplit_table_lift_px(
+        doc,
+        node.id,
+        &ctx.column_styles,
+        &ctx.pagination_geometry,
+    );
+    let (width, height) = size_in_pt(size);
     let style = extract_block_style(node, ctx.assets);
     let clipping = style.has_overflow_clip();
     let (opacity, visible) = extract_opacity_visible(node);

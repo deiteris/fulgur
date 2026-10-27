@@ -111,6 +111,20 @@ pub enum BreakBorder {
     None,
 }
 
+/// `-fulgur-header-repeat` on a row of a table's repeating header group:
+/// on which of the table's pages the row prints. `auto`, the initial value,
+/// prints it on every page; `skip-first` leaves it off the table's first
+/// page, so it prints only where the header repeats, as a row reading
+/// "continued" above the column headings of each following page. Only rows
+/// at the top of the group skip, as one above a row that prints would leave
+/// a gap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeaderRepeat {
+    #[default]
+    Auto,
+    SkipFirst,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -166,6 +180,9 @@ pub struct ColumnStyleProps {
     /// `-fulgur-break-border: auto | none`, read on a table (see
     /// [`BreakBorder`]).
     pub break_border: Option<BreakBorder>,
+    /// `-fulgur-header-repeat: auto | skip-first`, read on a row (see
+    /// [`HeaderRepeat`]).
+    pub header_repeat: Option<HeaderRepeat>,
     /// `orphans` as declared on the element; `None` when it declares none.
     /// The property is inherited, so the consumer looks at the ancestors
     /// next (`pagination_layout::line_limits`).
@@ -201,6 +218,9 @@ impl ColumnStyleProps {
         if other.break_border.is_some() {
             self.break_border = other.break_border;
         }
+        if other.header_repeat.is_some() {
+            self.header_repeat = other.header_repeat;
+        }
         if other.orphans.is_some() {
             self.orphans = other.orphans;
         }
@@ -217,6 +237,7 @@ impl ColumnStyleProps {
             && self.break_before.is_none()
             && self.page.is_none()
             && self.break_border.is_none()
+            && self.header_repeat.is_none()
             && self.orphans.is_none()
             && self.widows.is_none()
     }
@@ -542,6 +563,21 @@ fn parse_break_border_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-header-repeat: auto | skip-first`; any
+/// other value drops the declaration.
+fn parse_header_repeat_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<HeaderRepeat, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    if ident.eq_ignore_ascii_case("auto") {
+        Ok(HeaderRepeat::Auto)
+    } else if ident.eq_ignore_ascii_case("skip-first") {
+        Ok(HeaderRepeat::SkipFirst)
+    } else {
+        Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid))
+    }
+}
+
 /// Parse the value side of `orphans` or `widows`: a positive `<integer>`,
 /// `initial` (2), or a keyword that takes the parent's value. Zero, a
 /// negative or fractional number, and any other value drop the declaration.
@@ -748,6 +784,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-break-border") {
             if let Ok(v) = input.parse_entirely(parse_break_border_value) {
                 self.props.break_border = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-header-repeat") {
+            if let Ok(v) = input.parse_entirely(parse_header_repeat_value) {
+                self.props.header_repeat = Some(v);
             }
         } else if name.eq_ignore_ascii_case("orphans") {
             if let Ok(v) = input.parse_entirely(parse_line_count_value) {
@@ -1318,6 +1358,21 @@ mod tests {
         assert_eq!(read("-fulgur-break-border: none"), Some(BreakBorder::None));
         assert_eq!(read("-fulgur-break-border: auto"), Some(BreakBorder::Auto));
         assert_eq!(read("-fulgur-break-border: slice"), None);
+    }
+
+    #[test]
+    fn parse_header_repeat_reads_auto_and_skip_first_and_drops_other_values() {
+        let read = |css: &str| parse_declaration_block(css).header_repeat;
+        assert_eq!(
+            read("-fulgur-header-repeat: skip-first"),
+            Some(HeaderRepeat::SkipFirst)
+        );
+        assert_eq!(
+            read("-fulgur-header-repeat: SKIP-FIRST"),
+            Some(HeaderRepeat::SkipFirst)
+        );
+        assert_eq!(read("-fulgur-header-repeat: auto"), Some(HeaderRepeat::Auto));
+        assert_eq!(read("-fulgur-header-repeat: skip-last"), None);
     }
 
     #[test]
