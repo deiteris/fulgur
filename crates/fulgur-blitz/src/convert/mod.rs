@@ -59,6 +59,17 @@ fn size_in_pt(size: taffy::Size<f32>) -> (Pt, Pt) {
     (size.width.as_px().in_pt(), size.height.as_px().in_pt())
 }
 
+/// The layout size of `node` less what its box ends higher on its page
+/// when it is not split (`PaginationGeometry::unsplit_lift_px`): a table
+/// without the header rows that skip its first page, and a block around one.
+fn lifted_size(node: &Node, ctx: &ConvertContext<'_>) -> taffy::Size<f32> {
+    let mut size = node.final_layout.size;
+    if let Some(geometry) = ctx.pagination_geometry.get(&node.id) {
+        size.height -= geometry.unsplit_lift_px();
+    }
+    size
+}
+
 /// Default CSS line-height multiplier when the actual computed value is
 /// unavailable (CSS 2 §10.8.1 initial value for `line-height: normal`).
 const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.2;

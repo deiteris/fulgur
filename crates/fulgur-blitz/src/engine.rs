@@ -1935,6 +1935,7 @@ mod tests {
                     fragments: vec![frag_on_page(page_index)],
                     is_repeat: false,
                     line_boundaries: Vec::new(),
+                    lift_px: 0.0,
                 },
             );
         }
@@ -2053,6 +2054,7 @@ mod tests {
                 fragments: vec![frag_on_page(2)],
                 is_repeat: false,
                 line_boundaries: Vec::new(),
+                lift_px: 0.0,
             },
         );
         let map = build_implicit_href_map(&doc, &geometry);

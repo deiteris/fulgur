@@ -47,6 +47,10 @@ pub(super) fn convert(
     let opacity_scope = !clipping && opacity < 1.0;
     let mark = (clipping || opacity_scope).then(|| out.draw_mark());
 
+    // A block on one page around a table without the header rows that skip
+    // its first page paints its box that much shorter than its layout box.
+    let (width, height) = size_in_pt(lifted_size(node, ctx));
+
     // Always insert the block entry — the dispatcher silently no-ops
     // when neither paint nor clip nor opacity applies, so leaving an
     // unstyled entry costs nothing and keeps abs/fixed descendants able

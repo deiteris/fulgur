@@ -137,9 +137,23 @@ pub struct PaginationGeometry {
     /// vector (a paragraph that was strip-sliced whole rather than
     /// split at line boundaries publishes nothing).
     pub line_boundaries: Vec<usize>,
+    /// How much shorter than its layout box the node ends on its page: a
+    /// table without the header rows that skip its first page
+    /// (`-fulgur-header-repeat: skip-first`), and each block around it by
+    /// what stayed on its page. A node that is not split paints its box at
+    /// the layout height less this ([`Self::unsplit_lift_px`]). Zero for
+    /// every other node.
+    pub lift_px: f32,
 }
 
 impl PaginationGeometry {
+    /// What a node that is not split paints its box shorter than its layout
+    /// height by ([`Self::lift_px`]); zero for a split node, whose fragments
+    /// carry their heights.
+    pub fn unsplit_lift_px(&self) -> f32 {
+        if self.is_split() { 0.0 } else { self.lift_px }
+    }
+
     /// Whether this node's content was *split* across multiple pages —
     /// i.e. each fragment is a slice of the same content. Returns
     /// `false` when the geometry represents per-page repetition
@@ -2230,36 +2244,6 @@ fn repeating_table_header(
     })
 }
 
-/// How much shorter than its layout box a table on one page is: the header
-/// rows that skip its first page (`-fulgur-header-repeat: skip-first`) take
-/// no room there. The frame of a table that is not split is painted at the
-/// layout height, so it has to leave them out. Zero for a split table, whose
-/// fragments carry their heights, and for one whose header was not placed
-/// as a repeating band (its rows then all print).
-pub(crate) fn unsplit_table_lift_px(
-    doc: &BaseDocument,
-    table_id: usize,
-    column_styles: &crate::column_css::ColumnStyleTable,
-    geometry: &PaginationGeometryTable,
-) -> f32 {
-    if geometry.get(&table_id).is_none_or(PaginationGeometry::is_split) {
-        return 0.0;
-    }
-    let Some(header) = repeating_table_header(doc, table_id, 1, Some(column_styles)) else {
-        return 0.0;
-    };
-    let skipped = header
-        .header_cell_ids
-        .iter()
-        .filter(|id| !header.first_page_cell_ids.contains(id))
-        .any(|id| geometry.get(id).is_none_or(|g| g.fragments.is_empty()));
-    if skipped {
-        header.first_page_lift_px
-    } else {
-        0.0
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree(
     geometry: &mut PaginationGeometryTable,
@@ -2723,9 +2707,19 @@ fn fragment_repeating_table(
     };
     // A table that ends on its first page ends higher than its layout box by
     // the skipped rows; what follows it on that page moves up with it.
-    if body_end_page == first_page {
+    // Such a table ends at its own bottom, its border included, less the
+    // skipped rows, as one placed whole would: the body's cursor stops at
+    // its last row.
+    let end_cursor = if body_end_page == first_page && lift > 0.0 {
+        geometry.entry(header.table_id).or_default().lift_px = lift;
         *lifted += lift;
-    }
+        let table_height = doc
+            .get_node(header.table_id)
+            .map_or(0.0, |table| table.final_layout.size.height);
+        end_cursor.max(first_table_top + table_height - lift)
+    } else {
+        end_cursor
+    };
     (body_end_page, end_cursor)
 }
 
@@ -2790,6 +2784,9 @@ fn fragment_block_subtree_inner(
     //   `location.y` for cards in the same row, so the offset
     //   collapses to the row's first y).
     let mut page_taffy_origin = initial_taffy_origin;
+    // The lift of the children that ended on their page, which moved the
+    // siblings after them up: the parent ends that much higher too.
+    let mut own_lift = 0.0_f32;
     let mut origin_pending_target_y: Option<f32> = None;
     let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
     // fulgur-uebl: tracks the previous in-flow sibling's used page-name
@@ -3606,7 +3603,7 @@ fn fragment_block_subtree_inner(
             // moved: the row's height is not this child's alone.
             if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
                 page_taffy_origin += child_lift;
-                *lifted += child_lift;
+                own_lift += child_lift;
             }
             // If the recursion crossed a boundary, the parent's
             // current-page fragment must restart at y=0 on the new
@@ -3866,6 +3863,14 @@ fn fragment_block_subtree_inner(
         }
     }
 
+    // A parent entered only to lift a table on its page (it ends on the
+    // page it started on) ends at its own bottom, its padding and border
+    // included, less the lift, as it would were it placed whole: the
+    // cursor alone stops at its last child.
+    if own_lift > 0.0 && page_index == page_in {
+        cursor_y = cursor_y.max(page_start_y + parent.final_layout.size.height - page_taffy_origin);
+    }
+
     // Close the parent's fragment for the final page span. Always
     // emit at least one fragment so the parent is represented in
     // geometry — `collect_counter_states` and friends look up nodes
@@ -3885,6 +3890,10 @@ fn fragment_block_subtree_inner(
             width: parent_w.as_px(),
             height: (cursor_y - page_start_y).as_px(),
         });
+    if own_lift > 0.0 {
+        geometry.entry(parent_id).or_default().lift_px = own_lift;
+        *lifted += own_lift;
+    }
 
     (page_index, cursor_y)
 }
@@ -6670,23 +6679,22 @@ mod tests {
         assert_eq!(placements(&doc, &geometry, "h"), [(0, 0.0)]);
         assert_eq!(placements(&doc, &geometry, "b1"), [(0, 20.0)]);
         assert_eq!(placements(&doc, &geometry, "after"), [(0, 40.0)]);
-        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
-        let table_id = find_by_id(&doc, "t").unwrap();
-        assert_eq!(
-            super::unsplit_table_lift_px(&doc, table_id, &styles, &geometry),
-            20.0
-        );
+        let table = &geometry[&find_by_id(&doc, "t").unwrap()];
+        assert_eq!(table.unsplit_lift_px(), 20.0);
     }
 
     /// A one-page table nested in blocks takes what follows it up with it,
     /// in its own block and in each block around it: the siblings are
-    /// placed by their layout offsets, which count the skipped row.
+    /// placed by their layout offsets, which count the skipped row. Each
+    /// block around it ends that much higher, at its own bottom (padding
+    /// included), and paints its box that much shorter; a block split over
+    /// pages carries its heights in its fragments.
     #[test]
     fn a_nested_one_page_table_takes_what_follows_it_up_by_the_skipped_row() {
         let table = header_table("", NOTE_THEN_H, 1);
         let (doc, geometry) = header_pass(
             &format!(
-                r#"<div><div>{table}<div id="in" class="s"></div></div><div id="out" class="s"></div></div>"#
+                r#"<div id="outer" style="padding-bottom: 10px"><div id="inner">{table}<div id="in" class="s"></div></div><div id="out" class="s"></div></div><div id="after" class="s"></div>"#
             ),
             200.0,
         );
@@ -6695,6 +6703,19 @@ mod tests {
         assert_eq!(placements(&doc, &geometry, "b1"), [(0, 20.0)]);
         assert_eq!(placements(&doc, &geometry, "in"), [(0, 40.0)]);
         assert_eq!(placements(&doc, &geometry, "out"), [(0, 60.0)]);
+        // The outer block ends at its padding's bottom, less the row.
+        assert_eq!(placements(&doc, &geometry, "after"), [(0, 90.0)]);
+        for block in ["inner", "outer"] {
+            let block = &geometry[&find_by_id(&doc, block).unwrap()];
+            assert_eq!(block.unsplit_lift_px(), 20.0, "{block:?}");
+        }
+        let fragment = geometry[&find_by_id(&doc, "outer").unwrap()].fragments[0].clone();
+        let split = PaginationGeometry {
+            fragments: vec![fragment.clone(), fragment],
+            lift_px: 20.0,
+            ..Default::default()
+        };
+        assert_eq!(split.unsplit_lift_px(), 0.0);
     }
 
     /// A table kept whole (`break-inside: avoid`), on itself or on a block

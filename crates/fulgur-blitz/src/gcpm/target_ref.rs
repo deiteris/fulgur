@@ -480,6 +480,7 @@ mod tests {
                 ],
                 is_repeat: false,
                 line_boundaries: Vec::new(),
+                lift_px: 0.0,
             },
         );
         assert_eq!(page_for_node(&table, 42), Some(3)); // page_index 2 -> 1-based page 3
@@ -501,6 +502,7 @@ mod tests {
                 fragments: vec![],
                 is_repeat: false,
                 line_boundaries: Vec::new(),
+                lift_px: 0.0,
             },
         );
         assert_eq!(page_for_node(&table, 7), None);

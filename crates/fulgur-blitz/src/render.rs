@@ -5403,6 +5403,7 @@ mod tests {
             fragments: vec![frag.clone()],
             is_repeat: false,
             line_boundaries: Vec::new(),
+            lift_px: 0.0,
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 120.0).abs() < 0.001, "width from layout_size");
@@ -5424,6 +5425,7 @@ mod tests {
             fragments: vec![frag.clone(), continuation],
             is_repeat: false,
             line_boundaries: Vec::new(),
+            lift_px: 0.0,
         };
         let (_, h) = table_box_size(&entry, &geom, &frag);
         assert!((h - 30.0).abs() < 0.01, "height = frag.height.in_pt()");
@@ -5438,6 +5440,7 @@ mod tests {
             fragments: vec![frag.clone()],
             is_repeat: false,
             line_boundaries: Vec::new(),
+            lift_px: 0.0,
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
@@ -5462,6 +5465,7 @@ mod tests {
             fragments: vec![frag.clone(), continuation],
             is_repeat: false,
             line_boundaries: Vec::new(),
+            lift_px: 0.0,
         };
         let (_, h) = table_box_size(&entry, &geom, &frag);
         assert!(
@@ -5480,6 +5484,7 @@ mod tests {
             fragments: vec![frag.clone()],
             is_repeat: false,
             line_boundaries: Vec::new(),
+            lift_px: 0.0,
         };
         let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");

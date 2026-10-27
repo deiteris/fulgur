@@ -29,14 +29,9 @@ fn convert_table(
     depth: usize,
     out: &mut crate::drawables::Drawables,
 ) {
-    let mut size = node.final_layout.size;
-    size.height -= crate::pagination_layout::unsplit_table_lift_px(
-        doc,
-        node.id,
-        &ctx.column_styles,
-        &ctx.pagination_geometry,
-    );
-    let (width, height) = size_in_pt(size);
+    // A table on one page without the header rows that skip its first
+    // page paints its frame that much shorter than its layout box.
+    let (width, height) = size_in_pt(lifted_size(node, ctx));
     let style = extract_block_style(node, ctx.assets);
     let clipping = style.has_overflow_clip();
     let (opacity, visible) = extract_opacity_visible(node);
