@@ -6745,38 +6745,66 @@ mod tests {
         }
     }
 
-    /// A table kept whole (`break-inside: avoid`) that does not fit the rest
-    /// of the page moves to the next page with its caption, at the body
-    /// level or nested, with a skipped header row or without: the caption
-    /// lies outside the table's box, in the box around both. A kept table
-    /// taller than a page splits where it stands, under its caption.
+    /// A table's break properties are its caption's too, since the caption
+    /// lies outside the table's box, in the box around both. A table kept
+    /// whole (`break-inside: avoid`) that does not fit the rest of the page
+    /// moves to the next page with its caption, above or below it, at the
+    /// body level or nested, with a skipped header row or without; one that
+    /// fits a page but not with its caption, or that is taller than a page,
+    /// splits where it stands, under its caption. A forced break before the
+    /// table goes before its caption.
     #[test]
     fn a_table_kept_whole_moves_with_its_caption() {
-        let table = |head: &str, body_rows: usize| {
-            header_table(r#" style="break-inside: avoid""#, head, body_rows).replacen(
+        // A table of `attrs` with the caption `c` of `caption` style, the
+        // header rows `head`, and `body_rows` 20 px rows.
+        let table = |attrs: &str, caption: &str, head: &str, body_rows: usize| {
+            header_table(attrs, head, body_rows).replacen(
                 "<thead>",
-                r#"<caption id="c">C</caption><thead>"#,
+                &format!(r#"<caption id="c" style="{caption}">C</caption><thead>"#),
                 1,
             )
         };
+        let kept = r#" style="break-inside: avoid""#;
         let h = r#"<tr><th id="h">H</th></tr>"#;
         let spacer = r#"<div style="height: 100px"></div>"#;
+        let at = |body: &str, ids: [&str; 2]| {
+            let (doc, geometry) = header_pass(body, 200.0);
+            ids.map(|id| placements(&doc, &geometry, id))
+        };
         for body in [
-            format!("{spacer}{}", table(h, 3)),
-            format!("<div>{spacer}{}</div>", table(h, 3)),
-            format!("{spacer}{}", table(NOTE_THEN_H, 3)),
-            format!("<div>{spacer}{}</div>", table(NOTE_THEN_H, 3)),
+            format!("{spacer}{}", table(kept, "", h, 5)),
+            format!("<div>{spacer}{}</div>", table(kept, "", h, 5)),
+            format!("{spacer}{}", table(kept, "", NOTE_THEN_H, 5)),
+            format!("<div>{spacer}{}</div>", table(kept, "", NOTE_THEN_H, 5)),
         ] {
-            let (doc, geometry) = header_pass(&body, 200.0);
-
-            assert_eq!(placements(&doc, &geometry, "c"), [(1, 0.0)], "{body}");
-            assert_eq!(placements(&doc, &geometry, "h"), [(1, 20.0)], "{body}");
-            assert_eq!(placements(&doc, &geometry, "b3"), [(1, 80.0)], "{body}");
+            assert_eq!(
+                at(&body, ["c", "h"]),
+                [vec![(1, 0.0)], vec![(1, 20.0)]],
+                "{body}"
+            );
         }
 
-        let (doc, geometry) = header_pass(&format!("{spacer}{}", table(h, 10)), 200.0);
-        assert_eq!(placements(&doc, &geometry, "c"), [(0, 100.0)]);
-        assert_eq!(placements(&doc, &geometry, "h"), [(0, 120.0), (1, 0.0)]);
+        let bottom = format!("{spacer}{}", table(kept, "caption-side: bottom", h, 5));
+        assert_eq!(at(&bottom, ["h", "c"]), [vec![(1, 0.0)], vec![(1, 120.0)]]);
+
+        // A 180 px table under a 40 px caption: together taller than a page.
+        let window = format!("{spacer}{}", table(kept, "height: 40px", h, 8));
+        assert_eq!(
+            at(&window, ["c", "h"]),
+            [vec![(0, 100.0)], vec![(0, 140.0), (1, 0.0)]]
+        );
+
+        let long = format!("{spacer}{}", table(kept, "", h, 10));
+        assert_eq!(
+            at(&long, ["c", "h"]),
+            [vec![(0, 100.0)], vec![(0, 120.0), (1, 0.0)]]
+        );
+
+        let forced = format!(
+            r#"<div><div class="s"></div>{}</div>"#,
+            table(r#" style="break-before: page""#, "", h, 1)
+        );
+        assert_eq!(at(&forced, ["c", "h"]), [vec![(1, 0.0)], vec![(1, 20.0)]]);
     }
 
     /// A `skip-first` row below a header row that prints is placed on the
