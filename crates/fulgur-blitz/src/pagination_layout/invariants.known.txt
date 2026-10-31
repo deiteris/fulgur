@@ -98,8 +98,8 @@
 25 PastFoot b4 0  # leading extent
 25 PastFoot b5 0  # leading extent
 25 PlacedOnce b2 0  # page cursor
+27 DocumentOrder b4 1  # leading extent: lines measured from the line box
 27 PlacedOnce b10 4  # page cursor
-27 PlacedOnce b2 0  # page cursor
 27 PlacedOnce b6 2  # page cursor
 28 PastFoot b2 0  # page cursor
 28 PlacedOnce b2 0  # page cursor
@@ -139,7 +139,7 @@
 40 PlacedOnce b8 0  # page cursor
 41 PastFoot b12 5  # page cursor
 41 PlacedOnce b12 5  # page cursor
-41 PlacedOnce b7 2  # page cursor
+41 PlacedOnce b7 3  # page cursor
 42 PastFoot b0 0  # leading extent
 42 PastFoot b4 0  # leading extent
 42 PastFoot b5 0  # leading extent
@@ -173,7 +173,6 @@
 44 PastFoot b11 16  # page cursor
 44 PastFoot b15 14  # table walker
 44 PastFoot b16 14  # table walker
-44 PastFoot b22 18  # page cursor
 44 PastFoot b4 0  # leading extent
 44 PlacedOnce b0 0  # page cursor
 44 PlacedOnce b1 0  # page cursor
@@ -181,7 +180,6 @@
 44 PlacedOnce b2 0  # leading extent
 44 PlacedOnce b20 16  # table walker
 44 PlacedOnce b22 18  # page cursor
-44 PlacedOnce b25 18  # leading extent
 44 PlacedOnce b7 5  # page cursor
 46 DocumentOrder b6 0  # leading extent: lines measured from the line box
 46 DocumentOrder b7 0  # leading extent: lines measured from the line box
@@ -204,13 +202,13 @@
 51 PastFoot b12 4  # table walker
 51 PastFoot b13 4  # table walker
 51 PastFoot b15 5  # table walker
-51 PastFoot b20 8  # page cursor
+51 PastFoot b20 9  # page cursor
 51 PastFoot b5 1  # table walker
 51 PastFoot b6 1  # table walker
 51 PlacedOnce b0 0  # page cursor
 51 PlacedOnce b17 5  # table walker
-51 PlacedOnce b20 7  # page cursor
-51 PlacedOnce b21 8  # leading extent: lines measured from the line box
+51 PlacedOnce b20 8  # page cursor
+51 PlacedOnce b21 9  # leading extent: lines measured from the line box
 51 PlacedOnce b7 0  # table walker
 54 PastFoot b0 0  # page cursor
 54 PastFoot b0 1  # page cursor
@@ -261,19 +259,19 @@
 68 DocumentOrder b12 1  # leading extent: lines measured from the line box
 68 PastFoot b0 0  # page cursor
 68 PastFoot b1 0  # page cursor
-68 PastFoot b13 1  # page cursor
+68 PastFoot b13 2  # page cursor
 68 PastFoot b2 0  # page cursor
 68 PastFoot b8 0  # leading extent
 68 PastFoot b9 0  # leading extent
 68 PlacedOnce b0 0  # page cursor
 68 PlacedOnce b1 0  # page cursor
-68 PlacedOnce b13 1  # page cursor
-68 PlacedOnce b14 1  # leading extent: lines measured from the line box
+68 PlacedOnce b13 2  # page cursor
+68 PlacedOnce b14 2  # leading extent: lines measured from the line box
 68 PlacedOnce b2 0  # page cursor
 68 PlacedOnce b8 0  # leading extent
-70 PastFoot b2 0  # page cursor
-70 PlacedOnce b2 0  # page cursor
-70 PlacedOnce b3 0  # leading extent: lines measured from the line box
+70 PastFoot b2 1  # page cursor
+70 PlacedOnce b2 1  # page cursor
+70 PlacedOnce b3 1  # leading extent: lines measured from the line box
 73 PastFoot b0 1  # page cursor
 73 PlacedOnce b0 0  # page cursor
 73 PlacedOnce b2 0  # table walker
@@ -333,9 +331,10 @@
 92 PlacedOnce b4 1  # page cursor
 93 PlacedOnce b16 2  # page cursor
 94 PlacedOnce b1 0  # page cursor
+95 Encloses b11 4  # leading extent
 95 Encloses b12 6  # leading extent
 95 PastFoot b10 3  # leading extent
-95 PastFoot b11 3  # page cursor
+95 PastFoot b11 4  # leading extent
 95 PastFoot b12 6  # leading extent
 95 PastFoot b14 6  # leading extent
 95 PastFoot b17 9  # page cursor
@@ -345,8 +344,7 @@
 95 PastFoot b7 2  # leading extent
 95 PastFoot b8 3  # page cursor
 95 PastFoot b9 3  # leading extent
-95 PlacedOnce b11 3  # page cursor
-95 PlacedOnce b12 3  # leading extent
+95 PlacedOnce b11 3  # leading extent
 95 PlacedOnce b17 9  # page cursor
 95 PlacedOnce b18 9  # edge model
 95 PlacedOnce b3 2  # page cursor
@@ -379,12 +377,11 @@
 102 PlacedOnce b2 0  # table walker
 102 PlacedOnce b5 1  # table walker
 103 PlacedOnce b0 0  # page cursor
-105 PlacedOnce b2 0  # page cursor
-106 PastFoot b3 2  # page cursor
+105 PlacedOnce b2 1  # page cursor
+106 PastFoot b3 3  # page cursor
 106 PastFoot b3 6  # page cursor
 106 PlacedOnce b10 6  # leading extent: lines measured from the line box
 106 PlacedOnce b3 2  # page cursor
-106 PlacedOnce b5 2  # page cursor
 107 Encloses b1 3  # page cursor
 107 PastFoot b0 1  # page cursor
 107 PastFoot b1 1  # page cursor
@@ -503,12 +500,11 @@
 154 PlacedOnce b0 0  # page cursor
 155 PastFoot b0 0  # page cursor
 155 PlacedOnce b0 0  # page cursor
-156 PastFoot b3 0  # page cursor
 156 PastFoot b3 1  # page cursor
-156 PastFoot b6 0  # leading extent
+156 PastFoot b6 1  # leading extent
 156 PlacedOnce b3 0  # page cursor
-156 PlacedOnce b6 0  # leading extent
-156 PlacedOnce b7 0  # leading extent
+156 PlacedOnce b6 1  # leading extent
+156 PlacedOnce b7 1  # leading extent
 157 DocumentOrder b1 0  # leading extent: lines measured from the line box
 157 PastFoot b1 0  # page cursor
 157 PlacedOnce b1 0  # page cursor
@@ -656,7 +652,6 @@
 199 PlacedOnce b0 0  # page cursor
 199 PlacedOnce b2 1  # page cursor
 199 PlacedOnce b3 1  # leading extent: lines measured from the line box
-199 PlacedOnce b8 2  # leading extent
 200 PastFoot b1 0  # page cursor
 200 PastFoot b2 0  # page cursor
 200 PlacedOnce b1 0  # page cursor
@@ -722,7 +717,6 @@
 212 PlacedOnce b11 4  # edge model
 212 PlacedOnce b16 8  # page cursor
 212 PlacedOnce b3 2  # page cursor
-214 PlacedOnce b9 1  # page cursor
 216 PastFoot b0 1  # page cursor
 216 PlacedOnce b0 0  # page cursor
 218 DocumentOrder b22 4  # leading extent: lines measured from the line box
@@ -742,20 +736,19 @@
 226 PlacedOnce b2 0  # leading extent
 227 DocumentOrder b12 2  # leading extent: lines measured from the line box
 227 PlacedOnce b8 1  # page cursor
-231 PastFoot b4 1  # page cursor
-231 PlacedOnce b4 1  # page cursor
-231 PlacedOnce b5 1  # edge model
+231 PastFoot b4 2  # page cursor
+231 PlacedOnce b4 2  # page cursor
+231 PlacedOnce b5 2  # leading extent: lines measured from the line box
 232 PastFoot b0 1  # page cursor
 232 PastFoot b1 1  # leading extent
 232 PastFoot b10 4  # page cursor
+232 PastFoot b16 10  # page cursor
 232 PastFoot b16 11  # page cursor
-232 PastFoot b16 9  # page cursor
 232 PastFoot b5 2  # page cursor
 232 PlacedOnce b0 0  # page cursor
 232 PlacedOnce b10 4  # page cursor
 232 PlacedOnce b11 4  # leading extent: lines measured from the line box
-232 PlacedOnce b16 9  # page cursor
-232 PlacedOnce b17 9  # edge model
+232 PlacedOnce b16 10  # page cursor
 232 PlacedOnce b3 1  # leading extent: lines measured from the line box
 232 PlacedOnce b5 2  # page cursor
 233 PastFoot b0 0  # page cursor
@@ -814,7 +807,7 @@
 251 PastFoot b6 0  # leading extent
 251 PastFoot b7 0  # leading extent
 251 PastFoot b9 0  # leading extent
-251 PlacedOnce b11 1  # page cursor
+251 PlacedOnce b11 2  # page cursor
 251 PlacedOnce b15 4  # page cursor
 251 PlacedOnce b16 4  # leading extent: lines measured from the line box
 251 PlacedOnce b20 5  # page cursor

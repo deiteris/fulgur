@@ -3475,7 +3475,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if lead.unit == Unit::Box && lead.moves_on(page_height_px) {
+            if matches!(lead.unit, Unit::Box | Unit::Lines) && lead.moves_on(page_height_px) {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
                 cursor.advance();
                 cursor.page_taffy_origin = this_top_in_parent;
@@ -12258,6 +12258,25 @@ h2 { string-set: chapter-title content(text); }
                 [&[1][..], container_pages],
                 "{body}"
             );
+        }
+    }
+
+    /// A box opened by a paragraph whose `orphans` cannot be met in the rest
+    /// of the page moves to the next page whole, as one opened by a box
+    /// placed whole does, at the body level and nested: the paragraph's
+    /// leading unit is its first three lines, 62 px with the box's border,
+    /// against the 35 px left. Moving the paragraph alone left the bordered
+    /// box empty from its top to the page foot.
+    #[test]
+    fn a_box_opened_by_a_paragraph_its_orphans_move_moves_whole() {
+        let para = r#"<p id="k" style="orphans: 3; widows: 1">K1<br>K2<br>K3<br>K4</p>"#;
+        for body in [
+            format!(r#"<p>Z</p><div id="c" style="border: 2px solid">{para}</div>"#),
+            format!(
+                r#"<div><p>Z</p><section id="c" style="border: 2px solid">{para}</section></div>"#
+            ),
+        ] {
+            assert_eq!(pages_after_65px(&body, &["k", "c"]), [[1], [1]], "{body}");
         }
     }
 
