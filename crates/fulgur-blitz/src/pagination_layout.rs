@@ -534,8 +534,7 @@ impl<'a> PaginationLayoutTree<'a> {
             })
             .unwrap_or_default();
 
-        let mut page_index: u32 = 0;
-        let mut cursor_y: f32 = 0.0;
+        let mut cursor = PageCursor::new(0, 0.0, self.page_height_px);
         let mut emitted = 0usize;
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
         // Tracks the bottom edge of the previously emitted in-flow child
@@ -602,9 +601,9 @@ impl<'a> PaginationLayoutTree<'a> {
                         .or_default()
                         .fragments
                         .push(Fragment {
-                            page_index,
+                            page_index: cursor.page_index,
                             x: (body_x + layout.location.x).as_px(),
-                            y: cursor_y.as_px(),
+                            y: cursor.cursor_y.as_px(),
                             width: 0.0_f32.as_px(),
                             height: 0.0_f32.as_px(),
                         });
@@ -678,13 +677,10 @@ impl<'a> PaginationLayoutTree<'a> {
                     zero_break_props.break_before,
                     Some(crate::draw_primitives::BreakBefore::Page)
                 ) || zero_page_name_changed;
-                if zero_force_break && cursor_y > 0.0 {
-                    page_index =
-                        page_on_side(self.doc, page_index + 1, zero_break_props.break_before_side);
-                    cursor_y = 0.0;
-                } else if page_index > 0 && cursor_y <= 0.0 {
-                    page_index =
-                        page_on_side(self.doc, page_index, zero_break_props.break_before_side);
+                if zero_force_break && cursor.cursor_y > 0.0 {
+                    cursor.break_to(self.doc, zero_break_props.break_before_side);
+                } else if cursor.page_index > 0 && cursor.cursor_y <= 0.0 {
+                    cursor.move_to_side(self.doc, zero_break_props.break_before_side);
                 }
                 if child.element_data().is_some() {
                     self.geometry
@@ -692,9 +688,9 @@ impl<'a> PaginationLayoutTree<'a> {
                         .or_default()
                         .fragments
                         .push(Fragment {
-                            page_index,
+                            page_index: cursor.page_index,
                             x: (body_x + layout.location.x).as_px(),
-                            y: cursor_y.as_px(),
+                            y: cursor.cursor_y.as_px(),
                             width: child_w.as_px(),
                             height: 0.0_f32.as_px(),
                         });
@@ -707,9 +703,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     zero_break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index =
-                        page_on_side(self.doc, page_index + 1, zero_break_props.break_after_side);
-                    cursor_y = 0.0;
+                    cursor.break_to(self.doc, zero_break_props.break_after_side);
                 }
                 continue;
             }
@@ -721,7 +715,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // gaps from sibling overlap (rare with default UA styles).
             let this_top_in_body = layout.location.y;
             let gap = (this_top_in_body - prev_bottom_y_in_body).max(0.0);
-            cursor_y += gap;
+            cursor.cursor_y += gap;
 
             // fulgur-k0g0: read break-before / break-after / break-inside
             // for this child from the column-style side-table (shared with
@@ -760,18 +754,17 @@ impl<'a> PaginationLayoutTree<'a> {
             let page_filling_break_child = gap > 0.0
                 && child_h >= self.page_height_px * 0.9
                 && gap + child_h <= self.page_height_px + 0.5;
-            if (explicit_break_before || page_name_changed) && emitted > 0 && cursor_y > 0.0 {
-                page_index = page_on_side(self.doc, page_index + 1, break_props.break_before_side);
-                cursor_y = if explicit_break_before && page_filling_break_child {
-                    gap
-                } else {
-                    0.0
-                };
-            } else if page_index > 0 && cursor_y <= 0.0 {
+            if (explicit_break_before || page_name_changed) && emitted > 0 && cursor.cursor_y > 0.0
+            {
+                cursor.break_to(self.doc, break_props.break_before_side);
+                if explicit_break_before && page_filling_break_child {
+                    cursor.cursor_y = gap;
+                }
+            } else if cursor.page_index > 0 && cursor.cursor_y <= 0.0 {
                 // Nothing is placed on this page yet (a `break-after`
                 // moved here, and no margin gap was added above): a side
                 // break only moves on to its side.
-                page_index = page_on_side(self.doc, page_index, break_props.break_before_side);
+                cursor.move_to_side(self.doc, break_props.break_before_side);
             }
 
             // `break-inside: avoid` keeps a child whole only when it fits a
@@ -805,21 +798,23 @@ impl<'a> PaginationLayoutTree<'a> {
                 // the "split before the child" fallback (CSS
                 // Fragmentation §4.2, class A break point).
                 let limits = line_limits(self.doc, self.column_styles, child_id);
-                if cursor_y > 0.0
-                    && moves_whole_at_foot(&line_metrics, cursor_y, self.page_height_px, limits)
+                if cursor.cursor_y > 0.0
+                    && moves_whole_at_foot(
+                        &line_metrics,
+                        cursor.cursor_y,
+                        self.page_height_px,
+                        limits,
+                    )
                 {
-                    page_index += 1;
-                    cursor_y = 0.0;
+                    cursor.advance();
                 }
                 let para_x = layout.location.x;
-                let (new_page_index, new_cursor_y, frag_count) = fragment_inline_root(
+                let frag_count = fragment_inline_root(
                     &mut self.geometry,
                     child_id,
                     body_x + para_x,
                     child_w,
-                    cursor_y,
-                    page_index,
-                    self.page_height_px,
+                    &mut cursor,
                     &line_metrics,
                     limits,
                 );
@@ -830,8 +825,6 @@ impl<'a> PaginationLayoutTree<'a> {
                     &line_metrics,
                     frag_count,
                 );
-                page_index = new_page_index;
-                cursor_y = new_cursor_y;
                 emitted += frag_count;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
                 if !is_float {
@@ -841,9 +834,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index =
-                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
-                    cursor_y = 0.0;
+                    cursor.break_to(self.doc, break_props.break_after_side);
                 }
                 continue;
             }
@@ -926,7 +917,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             .is_some_and(crate::blitz_adapter::has_column_span_all)
                     })
                 });
-            let available_strip = (self.page_height_px - cursor_y).max(0.0);
+            let available_strip = (self.page_height_px - cursor.cursor_y).max(0.0);
             let recursable = has_splittable_children && (!is_multicol || multicol_has_span_all);
             let below = if recursable {
                 fragmentation_below(self.doc, child_id, self.column_styles, 0)
@@ -957,8 +948,8 @@ impl<'a> PaginationLayoutTree<'a> {
             // moves whole first, as one not entered would; so does a box
             // opened by a box that places whole and crosses the foot.
             if needs_recursion
-                && cursor_y > 0.0
-                && ((!forced && avoid_inside && cursor_y + child_h > self.page_height_px)
+                && cursor.cursor_y > 0.0
+                && ((!forced && avoid_inside && cursor.cursor_y + child_h > self.page_height_px)
                     || opening_whole_box_bottom(
                         self.doc,
                         self.column_styles,
@@ -966,10 +957,9 @@ impl<'a> PaginationLayoutTree<'a> {
                         self.page_height_px,
                         0,
                     )
-                    .is_some_and(|bottom| cursor_y + bottom > self.page_height_px))
+                    .is_some_and(|bottom| cursor.cursor_y + bottom > self.page_height_px))
             {
-                page_index += 1;
-                cursor_y = 0.0;
+                cursor.advance();
             }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
@@ -984,16 +974,16 @@ impl<'a> PaginationLayoutTree<'a> {
                     child_id,
                     child_w,
                     child_x_in_body,
-                    page_index,
-                    cursor_y,
+                    cursor.page_index,
+                    cursor.cursor_y,
                     self.page_height_px,
                     0,
                     false,
                     &mut remaining_repeat_budget,
                     &mut lifted,
                 );
-                page_index = new_page;
-                cursor_y = new_cursor;
+                cursor.page_index = new_page;
+                cursor.cursor_y = new_cursor;
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
                 if !is_float {
@@ -1003,9 +993,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index =
-                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
-                    cursor_y = 0.0;
+                    cursor.break_to(self.doc, break_props.break_after_side);
                 }
                 continue;
             }
@@ -1016,9 +1004,8 @@ impl<'a> PaginationLayoutTree<'a> {
             // `avoid_inside` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
             // identical).
-            if cursor_y > 0.0 && cursor_y + child_h > self.page_height_px {
-                page_index += 1;
-                cursor_y = 0.0;
+            if cursor.cursor_y > 0.0 && cursor.cursor_y + child_h > self.page_height_px {
+                cursor.advance();
             }
 
             // Phase 4 PR 5 fix: include `layout.location.x` so the
@@ -1071,15 +1058,15 @@ impl<'a> PaginationLayoutTree<'a> {
                 .primary_styles()
                 .is_some_and(|s| !s.get_box().transform.0.is_empty());
             if !has_transform && child_h > self.page_height_px + 1.0 {
-                let first_slice_h = (self.page_height_px - cursor_y).min(child_h);
+                let first_slice_h = (self.page_height_px - cursor.cursor_y).min(child_h);
                 self.geometry
                     .entry(child_id)
                     .or_default()
                     .fragments
                     .push(Fragment {
-                        page_index,
+                        page_index: cursor.page_index,
                         x: frag_x.as_px(),
-                        y: cursor_y.as_px(),
+                        y: cursor.cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: first_slice_h.as_px(),
                     });
@@ -1087,8 +1074,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     &mut self.geometry,
                     self.doc,
                     child_id,
-                    page_index,
-                    cursor_y,
+                    cursor.page_index,
+                    cursor.cursor_y,
                     frag_x,
                     0,
                 );
@@ -1137,8 +1124,7 @@ impl<'a> PaginationLayoutTree<'a> {
                          to a single page (fulgur-ezst)",
                         crate::MAX_PAGES,
                     );
-                    page_index += 1;
-                    cursor_y = 0.0;
+                    cursor.advance();
                 } else {
                     // fulgur-2m6w: cap the per-page-strip slicing at
                     // `MAX_PAGES`. `child_h` is attacker-controlled CSS
@@ -1148,15 +1134,15 @@ impl<'a> PaginationLayoutTree<'a> {
                     // `remaining`, looping forever. The `page_index` ceiling is
                     // load-bearing on its own (it stops the loop even when
                     // `remaining` is `+inf`); content past the cap is truncated.
-                    while remaining > 0.0 && page_index < crate::MAX_PAGES {
-                        page_index += 1;
+                    while remaining > 0.0 && cursor.page_index < crate::MAX_PAGES {
+                        cursor.advance();
                         last_slice_h = remaining.min(self.page_height_px);
                         self.geometry
                             .entry(child_id)
                             .or_default()
                             .fragments
                             .push(Fragment {
-                                page_index,
+                                page_index: cursor.page_index,
                                 x: frag_x.as_px(),
                                 y: 0.0_f32.as_px(),
                                 width: child_w.as_px(),
@@ -1172,10 +1158,10 @@ impl<'a> PaginationLayoutTree<'a> {
                             crate::MAX_PAGES,
                         );
                     }
-                    cursor_y = if child_h - first_slice_h > 0.0 {
+                    cursor.cursor_y = if child_h - first_slice_h > 0.0 {
                         last_slice_h
                     } else {
-                        cursor_y + first_slice_h
+                        cursor.cursor_y + first_slice_h
                     };
                 }
                 emitted += 1;
@@ -1187,17 +1173,15 @@ impl<'a> PaginationLayoutTree<'a> {
                     break_props.break_after,
                     Some(crate::draw_primitives::BreakAfter::Page)
                 ) {
-                    page_index =
-                        page_on_side(self.doc, page_index + 1, break_props.break_after_side);
-                    cursor_y = 0.0;
+                    cursor.break_to(self.doc, break_props.break_after_side);
                 }
                 continue;
             }
 
             let frag = Fragment {
-                page_index,
+                page_index: cursor.page_index,
                 x: frag_x.as_px(),
-                y: cursor_y.as_px(),
+                y: cursor.cursor_y.as_px(),
                 width: child_w.as_px(),
                 height: child_h.as_px(),
             };
@@ -1224,13 +1208,13 @@ impl<'a> PaginationLayoutTree<'a> {
                 &mut self.geometry,
                 self.doc,
                 child_id,
-                page_index,
-                cursor_y,
+                cursor.page_index,
+                cursor.cursor_y,
                 frag_x,
                 0,
             );
 
-            cursor_y += child_h;
+            cursor.cursor_y += child_h;
             emitted += 1;
             prev_bottom_y_in_body = this_top_in_body + child_h;
             if !is_float {
@@ -1247,8 +1231,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 break_props.break_after,
                 Some(crate::draw_primitives::BreakAfter::Page)
             ) {
-                page_index = page_on_side(self.doc, page_index + 1, break_props.break_after_side);
-                cursor_y = 0.0;
+                cursor.break_to(self.doc, break_props.break_after_side);
             }
         }
 
@@ -1870,11 +1853,8 @@ fn has_page_name_change_below(
 /// (page, cursor) as the first cell did. After all cells in the row are
 /// processed the outer cursor advances to `max_end_*`.
 struct RowState {
-    start_page: u32,
-    start_cursor_y: f32,
-    start_page_start_y: f32,
-    start_page_taffy_origin: f32,
-    start_initial_page_occupied: bool,
+    /// The cursor where the row's first cell started.
+    start: PageMark,
     started_on_occupied_strip: bool,
     max_end_page: u32,
     max_end_cursor_y: f32,
@@ -1882,14 +1862,240 @@ struct RowState {
     _row_top: f32,
     /// Max `location.y + height` seen across cells in this row.
     row_bottom: f32,
-    /// Pages for which a parent fragment has already been emitted this row,
-    /// to avoid duplicate entries when multiple cells cross the same boundary.
-    emitted_parent_pages: BTreeSet<u32>,
     /// True when at least one cell in this row has crossed a page boundary via
     /// recursion. Only in this case do subsequent same-row cells need the full
     /// state-restore (co-split); non-recursion page advances are already handled
     /// by the existing `origin_pending_same_row` mechanism.
     crossed_by_recursion: bool,
+}
+
+impl RowState {
+    /// Records where a cell of the row ended, when it is past every other.
+    fn reach(&mut self, cursor: &PageCursor) {
+        if cursor.page_index > self.max_end_page
+            || (cursor.page_index == self.max_end_page && cursor.cursor_y > self.max_end_cursor_y)
+        {
+            self.max_end_page = cursor.page_index;
+            self.max_end_cursor_y = cursor.cursor_y;
+        }
+    }
+}
+
+/// How tall a walker makes the fragment of its parent on the page it
+/// closes, from the fragment's top (`PageCursor::page_start_y`).
+#[derive(Clone, Copy, Debug)]
+enum ParentHeight {
+    /// Down to the lowest point placed on the page (`PageCursor::cursor_y`).
+    Placed,
+    /// Down to the foot of the page strip.
+    ToFoot,
+    /// A height the walker measured: a child that crossed the page.
+    Measured(f32),
+}
+
+/// The box a nested walk fills, whose fragments [`PageCursor`] closes.
+#[derive(Debug)]
+struct ParentSink {
+    id: usize,
+    x: f32,
+    width: f32,
+    /// While a flex or grid row is open, the pages its cells already closed
+    /// the parent on when they moved on: cells that leave the same page
+    /// close it once.
+    row_pages: Option<BTreeSet<u32>>,
+}
+
+/// The parts of a [`PageCursor`] a flex or grid row restores for each of
+/// its cells, so that each starts where the row's first cell did.
+#[derive(Clone, Copy, Debug)]
+struct PageMark {
+    page_index: u32,
+    cursor_y: f32,
+    page_start_y: f32,
+    page_taffy_origin: f32,
+    entered_below_content: bool,
+}
+
+/// A walker's place in the page sequence: the page it fills, the lowest
+/// point placed on it, and, for a nested walk, its parent's fragment on
+/// that page. Every move to the next page goes through [`Self::advance`],
+/// and every fragment of the parent through [`Self::close_parent`] or
+/// [`Self::close_parent_once`].
+#[derive(Debug)]
+struct PageCursor {
+    page_index: u32,
+    /// The lowest point placed on the page, in page-strip coordinates.
+    cursor_y: f32,
+    /// Where the parent's fragment on this page starts.
+    page_start_y: f32,
+    /// The parent-relative layout y placed at `page_start_y` (fulgur-kv0r):
+    /// a child's page y is `page_start_y + (location.y - page_taffy_origin)`.
+    page_taffy_origin: f32,
+    /// The walk entered on a page holding content above it, and has not
+    /// placed its first child yet (the first row's cells, side by side,
+    /// each start so).
+    entered_below_content: bool,
+    /// The height of the page strip the walk fills.
+    page_height_px: f32,
+    parent: Option<ParentSink>,
+}
+
+impl PageCursor {
+    /// A cursor at `cursor_y` on `page_index`, closing no parent.
+    fn new(page_index: u32, cursor_y: f32, page_height_px: f32) -> Self {
+        Self {
+            page_index,
+            cursor_y,
+            page_start_y: cursor_y,
+            page_taffy_origin: 0.0,
+            entered_below_content: false,
+            page_height_px,
+            parent: None,
+        }
+    }
+
+    /// Moves to the top of the next page.
+    fn advance(&mut self) {
+        self.page_index += 1;
+        self.cursor_y = 0.0;
+        self.page_start_y = 0.0;
+    }
+
+    /// Moves on to the page of `side` when this page is not on it (a side
+    /// break, [`page_on_side`]).
+    fn move_to_side(&mut self, doc: &BaseDocument, side: Option<crate::draw_primitives::PageSide>) {
+        self.page_index = page_on_side(doc, self.page_index, side);
+    }
+
+    /// A forced break: moves to the next page, then on to `side`'s.
+    fn break_to(&mut self, doc: &BaseDocument, side: Option<crate::draw_primitives::PageSide>) {
+        self.advance();
+        self.move_to_side(doc, side);
+    }
+
+    fn mark(&self) -> PageMark {
+        PageMark {
+            page_index: self.page_index,
+            cursor_y: self.cursor_y,
+            page_start_y: self.page_start_y,
+            page_taffy_origin: self.page_taffy_origin,
+            entered_below_content: self.entered_below_content,
+        }
+    }
+
+    fn restore(&mut self, mark: PageMark) {
+        self.page_index = mark.page_index;
+        self.cursor_y = mark.cursor_y;
+        self.page_start_y = mark.page_start_y;
+        self.page_taffy_origin = mark.page_taffy_origin;
+        self.entered_below_content = mark.entered_below_content;
+    }
+
+    /// Opens a flex or grid row: until [`Self::close_row`], the parent is
+    /// closed once per page by [`Self::close_parent_once`].
+    fn open_row(&mut self) {
+        if let Some(parent) = &mut self.parent {
+            parent.row_pages = Some(BTreeSet::new());
+        }
+    }
+
+    fn close_row(&mut self) {
+        if let Some(parent) = &mut self.parent {
+            parent.row_pages = None;
+        }
+    }
+
+    fn parent_height(&self, height: ParentHeight) -> f32 {
+        match height {
+            ParentHeight::Placed => self.cursor_y - self.page_start_y,
+            ParentHeight::ToFoot => (self.page_height_px - self.page_start_y).max(0.0),
+            ParentHeight::Measured(height) => height,
+        }
+    }
+
+    fn push_parent(
+        &self,
+        geometry: &mut PaginationGeometryTable,
+        page_index: u32,
+        y: f32,
+        height: f32,
+    ) {
+        let Some(parent) = &self.parent else {
+            return;
+        };
+        geometry
+            .entry(parent.id)
+            .or_default()
+            .fragments
+            .push(Fragment {
+                page_index,
+                x: parent.x.as_px(),
+                y: y.as_px(),
+                width: parent.width.as_px(),
+                height: height.as_px(),
+            });
+    }
+
+    /// Closes the parent's fragment on this page.
+    fn close_parent(&self, geometry: &mut PaginationGeometryTable, height: ParentHeight) {
+        self.push_parent(
+            geometry,
+            self.page_index,
+            self.page_start_y,
+            self.parent_height(height),
+        );
+    }
+
+    /// Closes the parent's fragment on this page unless a cell of the open
+    /// row already did; returns whether it did now.
+    fn close_parent_once(
+        &mut self,
+        geometry: &mut PaginationGeometryTable,
+        height: ParentHeight,
+    ) -> bool {
+        let page_index = self.page_index;
+        let first = self
+            .parent
+            .as_mut()
+            .and_then(|parent| parent.row_pages.as_mut())
+            .is_none_or(|pages| pages.insert(page_index));
+        if first {
+            self.close_parent(geometry, height);
+        }
+        first
+    }
+
+    /// Grows the parent's fragment on this page, closed already by a cell
+    /// of the open row, to `height` at least.
+    fn grow_parent(&self, geometry: &mut PaginationGeometryTable, height: f32) {
+        let Some(parent) = &self.parent else {
+            return;
+        };
+        if let Some(fragment) = geometry
+            .entry(parent.id)
+            .or_default()
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.page_index == self.page_index)
+        {
+            fragment.height = fragment.height.to_f32().max(height).as_px();
+        }
+    }
+
+    /// Gives the parent a full-strip fragment on each page after this one
+    /// and before `end_page`, which a child crossed, once per open row.
+    fn fill_parent_pages(&mut self, geometry: &mut PaginationGeometryTable, end_page: u32) {
+        for page_index in (self.page_index + 1)..end_page {
+            let first = self
+                .parent
+                .as_mut()
+                .and_then(|parent| parent.row_pages.as_mut())
+                .is_none_or(|pages| pages.insert(page_index));
+            if first {
+                self.push_parent(geometry, page_index, 0.0, self.page_height_px);
+            }
+        }
+    }
 }
 
 /// The bottom edge, in its table's coordinates, of the table row that `cell`
@@ -2421,7 +2627,7 @@ fn fragment_block_subtree(
     cursor_in: f32,
     page_height_px: f32,
     depth: usize,
-    initial_page_occupied: bool,
+    entered_below_content: bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
@@ -2441,7 +2647,7 @@ fn fragment_block_subtree(
             cursor_in,
             page_height_px,
             depth,
-            initial_page_occupied,
+            entered_below_content,
             remaining_repeat_budget,
             lifted,
         );
@@ -2459,7 +2665,7 @@ fn fragment_block_subtree(
             cursor_in,
             page_height_px,
             depth,
-            initial_page_occupied,
+            entered_below_content,
             remaining_repeat_budget,
             lifted,
             content_top,
@@ -2480,7 +2686,7 @@ fn fragment_block_subtree(
         None,
         0.0,
         false,
-        initial_page_occupied,
+        entered_below_content,
         remaining_repeat_budget,
         lifted,
     )
@@ -2525,7 +2731,7 @@ fn fragment_table_cell(
     cursor_in: f32,
     page_height_px: f32,
     depth: usize,
-    initial_page_occupied: bool,
+    entered_below_content: bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
     content_top: f32,
@@ -2546,7 +2752,7 @@ fn fragment_table_cell(
         None,
         0.0,
         false,
-        initial_page_occupied,
+        entered_below_content,
         remaining_repeat_budget,
         lifted,
     );
@@ -2732,7 +2938,7 @@ fn fragment_repeating_table(
     cursor_in: f32,
     page_height_px: f32,
     depth: usize,
-    initial_page_occupied: bool,
+    entered_below_content: bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
@@ -2756,7 +2962,7 @@ fn fragment_repeating_table(
             None,
             0.0,
             false,
-            initial_page_occupied,
+            entered_below_content,
             remaining_repeat_budget,
             lifted,
         );
@@ -3030,10 +3236,36 @@ fn fragment_block_subtree_inner(
     children_override: Option<&[usize]>,
     initial_taffy_origin: f32,
     co_split_rows: bool,
-    mut initial_page_occupied: bool,
+    entered_below_content: bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
+    // The parent's fragment on each page starts at the cursor's
+    // `page_start_y`: the walk closes one and starts the next each time it
+    // crosses a page boundary. fulgur-kv0r: `page_taffy_origin` is the
+    // parent-relative y of the first in-flow child on the current page
+    // strip. Taffy's `layout.location.y` is in the parent's full coordinate
+    // system (same value across page splits); each child's page-local y
+    // becomes `page_start_y + (this_top_in_parent - page_taffy_origin)`,
+    // which gives:
+    // - block siblings: sequential placement (same as cursor-advance)
+    // - grid / flex parallel siblings: same y (Taffy reports same
+    //   `location.y` for cards in the same row, so the offset
+    //   collapses to the row's first y).
+    let mut cursor = PageCursor {
+        page_index: page_in,
+        cursor_y: cursor_in,
+        page_start_y: cursor_in,
+        page_taffy_origin: initial_taffy_origin,
+        entered_below_content,
+        page_height_px,
+        parent: Some(ParentSink {
+            id: parent_id,
+            x: parent_x_in_body,
+            width: parent_w,
+            row_pages: None,
+        }),
+    };
     if depth >= crate::MAX_DOM_DEPTH {
         // Bailed: emit a single whole-fragment for the parent at its
         // entry coordinates so geometry still has an entry for it.
@@ -3041,40 +3273,12 @@ fn fragment_block_subtree_inner(
             .get_node(parent_id)
             .map(|n| n.final_layout.size.height)
             .unwrap_or(0.0);
-        geometry
-            .entry(parent_id)
-            .or_default()
-            .fragments
-            .push(Fragment {
-                page_index: page_in,
-                x: parent_x_in_body.as_px(),
-                y: cursor_in.as_px(),
-                width: parent_w.as_px(),
-                height: h.as_px(),
-            });
+        cursor.close_parent(geometry, ParentHeight::Measured(h));
         return (page_in, cursor_in + h);
     }
     let Some(parent) = doc.get_node(parent_id) else {
         return (page_in, cursor_in);
     };
-
-    let mut page_index = page_in;
-    let mut cursor_y = cursor_in;
-    // Y on `page_index` where the parent's current-page fragment
-    // starts. We close one parent fragment and start a new one each
-    // time we cross a page boundary.
-    let mut page_start_y = cursor_in;
-    // fulgur-kv0r: parent-relative y of the first in-flow child on
-    // the current page strip. Taffy's `layout.location.y` is in the
-    // parent's full coordinate system (same value across page
-    // splits); each child's page-local y becomes
-    // `page_start_y + (this_top_in_parent - page_taffy_origin)`,
-    // which gives:
-    // - block siblings: sequential placement (same as cursor-advance)
-    // - grid / flex parallel siblings: same y (Taffy reports same
-    //   `location.y` for cards in the same row, so the offset
-    //   collapses to the row's first y).
-    let mut page_taffy_origin = initial_taffy_origin;
     // The lift of the children that ended on their page, which moved the
     // siblings after them up: the parent ends that much higher too.
     let mut own_lift = 0.0_f32;
@@ -3225,11 +3429,7 @@ fn fragment_block_subtree_inner(
                         // that puts THIS cell at the correct row-start y, and the
                         // previous cell's pending origin would incorrectly shift
                         // page_taffy_origin again.
-                        page_index = rs.start_page;
-                        cursor_y = rs.start_cursor_y;
-                        page_start_y = rs.start_page_start_y;
-                        page_taffy_origin = rs.start_page_taffy_origin;
-                        initial_page_occupied = rs.start_initial_page_occupied;
+                        cursor.restore(rs.start);
                         origin_pending_target_y = None;
                         origin_pending_same_row = None;
                     }
@@ -3242,14 +3442,14 @@ fn fragment_block_subtree_inner(
                     // New row: advance outer cursor to the max end reached
                     // across all cells in the previous row.
                     let rs = row_state.take().unwrap();
-                    page_index = rs.max_end_page;
-                    cursor_y = rs.max_end_cursor_y;
-                    if rs.max_end_page > rs.start_page {
-                        page_start_y = 0.0;
+                    cursor.page_index = rs.max_end_page;
+                    cursor.cursor_y = rs.max_end_cursor_y;
+                    if rs.max_end_page > rs.start.page_index {
+                        cursor.page_start_y = 0.0;
                         origin_pending_target_y = Some(rs.max_end_cursor_y);
                         origin_pending_same_row = None;
                     } else {
-                        page_start_y = rs.start_page_start_y;
+                        cursor.page_start_y = rs.start.page_start_y;
                     }
                 }
                 None => {}
@@ -3257,19 +3457,15 @@ fn fragment_block_subtree_inner(
             if row_state.is_none() {
                 // First cell in a new row: snapshot current state.
                 row_state = Some(RowState {
-                    start_page: page_index,
-                    start_cursor_y: cursor_y,
-                    start_page_start_y: page_start_y,
-                    start_page_taffy_origin: page_taffy_origin,
-                    start_initial_page_occupied: initial_page_occupied,
-                    started_on_occupied_strip: initial_page_occupied,
-                    max_end_page: page_index,
-                    max_end_cursor_y: cursor_y,
+                    start: cursor.mark(),
+                    started_on_occupied_strip: cursor.entered_below_content,
+                    max_end_page: cursor.page_index,
+                    max_end_cursor_y: cursor.cursor_y,
                     _row_top: this_top_in_parent,
                     row_bottom: this_top_in_parent + child_h,
-                    emitted_parent_pages: BTreeSet::new(),
                     crossed_by_recursion: false,
                 });
+                cursor.open_row();
             } else if let Some(ref mut rs) = row_state {
                 rs.row_bottom = rs.row_bottom.max(this_top_in_parent + child_h);
             }
@@ -3281,7 +3477,7 @@ fn fragment_block_subtree_inner(
             {
                 target_y = same_row_y + (this_top_in_parent - row_top);
             }
-            page_taffy_origin = this_top_in_parent - (target_y - page_start_y);
+            cursor.page_taffy_origin = this_top_in_parent - (target_y - cursor.page_start_y);
         }
 
         if child_h <= 0.0 {
@@ -3293,31 +3489,19 @@ fn fragment_block_subtree_inner(
             // `fragment_pagination_root`'s zero-height branch where
             // `continue` happens before the gap calc), so break-before
             // can fire here without first folding gap into cursor_y.
-            if break_before_page && cursor_y > page_start_y {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-                page_index = page_on_side(doc, page_index + 1, break_props.break_before_side);
-                cursor_y = 0.0;
-                page_start_y = 0.0;
+            if break_before_page && cursor.cursor_y > cursor.page_start_y {
+                cursor.close_parent(geometry, ParentHeight::Placed);
+                cursor.break_to(doc, break_props.break_before_side);
                 // Zero-height break-before: this child IS the first
                 // on the new page — apply origin rebase eagerly.
-                page_taffy_origin = this_top_in_parent;
+                cursor.page_taffy_origin = this_top_in_parent;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
             } else if !suppress_page_check
-                && !initial_page_occupied
-                && page_index > 0
-                && cursor_y <= 0.0
+                && !cursor.entered_below_content
+                && cursor.page_index > 0
+                && cursor.cursor_y <= 0.0
             {
-                page_index = page_on_side(doc, page_index, break_props.break_before_side);
+                cursor.move_to_side(doc, break_props.break_before_side);
             }
             if child.element_data().is_some() {
                 geometry
@@ -3325,9 +3509,9 @@ fn fragment_block_subtree_inner(
                     .or_default()
                     .fragments
                     .push(Fragment {
-                        page_index,
+                        page_index: cursor.page_index,
                         x: (parent_x_in_body + layout.location.x).as_px(),
-                        y: cursor_y.as_px(),
+                        y: cursor.cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: 0.0_f32.as_px(),
                     });
@@ -3336,23 +3520,12 @@ fn fragment_block_subtree_inner(
             // too — same fulgur-p3uf (Phase 3.1.5a) fix as
             // `fragment_pagination_root`'s zero-height branch.
             if break_after_page {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
-                cursor_y = 0.0;
-                page_start_y = 0.0;
+                cursor.close_parent(geometry, ParentHeight::Placed);
+                cursor.break_to(doc, break_props.break_after_side);
                 // Zero-height break-after: NEXT child is the first
                 // on the new page — defer origin rebase.
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                (origin_pending_target_y, origin_pending_same_row) =
+                    (Some(cursor.page_start_y), None);
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -3368,48 +3541,37 @@ fn fragment_block_subtree_inner(
         // y. For grid / flex parallel siblings (same `location.y`),
         // this places them at the same page-local y; for sequential
         // block flow, it matches Taffy's stacked positions exactly.
-        let mut child_page_y = page_start_y + (this_top_in_parent - page_taffy_origin);
+        let mut child_page_y =
+            cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin);
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
         // `gap + child_h`; for grid parallel siblings the cursor
         // tracks the row's max bottom (so break-before / overflow
         // checks see the full row height).
-        cursor_y = cursor_y.max(child_page_y);
+        cursor.cursor_y = cursor.cursor_y.max(child_page_y);
 
         // Honour `break-before: page`. Leading collapse: only fires
         // when some content has already been placed on this page —
         // gated by `cursor_y > page_start_y` (mirrors body-level's
         // `cursor_y > 0.0` since body's implicit page_start is 0).
-        if break_before_page && cursor_y > page_start_y {
-            geometry
-                .entry(parent_id)
-                .or_default()
-                .fragments
-                .push(Fragment {
-                    page_index,
-                    x: parent_x_in_body.as_px(),
-                    y: page_start_y.as_px(),
-                    width: parent_w.as_px(),
-                    height: (cursor_y - page_start_y).as_px(),
-                });
-            page_index = page_on_side(doc, page_index + 1, break_props.break_before_side);
-            cursor_y = 0.0;
-            page_start_y = 0.0;
+        if break_before_page && cursor.cursor_y > cursor.page_start_y {
+            cursor.close_parent(geometry, ParentHeight::Placed);
+            cursor.break_to(doc, break_props.break_before_side);
             // The breaking child is the first in-flow child on the
             // new page strip. Rebase the Taffy origin to its
             // `this_top_in_parent` so it lands at `page_start_y` (= 0)
             // — discarding the inter-child gap, matching CSS 3
             // Fragmentation §3 (margins at forced breaks truncate).
-            page_taffy_origin = this_top_in_parent;
+            cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
         } else if !suppress_page_check
-            && !initial_page_occupied
-            && page_index > 0
-            && cursor_y <= 0.0
+            && !cursor.entered_below_content
+            && cursor.page_index > 0
+            && cursor.cursor_y <= 0.0
         {
             // Nothing is placed on this page yet, here or above: a side
             // break only moves on to its side, as at the body level.
-            page_index = page_on_side(doc, page_index, break_props.break_before_side);
+            cursor.move_to_side(doc, break_props.break_before_side);
         }
 
         // (Strip-overflow page cut moved below the recursion gate as
@@ -3458,30 +3620,13 @@ fn fragment_block_subtree_inner(
                 page_height_px,
             )
         {
-            let should_emit = cursor_y > page_start_y
-                && row_state
-                    .as_mut()
-                    .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                    .unwrap_or(true);
-            if should_emit {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
+            if cursor.cursor_y > cursor.page_start_y {
+                cursor.close_parent_once(geometry, ParentHeight::Placed);
             }
-            page_index += 1;
-            cursor_y = 0.0;
-            page_start_y = 0.0;
-            page_taffy_origin = this_top_in_parent;
+            cursor.advance();
+            cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
-            initial_page_occupied = false;
+            cursor.entered_below_content = false;
         }
         // A child taller than a page is not kept whole: it splits between
         // its lines, as at the body level, instead of being placed as one
@@ -3531,7 +3676,7 @@ fn fragment_block_subtree_inner(
             // splitting further. Using `pre_split_page` there instead
             // would miss the split-before-only case, since `pre_split_page`
             // is captured *after* that advance.
-            let entry_page_index = page_index;
+            let entry_page_index = cursor.page_index;
             // codex P1: compare against `child_page_y` (this child's
             // own row-local start), not `cursor_y` — for a later
             // grid/flex row cell, `cursor_y` is the previous cell's row
@@ -3541,50 +3686,35 @@ fn fragment_block_subtree_inner(
             // "is there real content already on this page" (the
             // fulgur-2s7p.1 first-child exemption), which `cursor_y`
             // correctly proxies for regardless of row position.
-            if cursor_y > page_start_y
+            if cursor.cursor_y > cursor.page_start_y
                 && moves_whole_at_foot(&line_metrics, child_page_y, page_height_px, limits)
             {
-                let should_emit = row_state
-                    .as_mut()
-                    .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                    .unwrap_or(true);
-                if should_emit {
-                    geometry
-                        .entry(parent_id)
-                        .or_default()
-                        .fragments
-                        .push(Fragment {
-                            page_index,
-                            x: parent_x_in_body.as_px(),
-                            y: page_start_y.as_px(),
-                            width: parent_w.as_px(),
-                            // Only widen to the full page strip when we're
-                            // actually inside a grid/flex row
-                            // (`row_state.is_some()`, gated the same way
-                            // `should_emit` above is): a later same-row
-                            // sibling cell can restore this same page
-                            // (`origin_pending_same_row`) and paint past
-                            // `cursor_y`, so the parent fragment must
-                            // already cover the whole strip to avoid a gap
-                            // under that restored content. Outside a row
-                            // context (plain block flow — the common case,
-                            // e.g. a `break-inside:avoid` block pushed to a
-                            // fresh page) there is no such later sibling, so
-                            // stretching to the full remaining page height
-                            // is wrong: it paints the parent's background
-                            // far past its actual content and pushes
-                            // whatever comes after it onto a spurious extra
-                            // page (confirmed regression in
-                            // examples/break-inside via PR #741).
-                            height: if row_state.is_some() {
-                                (page_height_px - page_start_y).max(0.0).as_px()
-                            } else {
-                                (cursor_y - page_start_y).as_px()
-                            },
-                        });
-                }
-                page_index += 1;
-                page_start_y = 0.0;
+                // Only widen to the full page strip when we're actually
+                // inside a grid/flex row (`row_state.is_some()`, whose open
+                // row closes the parent once a page): a later same-row
+                // sibling cell can restore this same page
+                // (`origin_pending_same_row`) and paint past `cursor_y`, so
+                // the parent fragment must already cover the whole strip to
+                // avoid a gap under that restored content. Outside a row
+                // context (plain block flow — the common case, e.g. a
+                // `break-inside:avoid` block pushed to a fresh page) there is
+                // no such later sibling, so stretching to the full remaining
+                // page height is wrong: it paints the parent's background far
+                // past its actual content and pushes whatever comes after it
+                // onto a spurious extra page (confirmed regression in
+                // examples/break-inside via PR #741).
+                let height = if row_state.is_some() {
+                    ParentHeight::ToFoot
+                } else {
+                    ParentHeight::Placed
+                };
+                cursor.close_parent_once(geometry, height);
+                // The cursor keeps the lowest point placed on the page left
+                // behind: the row's cells beside this one may return to it
+                // (see the `cursor_y` choice below).
+                let left_behind = cursor.cursor_y;
+                cursor.advance();
+                cursor.cursor_y = left_behind;
                 // codex P1 (fulgur-2s7p.1 follow-up): this child is
                 // the first in-flow child on the new page strip —
                 // rebase `page_taffy_origin` to its own top, mirroring
@@ -3594,10 +3724,10 @@ fn fragment_block_subtree_inner(
                 // same-row / origin-pending bookkeeping is skipped and
                 // the next sibling computes `child_page_y` from the
                 // stale pre-advance origin.
-                page_taffy_origin = this_top_in_parent;
+                cursor.page_taffy_origin = this_top_in_parent;
                 child_page_y = 0.0;
             }
-            let pre_split_page = page_index;
+            let pre_split_page = cursor.page_index;
             // codex P1: start from `child_page_y` (this child's own
             // rebased page-local y), not the parent's running
             // `cursor_y` — for block flow the two are equal, but for
@@ -3605,17 +3735,17 @@ fn fragment_block_subtree_inner(
             // previous sibling's row bottom while `child_page_y` is
             // this cell's row-local start (fulgur-u0p0, mirrored from
             // the recursion branch below).
-            let (new_page_index, new_cursor_y, split_frag_count) = fragment_inline_root(
+            let mut paragraph = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
+            let split_frag_count = fragment_inline_root(
                 geometry,
                 child_id,
                 child_x_in_body,
                 child_w,
-                child_page_y,
-                page_index,
-                page_height_px,
+                &mut paragraph,
                 &line_metrics,
                 limits,
             );
+            let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
             record_inline_root_descendants(
                 geometry,
                 doc,
@@ -3628,46 +3758,11 @@ fn fragment_block_subtree_inner(
             // crossed, the parent's own background / border would
             // disappear from every page but the last.
             if new_page_index > pre_split_page {
-                let first_height = (page_height_px - page_start_y).max(0.0);
-                if first_height > 0.0 {
-                    let should_emit = row_state
-                        .as_mut()
-                        .map(|rs| rs.emitted_parent_pages.insert(pre_split_page))
-                        .unwrap_or(true);
-                    if should_emit {
-                        geometry
-                            .entry(parent_id)
-                            .or_default()
-                            .fragments
-                            .push(Fragment {
-                                page_index: pre_split_page,
-                                x: parent_x_in_body.as_px(),
-                                y: page_start_y.as_px(),
-                                width: parent_w.as_px(),
-                                height: first_height.as_px(),
-                            });
-                    }
+                if cursor.parent_height(ParentHeight::ToFoot) > 0.0 {
+                    cursor.close_parent_once(geometry, ParentHeight::ToFoot);
                 }
-                for p in (pre_split_page + 1)..new_page_index {
-                    let should_emit = row_state
-                        .as_mut()
-                        .map(|rs| rs.emitted_parent_pages.insert(p))
-                        .unwrap_or(true);
-                    if should_emit {
-                        geometry
-                            .entry(parent_id)
-                            .or_default()
-                            .fragments
-                            .push(Fragment {
-                                page_index: p,
-                                x: parent_x_in_body.as_px(),
-                                y: 0.0_f32.as_px(),
-                                width: parent_w.as_px(),
-                                height: page_height_px.as_px(),
-                            });
-                    }
-                }
-                page_start_y = 0.0;
+                cursor.fill_parent_pages(geometry, new_page_index);
+                cursor.page_start_y = 0.0;
                 origin_pending_target_y = Some(new_cursor_y);
             }
             // CodeRabbit + codex P1: mirror the recursion branch's
@@ -3694,7 +3789,7 @@ fn fragment_block_subtree_inner(
                     rs.crossed_by_recursion = true;
                 }
             }
-            page_index = new_page_index;
+            cursor.page_index = new_page_index;
             // codex P2: mirror the recursion branch's fulgur-u0p0
             // cursor handling — when `fragment_inline_root` stayed on
             // the same page (`new_page_index == pre_split_page`) AND
@@ -3737,43 +3832,27 @@ fn fragment_block_subtree_inner(
             // (`pre_split_page == entry_page_index`), i.e. this is
             // genuinely a later cell still being placed on the row's
             // already-current page.
-            cursor_y = if new_page_index == pre_split_page {
+            cursor.cursor_y = if new_page_index == pre_split_page {
                 if row_state.is_some() && pre_split_page == entry_page_index {
-                    cursor_y.max(new_cursor_y)
+                    cursor.cursor_y.max(new_cursor_y)
                 } else {
                     new_cursor_y
                 }
             } else {
                 new_cursor_y
             };
-            initial_page_occupied = false;
+            cursor.entered_below_content = false;
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
             if break_after_page {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
-                cursor_y = 0.0;
-                page_start_y = 0.0;
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                cursor.close_parent(geometry, ParentHeight::Placed);
+                cursor.break_to(doc, break_props.break_after_side);
+                (origin_pending_target_y, origin_pending_same_row) =
+                    (Some(cursor.page_start_y), None);
             }
             if let Some(ref mut rs) = row_state {
-                if page_index > rs.max_end_page
-                    || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-                {
-                    rs.max_end_page = page_index;
-                    rs.max_end_cursor_y = cursor_y;
-                }
+                rs.reach(&cursor);
             }
             continue;
         }
@@ -3791,7 +3870,7 @@ fn fragment_block_subtree_inner(
         // against the "parent CSS height > children sum" case where
         // recursion would emit a parent fragment shorter than
         // expected.
-        let available_strip = (page_height_px - cursor_y).max(0.0);
+        let available_strip = (page_height_px - cursor.cursor_y).max(0.0);
         // fulgur-7hf5: see body-direct branch — multicol containers
         // are atomic from the fragmenter's perspective.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
@@ -3831,42 +3910,25 @@ fn fragment_block_subtree_inner(
         // row kept whole is moved with its row instead.
         if needs_recursion
             && kept_row_bottom.is_none()
-            && (child_page_y > page_start_y || (initial_page_occupied && page_index == page_in))
+            && (child_page_y > cursor.page_start_y
+                || (cursor.entered_below_content && cursor.page_index == page_in))
             && ((!forced && avoid_fits_whole_page && child_page_y + child_h > page_height_px)
                 || opening_whole_box_bottom(doc, column_styles, child, page_height_px, depth + 1)
                     .is_some_and(|bottom| child_page_y + bottom > page_height_px))
         {
-            let should_emit = row_state
-                .as_mut()
-                .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                .unwrap_or(true);
-            if should_emit {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-            }
-            page_index += 1;
-            cursor_y = 0.0;
-            page_start_y = 0.0;
-            page_taffy_origin = this_top_in_parent;
+            cursor.close_parent_once(geometry, ParentHeight::Placed);
+            cursor.advance();
+            cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
-            initial_page_occupied = false;
+            cursor.entered_below_content = false;
         }
         if needs_recursion {
-            let occupied_before_recursion = initial_page_occupied;
-            let row_started_on_occupied_strip = row_state
-                .as_ref()
-                .is_some_and(|rs| rs.started_on_occupied_strip && rs.start_page == page_index);
-            let pre_recursion_page = page_index;
-            let pre_recursion_cursor_y = cursor_y;
+            let occupied_before_recursion = cursor.entered_below_content;
+            let row_started_on_occupied_strip = row_state.as_ref().is_some_and(|rs| {
+                rs.started_on_occupied_strip && rs.start.page_index == cursor.page_index
+            });
+            let pre_recursion_page = cursor.page_index;
+            let pre_recursion_cursor_y = cursor.cursor_y;
             // fulgur-u0p0: enter recursion from `child_page_y` (the rebased
             // page-local y of THIS child) instead of the parent's running
             // `cursor_y`. For block flow, `child_page_y == cursor_y` after
@@ -3886,11 +3948,11 @@ fn fragment_block_subtree_inner(
                 child_id,
                 child_w,
                 child_x_in_body,
-                page_index,
+                cursor.page_index,
                 child_page_y,
                 page_height_px,
                 depth + 1,
-                initial_page_occupied,
+                cursor.entered_below_content,
                 remaining_repeat_budget,
                 &mut child_lift,
             );
@@ -3901,49 +3963,30 @@ fn fragment_block_subtree_inner(
                     doc,
                     child_id,
                     pre_recursion_page,
-                    page_start_y,
+                    cursor.page_start_y,
                     depth + 1,
                 )
                 .max(0.0)
             } else {
                 0.0
             };
-            // `start_initial_page_occupied` records whether the page was
-            // already occupied when the ROW began, and every cell of that row
-            // restores from it (see the `allow_same_row_rebase` branch). It is
-            // a per-row constant, so a child consuming the strip must not
-            // clear it: doing so left the row's second and later cells
-            // believing they started on an empty page, skipping the
-            // occupied-strip page-break check and painting past the page
+            // The row's `start.entered_below_content` records whether the
+            // page was already occupied when the ROW began, and every cell of
+            // that row restores from it (see the `allow_same_row_rebase`
+            // branch). It is a per-row constant, so a child consuming the
+            // strip must not clear it: doing so left the row's second and
+            // later cells believing they started on an empty page, skipping
+            // the occupied-strip page-break check and painting past the page
             // bottom (fulgur-naj7.3: measured right-tall = [(0, y=80, h=30)],
             // bottom 110 on a 100px page, while the row's left cell had
             // already moved to page 1).
-            initial_page_occupied = false;
-            page_index = np;
-            // fulgur-u0p0: when the recursion stayed on the same page,
-            // keep the larger of the parent's existing `cursor_y` (row max
-            // bottom from a previous parallel sibling) and the recursion's
-            // returned `nc`. When the recursion crossed pages, the previous
-            // page's `cursor_y` is stale — adopt `nc` directly.
-            cursor_y = if np == pre_recursion_page {
-                cursor_y.max(nc)
-            } else {
-                nc
-            };
-            // A child that ended on this page higher than its layout box (a
-            // table without its skipped header rows) takes the siblings
-            // after it up with it, here and, through `lifted`, in the
-            // parent's own siblings. Cells side by side in a row are not
-            // moved: the row's height is not this child's alone.
-            if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
-                page_taffy_origin += child_lift;
-                own_lift += child_lift;
-            }
+            cursor.entered_below_content = false;
             // If the recursion crossed a boundary, the parent's
             // current-page fragment must restart at y=0 on the new
             // page. Defensive `nc < page_start_y` guards against
             // backward cursor returns (impossible in normal flow).
-            if page_index != pre_recursion_page || nc < page_start_y {
+            let crossed = np != pre_recursion_page || nc < cursor.page_start_y;
+            if np > pre_recursion_page {
                 // fulgur-oc51: emit parent fragments for every
                 // page span the recursion crossed. Without this,
                 // only the trailing close at the end of this
@@ -3962,75 +4005,55 @@ fn fragment_block_subtree_inner(
                 // page), so the previous-page fragment spans
                 // `[page_start_y, page_height_px]` and any
                 // intermediate page is a full strip.
-                if page_index > pre_recursion_page {
-                    // Match the no-recursion strip-overflow shape
-                    // (line ~1713): the parent fragment's height is
-                    // its accumulated logical content on the
-                    // previous page, treated as if the splitting
-                    // child had been laid out in full (without
-                    // fragmentation). The renderer clips the
-                    // overflow visually. Using the visible page
-                    // strip (`page_height_px - page_start_y`)
-                    // instead would stop short of the page's
-                    // margin-area paint that adjacent passing tests
-                    // (mo-006/008) expect.
-                    let prev_height = if occupied_before_recursion || row_started_on_occupied_strip
-                    {
-                        occupied_page_extent
-                    } else {
-                        let logical_height =
-                            (pre_recursion_cursor_y + child_h - page_start_y).max(0.0);
-                        logical_height.max((page_height_px - page_start_y).max(0.0))
-                    };
-                    if prev_height > 0.0 {
-                        let should_emit = row_state
-                            .as_mut()
-                            .map(|rs| rs.emitted_parent_pages.insert(pre_recursion_page))
-                            .unwrap_or(true);
-                        if should_emit {
-                            geometry
-                                .entry(parent_id)
-                                .or_default()
-                                .fragments
-                                .push(Fragment {
-                                    page_index: pre_recursion_page,
-                                    x: parent_x_in_body.as_px(),
-                                    y: page_start_y.as_px(),
-                                    width: parent_w.as_px(),
-                                    height: prev_height.as_px(),
-                                });
-                        } else if let Some(fragment) = geometry
-                            .entry(parent_id)
-                            .or_default()
-                            .fragments
-                            .iter_mut()
-                            .find(|fragment| fragment.page_index == pre_recursion_page)
-                        {
-                            fragment.height = fragment.height.to_f32().max(prev_height).as_px();
-                        }
-                    }
-                    for p in (pre_recursion_page + 1)..page_index {
-                        let should_emit = row_state
-                            .as_mut()
-                            .map(|rs| rs.emitted_parent_pages.insert(p))
-                            .unwrap_or(true);
-                        if should_emit {
-                            geometry
-                                .entry(parent_id)
-                                .or_default()
-                                .fragments
-                                .push(Fragment {
-                                    page_index: p,
-                                    x: parent_x_in_body.as_px(),
-                                    y: 0.0_f32.as_px(),
-                                    width: parent_w.as_px(),
-                                    height: page_height_px.as_px(),
-                                });
-                        }
-                    }
+                //
+                // Match the no-recursion strip-overflow shape
+                // (line ~1713): the parent fragment's height is
+                // its accumulated logical content on the
+                // previous page, treated as if the splitting
+                // child had been laid out in full (without
+                // fragmentation). The renderer clips the
+                // overflow visually. Using the visible page
+                // strip (`page_height_px - page_start_y`)
+                // instead would stop short of the page's
+                // margin-area paint that adjacent passing tests
+                // (mo-006/008) expect.
+                let prev_height = if occupied_before_recursion || row_started_on_occupied_strip {
+                    occupied_page_extent
+                } else {
+                    let logical_height =
+                        (pre_recursion_cursor_y + child_h - cursor.page_start_y).max(0.0);
+                    logical_height.max(cursor.parent_height(ParentHeight::ToFoot))
+                };
+                if prev_height > 0.0
+                    && !cursor.close_parent_once(geometry, ParentHeight::Measured(prev_height))
+                {
+                    cursor.grow_parent(geometry, prev_height);
                 }
-                page_start_y = 0.0;
-                origin_pending_target_y = Some(cursor_y);
+                cursor.fill_parent_pages(geometry, np);
+            }
+            cursor.page_index = np;
+            // fulgur-u0p0: when the recursion stayed on the same page,
+            // keep the larger of the parent's existing `cursor_y` (row max
+            // bottom from a previous parallel sibling) and the recursion's
+            // returned `nc`. When the recursion crossed pages, the previous
+            // page's `cursor_y` is stale — adopt `nc` directly.
+            cursor.cursor_y = if np == pre_recursion_page {
+                cursor.cursor_y.max(nc)
+            } else {
+                nc
+            };
+            // A child that ended on this page higher than its layout box (a
+            // table without its skipped header rows) takes the siblings
+            // after it up with it, here and, through `lifted`, in the
+            // parent's own siblings. Cells side by side in a row are not
+            // moved: the row's height is not this child's alone.
+            if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
+                cursor.page_taffy_origin += child_lift;
+                own_lift += child_lift;
+            }
+            if crossed {
+                cursor.page_start_y = 0.0;
+                origin_pending_target_y = Some(cursor.cursor_y);
                 let row_top = this_top_in_parent;
                 let row_bottom = row_top + child_h;
                 origin_pending_same_row =
@@ -4044,32 +4067,16 @@ fn fragment_block_subtree_inner(
 
             // Honour `break-after: page` after recursion.
             if break_after_page {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
-                page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
-                cursor_y = 0.0;
-                page_start_y = 0.0;
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                cursor.close_parent(geometry, ParentHeight::Placed);
+                cursor.break_to(doc, break_props.break_after_side);
+                (origin_pending_target_y, origin_pending_same_row) =
+                    (Some(cursor.page_start_y), None);
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
             if let Some(ref mut rs) = row_state {
-                if page_index > rs.max_end_page
-                    || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-                {
-                    rs.max_end_page = page_index;
-                    rs.max_end_cursor_y = cursor_y;
-                }
+                rs.reach(&cursor);
             }
             continue;
         }
@@ -4088,40 +4095,23 @@ fn fragment_block_subtree_inner(
         let child_extent =
             kept_row_bottom.map_or(child_h, |bottom| child_h.max(bottom - this_top_in_parent));
         let kept_row_moves = kept_row_bottom.is_some() && child_page_y > 0.0;
-        if (child_page_y > page_start_y
-            || (initial_page_occupied && page_index == page_in)
+        if (child_page_y > cursor.page_start_y
+            || (cursor.entered_below_content && cursor.page_index == page_in)
             || kept_row_moves)
             && child_page_y + child_extent > page_height_px
         {
-            let leaves_parent = kept_row_bottom.is_none() || cursor_y > page_start_y;
-            let should_emit = leaves_parent
-                && row_state
-                    .as_mut()
-                    .map(|rs| rs.emitted_parent_pages.insert(page_index))
-                    .unwrap_or(true);
-            if should_emit {
-                geometry
-                    .entry(parent_id)
-                    .or_default()
-                    .fragments
-                    .push(Fragment {
-                        page_index,
-                        x: parent_x_in_body.as_px(),
-                        y: page_start_y.as_px(),
-                        width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
-                    });
+            let leaves_parent = kept_row_bottom.is_none() || cursor.cursor_y > cursor.page_start_y;
+            if leaves_parent {
+                cursor.close_parent_once(geometry, ParentHeight::Placed);
             }
-            page_index += 1;
-            cursor_y = 0.0;
-            page_start_y = 0.0;
+            cursor.advance();
             // Forced to a fresh page: rebase the Taffy origin so the
             // current child lands at page_start_y (= 0) on the new
             // page. Sequential siblings then continue from this point.
-            page_taffy_origin = this_top_in_parent;
+            cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
         }
-        initial_page_occupied = false;
+        cursor.entered_below_content = false;
 
         // Child fits the strip (or is an atomic oversized leaf that
         // simply overflows below the page bottom — with a single
@@ -4133,7 +4123,7 @@ fn fragment_block_subtree_inner(
             .or_default()
             .fragments
             .push(Fragment {
-                page_index,
+                page_index: cursor.page_index,
                 x: child_x_in_body.as_px(),
                 y: child_page_y.as_px(),
                 width: child_w.as_px(),
@@ -4143,7 +4133,7 @@ fn fragment_block_subtree_inner(
             geometry,
             doc,
             child_id,
-            page_index,
+            cursor.page_index,
             child_page_y,
             child_x_in_body,
             depth + 1,
@@ -4153,47 +4143,31 @@ fn fragment_block_subtree_inner(
         // bottom for grid / flex parents (parallel siblings update
         // `cursor_y` to `max(cursor_y, child_page_y + child_h)` —
         // the per-row max bottom).
-        cursor_y = cursor_y.max(child_page_y + child_h);
+        cursor.cursor_y = cursor.cursor_y.max(child_page_y + child_h);
 
         // Honour `break-after: page` after the child fragment lands
         // (and the descendant walk records same-page entries).
         if break_after_page {
-            geometry
-                .entry(parent_id)
-                .or_default()
-                .fragments
-                .push(Fragment {
-                    page_index,
-                    x: parent_x_in_body.as_px(),
-                    y: page_start_y.as_px(),
-                    width: parent_w.as_px(),
-                    height: (cursor_y - page_start_y).as_px(),
-                });
-            page_index = page_on_side(doc, page_index + 1, break_props.break_after_side);
-            cursor_y = 0.0;
-            page_start_y = 0.0;
-            (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+            cursor.close_parent(geometry, ParentHeight::Placed);
+            cursor.break_to(doc, break_props.break_after_side);
+            (origin_pending_target_y, origin_pending_same_row) = (Some(cursor.page_start_y), None);
         }
         if !is_float {
             prev_used_page = Some(used_end.clone());
         }
         if let Some(ref mut rs) = row_state {
-            if page_index > rs.max_end_page
-                || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-            {
-                rs.max_end_page = page_index;
-                rs.max_end_cursor_y = cursor_y;
-            }
+            rs.reach(&cursor);
         }
     }
 
     // fulgur-ysms: finalize any open row — advance to the max end state
     // reached across all parallel sibling cells.
     if let Some(rs) = row_state.take() {
-        page_index = rs.max_end_page;
-        cursor_y = rs.max_end_cursor_y;
-        if rs.max_end_page > rs.start_page {
-            page_start_y = 0.0;
+        cursor.close_row();
+        cursor.page_index = rs.max_end_page;
+        cursor.cursor_y = rs.max_end_cursor_y;
+        if rs.max_end_page > rs.start.page_index {
+            cursor.page_start_y = 0.0;
         }
     }
 
@@ -4201,8 +4175,10 @@ fn fragment_block_subtree_inner(
     // page it started on) ends at its own bottom, its padding and border
     // included, less the lift, as it would were it placed whole: the
     // cursor alone stops at its last child.
-    if own_lift > 0.0 && page_index == page_in {
-        cursor_y = cursor_y.max(page_start_y + parent.final_layout.size.height - page_taffy_origin);
+    if own_lift > 0.0 && cursor.page_index == page_in {
+        cursor.cursor_y = cursor
+            .cursor_y
+            .max(cursor.page_start_y + parent.final_layout.size.height - cursor.page_taffy_origin);
     }
 
     // Close the parent's fragment for the final page span. Always
@@ -4213,23 +4189,13 @@ fn fragment_block_subtree_inner(
     // `render.rs`. Height may be 0 when every child was skipped
     // (whitespace / OOF / running) — that's intentional and
     // matches `fragment_pagination_root`'s zero-height-element path.
-    geometry
-        .entry(parent_id)
-        .or_default()
-        .fragments
-        .push(Fragment {
-            page_index,
-            x: parent_x_in_body.as_px(),
-            y: page_start_y.as_px(),
-            width: parent_w.as_px(),
-            height: (cursor_y - page_start_y).as_px(),
-        });
+    cursor.close_parent(geometry, ParentHeight::Placed);
     if own_lift > 0.0 {
         geometry.entry(parent_id).or_default().lift_px = own_lift;
         *lifted += own_lift;
     }
 
-    (page_index, cursor_y)
+    (cursor.page_index, cursor.cursor_y)
 }
 
 /// fulgur-p55h: read per-line `(min_coord, max_coord)` pairs from a
@@ -4350,7 +4316,8 @@ fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Op
 
 /// fulgur-p55h: split a multi-line inline root across page boundaries
 /// at line edges, append one Fragment per page span to the geometry
-/// table, and return the updated `(page_index, cursor_y, fragments_emitted)`.
+/// table, and return the number of fragments emitted. The paragraph starts
+/// at `cursor`, which ends below its last line.
 ///
 /// Walks lines, tracks the first line of the current fragment in
 /// `fragment_start_idx`, and breaks when a line's bottom, in
@@ -4386,24 +4353,21 @@ fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Op
 ///   ending on a partial page leave room for a following sibling).
 /// - `line_boundaries` records the first line of each fragment and ends
 ///   with the total line count.
-#[allow(clippy::too_many_arguments)]
 fn fragment_inline_root(
     geometry: &mut PaginationGeometryTable,
     child_id: usize,
     paragraph_x: f32,
     width: f32,
-    initial_cursor_y: f32,
-    initial_page_index: u32,
-    page_height_px: f32,
+    cursor: &mut PageCursor,
     line_metrics: &[(f32, f32)],
     limits: LineLimits,
-) -> (u32, f32, usize) {
+) -> usize {
     if line_metrics.is_empty() {
-        return (initial_page_index, initial_cursor_y, 0);
+        return 0;
     }
 
-    let mut page_index = initial_page_index;
-    let mut paragraph_top_in_body = initial_cursor_y;
+    // The cursor's `cursor_y` is the top of the fragment being built.
+    let page_height_px = cursor.page_height_px;
     let mut fragment_start_idx: usize = 0;
     let mut emitted = 0usize;
     let total_lines = line_metrics.len();
@@ -4411,7 +4375,7 @@ fn fragment_inline_root(
     let mut i = 0usize;
     while i < total_lines {
         let frag_top_local = line_metrics[fragment_start_idx].0;
-        let projected_bottom_in_body = paragraph_top_in_body + (line_metrics[i].1 - frag_top_local);
+        let projected_bottom_in_body = cursor.cursor_y + (line_metrics[i].1 - frag_top_local);
 
         // codex P1: also refuse to break once the next fragment would land
         // on `MAX_PAGES` — the same bound the oversized-block re-slice loop
@@ -4421,12 +4385,12 @@ fn fragment_inline_root(
         // which feeds `implied_page_count`, driving per-page allocation and
         // rendering — can grow unbounded with the line count instead of
         // being clamped.
-        if projected_bottom_in_body <= page_height_px || page_index + 1 >= crate::MAX_PAGES {
+        if projected_bottom_in_body <= page_height_px || cursor.page_index + 1 >= crate::MAX_PAGES {
             i += 1;
             continue;
         }
 
-        let at_page_top = paragraph_top_in_body <= 0.0;
+        let at_page_top = cursor.cursor_y <= 0.0;
         if i == fragment_start_idx {
             // Not even the first line of this fragment fits.
             if at_page_top {
@@ -4435,8 +4399,7 @@ fn fragment_inline_root(
                 // fragment.
                 i += 1;
             } else {
-                page_index += 1;
-                paragraph_top_in_body = 0.0;
+                cursor.advance();
             }
             continue;
         }
@@ -4452,16 +4415,15 @@ fn fragment_inline_root(
         } else {
             // Break before the fragment instead, and evaluate its lines
             // again on the fresh page.
-            page_index += 1;
-            paragraph_top_in_body = 0.0;
+            cursor.advance();
             continue;
         };
 
         let frag_h = line_metrics[split - 1].1 - frag_top_local;
         let frag = Fragment {
-            page_index,
+            page_index: cursor.page_index,
             x: paragraph_x.as_px(),
-            y: paragraph_top_in_body.as_px(),
+            y: cursor.cursor_y.as_px(),
             width: width.as_px(),
             height: frag_h.as_px(),
         };
@@ -4473,8 +4435,7 @@ fn fragment_inline_root(
         entry.line_boundaries.push(fragment_start_idx);
         emitted += 1;
 
-        page_index += 1;
-        paragraph_top_in_body = 0.0;
+        cursor.advance();
         fragment_start_idx = split;
         // A pulled-back split puts lines the loop already passed into the
         // new fragment, so measure from its first line.
@@ -4486,9 +4447,9 @@ fn fragment_inline_root(
     let last_bottom_local = line_metrics.last().expect("non-empty checked above").1;
     let frag_h = last_bottom_local - frag_top_local;
     let frag = Fragment {
-        page_index,
+        page_index: cursor.page_index,
         x: paragraph_x.as_px(),
-        y: paragraph_top_in_body.as_px(),
+        y: cursor.cursor_y.as_px(),
         width: width.as_px(),
         height: frag_h.as_px(),
     };
@@ -4503,8 +4464,8 @@ fn fragment_inline_root(
     entry.line_boundaries.push(total_lines);
     emitted += 1;
 
-    let cursor_y = paragraph_top_in_body + frag_h;
-    (page_index, cursor_y, emitted)
+    cursor.cursor_y += frag_h;
+    emitted
 }
 
 /// Record geometry for the atomic inlines (`<img>`, `inline-block`) and
@@ -6312,6 +6273,34 @@ mod tests {
         let mut doc = blitz_adapter::parse(html, viewport_w, &fonts);
         blitz_adapter::resolve(&mut doc);
         doc
+    }
+
+    /// Splits `lines` as [`super::fragment_inline_root`] does from
+    /// `cursor_y` on `page_index`, and returns the page and the y the
+    /// paragraph ends at with the number of fragments it emitted.
+    #[allow(clippy::too_many_arguments)]
+    fn split_inline_root(
+        geometry: &mut PaginationGeometryTable,
+        child_id: usize,
+        paragraph_x: f32,
+        width: f32,
+        cursor_y: f32,
+        page_index: u32,
+        page_height_px: f32,
+        lines: &[(f32, f32)],
+        limits: LineLimits,
+    ) -> (u32, f32, usize) {
+        let mut cursor = PageCursor::new(page_index, cursor_y, page_height_px);
+        let emitted = fragment_inline_root(
+            geometry,
+            child_id,
+            paragraph_x,
+            width,
+            &mut cursor,
+            lines,
+            limits,
+        );
+        (cursor.page_index, cursor.cursor_y, emitted)
     }
 
     #[test]
@@ -11061,7 +11050,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200, so naturally we'd split at line 2 (bottom
         // 225 > 200), leaving 1 line in the tail — widow violated.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             /*child_id=*/ 1,
             /*paragraph_x=*/ 0.0,
@@ -11095,7 +11084,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200 → natural split at line 2 (bottom 225 > 200).
         // first_size = 2 ≥ orphans, remaining_size = 2 ≥ widows. Split OK.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0), (225.0, 300.0)];
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -11134,7 +11123,7 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 100 → natural split at line 1 (bottom 150 > 100).
         // first_size = 1 < orphans=2, but the paragraph is at the page top.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, _new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -12673,7 +12662,7 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn fragment_inline_root_empty_line_metrics_returns_early() {
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -12708,7 +12697,7 @@ h2 { string-set: chapter-title content(text); }
         // At i=2 overflow: lines 0-1 fit (80 <= 80), remaining_size=2 → split.
         let lines = vec![(0.0_f32, 25.0), (25.0, 50.0), (50.0, 75.0), (75.0, 100.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             5.0,
@@ -12765,7 +12754,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 50.0, i as f32 * 50.0 + 50.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             7,
             0.0,
@@ -12818,7 +12807,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 10.0, i as f32 * 10.0 + 10.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _new_cursor, _emitted) = super::fragment_inline_root(
+        let (new_page, _new_cursor, _emitted) = split_inline_root(
             &mut geom,
             7,
             0.0,
@@ -12861,7 +12850,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 40.0, i as f32 * 40.0 + 40.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, _new_cursor, emitted) = split_inline_root(
             &mut geom,
             99,
             0.0,
@@ -12889,7 +12878,7 @@ h2 { string-set: chapter-title content(text); }
         // Starts at y=50 on an 80px page; 25px lines end at 75 (fits), 100.
         let lines = vec![(0.0_f32, 25.0), (25.0, 50.0), (50.0, 75.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -12922,7 +12911,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 50.0, i as f32 * 50.0 + 50.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+        let (new_page, new_cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -12950,7 +12939,7 @@ h2 { string-set: chapter-title content(text); }
         // 75px lines on a 100px page: one line fits per page.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _cursor, emitted) = super::fragment_inline_root(
+        let (new_page, _cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -12975,7 +12964,7 @@ h2 { string-set: chapter-title content(text); }
     fn line_taller_than_an_empty_page_is_emitted_alone() {
         let lines = vec![(0.0, 150.0), (150.0, 175.0), (175.0, 200.0)];
         let mut geom = PaginationGeometryTable::new();
-        let (_page, _cursor, emitted) = super::fragment_inline_root(
+        let (_page, _cursor, emitted) = split_inline_root(
             &mut geom,
             1,
             0.0,
@@ -13008,7 +12997,7 @@ h2 { string-set: chapter-title content(text); }
                     .collect();
                 for start in 0..PAGE_H as u32 {
                     let mut geom = PaginationGeometryTable::new();
-                    super::fragment_inline_root(
+                    split_inline_root(
                         &mut geom,
                         1,
                         0.0,
