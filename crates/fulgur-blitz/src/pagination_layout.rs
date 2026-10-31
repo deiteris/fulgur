@@ -5075,9 +5075,7 @@ fn record_subtree_fragments_at_offset(
         cb_size: (f32, f32),
         depth: usize,
         emitted: &mut usize,
-        // The number of pages the slices of the sliced boxes walked so far
-        // reach, budget or not.
-        sliced_pages: &mut u32,
+        sliced: &mut SlicedBoxes,
         running_store: Option<&crate::gcpm::running::RunningElementStore>,
     ) {
         if depth >= crate::MAX_DOM_DEPTH {
@@ -5211,7 +5209,8 @@ fn record_subtree_fragments_at_offset(
             last_page_f = last_page_f.max(first_page_f);
             if is_sliced && last_page_f.is_finite() {
                 let pages = (last_page_f.max(0.0) as u32).min(crate::MAX_PAGES);
-                *sliced_pages = (*sliced_pages).max(pages.saturating_add(1));
+                sliced.pages = sliced.pages.max(pages.saturating_add(1));
+                sliced.boxes.push(node_id);
             }
             // fulgur-xa9q: an abs whose START is at/beyond the existing in-flow
             // page budget extends the page count even with in-flow content
@@ -5297,13 +5296,6 @@ fn record_subtree_fragments_at_offset(
                             -body_offset.1,
                             (h_for_paging - consumed).clamp(0.0, page_h_px),
                         )
-                    } else if is_sliced {
-                        // One slice a page, as block flow slices the box:
-                        // the part of it on this page, from the page top
-                        // after the first.
-                        let top = paging_origin_y.max(page_top);
-                        let bottom = (paging_origin_y + h).min(page_top + page_h_px);
-                        (top - page_top - body_offset.1, (bottom - top).max(0.0))
                     } else {
                         (paging_origin_y - page_top - body_offset.1, h)
                     };
@@ -5446,7 +5438,7 @@ fn record_subtree_fragments_at_offset(
                             child_cb_size,
                             depth + 1,
                             emitted,
-                            sliced_pages,
+                            sliced,
                             running_store,
                         );
                         continue;
@@ -5479,7 +5471,7 @@ fn record_subtree_fragments_at_offset(
                 child_cb_size,
                 depth + 1,
                 emitted,
-                sliced_pages,
+                sliced,
                 running_store,
             );
             flow_bottom =
@@ -5491,11 +5483,11 @@ fn record_subtree_fragments_at_offset(
     }
 
     let emitted_before = *emitted;
-    let mut sliced_pages = 0;
+    let mut sliced = SlicedBoxes::default();
     let walk_within = |geometry: &mut PaginationGeometryTable,
                        emitted: &mut usize,
                        total_pages: u32,
-                       sliced_pages: &mut u32| {
+                       sliced: &mut SlicedBoxes| {
         walk(
             geometry,
             doc,
@@ -5516,20 +5508,54 @@ fn record_subtree_fragments_at_offset(
             (0.0, 0.0),
             0,
             emitted,
-            sliced_pages,
+            sliced,
             running_store,
         )
     };
-    walk_within(geometry, emitted, total_pages, &mut sliced_pages);
+    walk_within(geometry, emitted, total_pages, &mut sliced);
     // The slices of a box block flow would slice take pages past the flow's,
     // as block flow's slices do, and the subtree around them reaches those
     // pages too: walk it again with them in the budget. Each node then emits
     // on at least the pages it did, so every entry of the first walk is
     // rewritten.
-    if !may_extend_pages && sliced_pages > total_pages {
+    if !may_extend_pages && sliced.pages > total_pages {
         *emitted = emitted_before;
-        walk_within(geometry, emitted, sliced_pages, &mut sliced_pages);
+        let budget = sliced.pages;
+        sliced = SlicedBoxes::default();
+        walk_within(geometry, emitted, budget, &mut sliced);
     }
+    // A sliced box, and every box around it up to the subtree's root, has
+    // one fragment a page that ends at the page foot and starts at the page
+    // top after the first, as in block flow; the walk stored each page's
+    // fragment as the whole box moved up by the pages before it.
+    let mut clipped = BTreeSet::new();
+    for id in sliced.boxes {
+        let mut next = Some(id);
+        while let Some(node_id) = next.filter(|&node_id| clipped.insert(node_id)) {
+            if let Some(entry) = geometry.get_mut(&node_id) {
+                for fragment in &mut entry.fragments {
+                    let top = fragment.y.to_f32() + body_offset.1;
+                    let bottom = top + fragment.height.to_f32();
+                    let (top, bottom) = (top.max(0.0), bottom.min(page_h_px));
+                    fragment.y = (top - body_offset.1).as_px();
+                    fragment.height = (bottom - top).max(0.0).as_px();
+                }
+            }
+            next = (node_id != subtree_root_id)
+                .then(|| doc.get_node(node_id))
+                .flatten()
+                .and_then(|node| node.layout_parent.get().or(node.parent));
+        }
+    }
+}
+
+/// The boxes the walk of an absolute subtree sliced
+/// ([`is_monolithic_in_absolute_subtree`]), and the number of pages their
+/// slices reach, budget or not.
+#[derive(Default)]
+struct SlicedBoxes {
+    pages: u32,
+    boxes: Vec<usize>,
 }
 
 /// Which axes of an out-of-flow element carry an explicit (length /
@@ -9333,6 +9359,39 @@ h2 { string-set: chapter-title content(text); }
             .map(|f| (f.0, f.1))
             .collect();
         assert_eq!(after, [(2, 50.0)]);
+    }
+
+    /// The boxes around a sliced box in an absolute subtree have one
+    /// fragment a page that ends at the page foot and starts at the page
+    /// top after the first, as block flow's do, so none paints into the
+    /// page margins.
+    #[test]
+    fn the_boxes_around_a_sliced_box_in_an_absolute_subtree_end_at_each_page_foot() {
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
+              <div id="root" style="position: absolute; top: 0; width: 100%">
+                <div id="wrapper">
+                  <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
+                </div>
+                <p style="margin: 0">after</p>
+              </div>
+            </body></html>"#,
+            1,
+        );
+        let root_h = doc
+            .get_node(find_by_id(&doc, "root").unwrap())
+            .unwrap()
+            .final_layout
+            .size
+            .height;
+        assert_eq!(
+            fragments_of(&doc, &geom, "root"),
+            [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, root_h - 200.0)]
+        );
+        assert_eq!(
+            fragments_of(&doc, &geom, "wrapper"),
+            [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)]
+        );
     }
 
     /// The slices of a tall box in an absolute subtree take pages past the
