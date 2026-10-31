@@ -8,3 +8,14 @@ rust-version = "1.89.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fulgur-rs/fulgur"
 homepage = "https://github.com/fulgur-rs/fulgur"
+
+# The Blitz fork (deiteris/blitz) at the tag the PDF consumer of this fork
+# pins: `blitz-dom` 0.2.4 with DioxusLabs/blitz#395 ported (`rowspan`), and
+# tables laid out at max-content height. `blitz-dom` takes `blitz-traits`
+# and `stylo_taffy` from its own workspace, so both come from the fork too.
+# The tests, the fragmentation corpus, and the invariants then measure the
+# tables the consumer ships. Drop with blitz-dom 0.3 (fulgur-rs/fulgur#450).
+[patch.crates-io]
+blitz-dom = { git = "https://github.com/deiteris/blitz", tag = "patched-2026-10-26" }
+blitz-traits = { git = "https://github.com/deiteris/blitz", tag = "patched-2026-10-26" }
+stylo_taffy = { git = "https://github.com/deiteris/blitz", tag = "patched-2026-10-26" }
