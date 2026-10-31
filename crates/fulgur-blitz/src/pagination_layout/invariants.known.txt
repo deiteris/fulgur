@@ -7,7 +7,6 @@
 0 PlacedOnce b10 0  # leading extent: lines measured from the line box
 1 PastFoot b10 3  # leading extent
 1 PastFoot b11 3  # leading extent
-1 PastFoot b6 1  # one walker
 1 PastFoot b6 2  # one walker
 1 PastFoot b9 3  # leading extent
 2 PlacedOnce b9 1  # table walker
@@ -56,6 +55,7 @@
 13 PastFoot b7 1  # leading extent
 13 PlacedOnce b0 0  # one walker
 13 PlacedOnce b1 0  # leading extent
+14 DocumentOrder b7 1  # leading extent: lines measured from the line box
 15 PlacedOnce b9 1  # one walker
 16 PastFoot b0 0  # one walker
 16 PastFoot b3 0  # leading extent: lines measured from the line box
@@ -248,13 +248,11 @@
 63 PlacedOnce b0 0  # one walker
 64 PastFoot b0 0  # one walker
 64 PlacedOnce b0 0  # one walker
-65 DocumentOrder b8 6  # leading extent: lines measured from the line box
-65 Encloses b13 6  # leading extent: lines measured from the line box
-65 Encloses b15 6  # leading extent: lines measured from the line box
+65 Encloses b8 6  # page cursor
 65 PastFoot b0 4  # one walker
-65 PastFoot b5 6  # one walker
+65 PastFoot b5 5  # one walker
+65 PastFoot b8 6  # page cursor
 65 PlacedOnce b0 0  # one walker
-65 PlacedOnce b13 6  # leading extent: lines measured from the line box
 65 PlacedOnce b15 6  # leading extent: lines measured from the line box
 65 PlacedOnce b5 5  # one walker
 65 PlacedOnce b8 6  # page cursor
@@ -341,6 +339,7 @@
 95 PastFoot b12 6  # one walker
 95 PastFoot b14 6  # one walker
 95 PastFoot b17 9  # one walker
+95 PastFoot b18 9  # edge model
 95 PastFoot b3 2  # one walker
 95 PastFoot b6 2  # leading extent
 95 PastFoot b7 2  # leading extent
@@ -349,6 +348,7 @@
 95 PlacedOnce b11 3  # page cursor
 95 PlacedOnce b12 3  # one walker
 95 PlacedOnce b17 9  # one walker
+95 PlacedOnce b18 9  # edge model
 95 PlacedOnce b3 2  # one walker
 95 PlacedOnce b4 2  # leading extent: lines measured from the line box
 95 PlacedOnce b8 3  # one walker
@@ -433,6 +433,7 @@
 124 PlacedOnce b0 0  # one walker
 124 PlacedOnce b3 1  # page cursor
 124 PlacedOnce b4 1  # page cursor
+128 DocumentOrder b1 0  # leading extent: lines measured from the line box
 128 Encloses b2 0  # table walker
 128 Encloses b2 2  # table walker
 128 PastFoot b1 0  # one walker
@@ -497,6 +498,7 @@
 152 PastFoot b2 1  # table walker
 152 PastFoot b7 2  # table walker
 152 PlacedOnce b0 0  # one walker
+154 DocumentOrder b12 3  # leading extent: lines measured from the line box
 154 PastFoot b0 0  # one walker
 154 PlacedOnce b0 0  # one walker
 155 PastFoot b0 0  # one walker
@@ -507,6 +509,7 @@
 156 PlacedOnce b3 0  # one walker
 156 PlacedOnce b6 0  # leading extent
 156 PlacedOnce b7 0  # leading extent
+157 DocumentOrder b1 0  # leading extent: lines measured from the line box
 157 PastFoot b1 0  # one walker
 157 PlacedOnce b1 0  # one walker
 157 PlacedOnce b8 0  # table walker
@@ -559,6 +562,7 @@
 171 PlacedOnce b0 0  # one walker
 171 PlacedOnce b1 0  # page cursor
 171 PlacedOnce b21 1  # one walker
+171 PlacedOnce b22 1  # leading extent
 171 PlacedOnce b26 2  # one walker
 171 PlacedOnce b7 0  # table walker
 172 PastFoot b0 0  # one walker
@@ -744,17 +748,17 @@
 231 PlacedOnce b5 1  # edge model
 232 PastFoot b0 1  # one walker
 232 PastFoot b1 1  # leading extent
-232 PastFoot b10 5  # one walker
-232 PastFoot b16 10  # one walker
-232 PastFoot b16 12  # one walker
-232 PastFoot b5 3  # one walker
+232 PastFoot b10 4  # one walker
+232 PastFoot b16 11  # one walker
+232 PastFoot b16 9  # one walker
+232 PastFoot b5 2  # one walker
 232 PlacedOnce b0 0  # one walker
-232 PlacedOnce b10 5  # one walker
-232 PlacedOnce b11 5  # leading extent: lines measured from the line box
-232 PlacedOnce b16 10  # one walker
-232 PlacedOnce b17 10  # edge model
+232 PlacedOnce b10 4  # one walker
+232 PlacedOnce b11 4  # leading extent: lines measured from the line box
+232 PlacedOnce b16 9  # one walker
+232 PlacedOnce b17 9  # edge model
 232 PlacedOnce b3 1  # leading extent: lines measured from the line box
-232 PlacedOnce b5 3  # one walker
+232 PlacedOnce b5 2  # one walker
 233 PastFoot b0 0  # one walker
 233 PastFoot b1 0  # edge model
 233 PlacedOnce b0 0  # one walker
@@ -780,6 +784,7 @@
 241 PastFoot b1 0  # one walker
 241 PastFoot b2 0  # one walker
 242 PlacedOnce b3 0  # leading extent
+244 DocumentOrder b10 0  # unexplained
 244 PastFoot b10 0  # one walker
 244 PlacedOnce b10 0  # one walker
 244 PlacedOnce b5 0  # leading extent

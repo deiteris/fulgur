@@ -2471,11 +2471,9 @@ fn fragment_repeating_table(
 /// cursor ([`PageCursor::close_parent`]); the collectors
 /// (`collect_string_set_states`, `collect_counter_states`,
 /// `collect_bookmark_entries`) read these per-page fragments. The root has
-/// none: its one fragment, on page 0, is recorded before its walk.
-///
-/// The root also stacks its children, each below the lowest point placed by
-/// the gap its layout leaves, where a nested walk places a child at its
-/// layout position.
+/// none: its one fragment, on page 0, is its layout box, recorded before its
+/// walk. The root differs in one more way only: a forced break before its
+/// first child is the document's start, and makes no page.
 ///
 /// A child taller than a page that the walk does not enter is sliced, one
 /// fragment a page, where it lies in block flow ([`slices_where_it_is`]).
@@ -2566,10 +2564,6 @@ fn fragment_block_subtree_inner(
     // (CSS Page 3 §5.3, "Using Named Pages").
     let mut prev_used_page: Option<Option<String>> = None;
     let mut row_state: Option<RowState> = None;
-    // The root stacks its children: each sits below the lowest point placed,
-    // by the gap its layout leaves above the previous in-flow child's bottom
-    // (`prev_bottom`), and none sits beside another or is lifted.
-    let mut prev_bottom = 0.0_f32;
     // A child of the root that has a fragment precedes this one: a forced
     // break before the root's first child is the document's start.
     let mut emitted_any = false;
@@ -2599,11 +2593,10 @@ fn fragment_block_subtree_inner(
         .and_then(|gp_id| doc.get_node(gp_id))
         .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent));
     let allow_same_row_rebase =
-        !root && (co_split_rows || crate::blitz_adapter::is_flex_or_grid_container_node(parent));
-    let suppress_page_check = !root
-        && (allow_same_row_rebase
-            || crate::blitz_adapter::is_atomic_inline_container_node(parent)
-            || parent_is_orthogonal);
+        co_split_rows || crate::blitz_adapter::is_flex_or_grid_container_node(parent);
+    let suppress_page_check = allow_same_row_rebase
+        || crate::blitz_adapter::is_atomic_inline_container_node(parent)
+        || parent_is_orthogonal;
 
     // fulgur-yb27: prefer `layout_children` over raw `children` —
     // same rationale as `record_subtree_descendants`. When a block
@@ -2669,13 +2662,9 @@ fn fragment_block_subtree_inner(
         // the siblings after a lifted table do.
         if running_store.is_some_and(|s| s.instance_for_node(child_id).is_some()) {
             let height = layout.size.height;
-            if height.is_finite() && height > 0.0 {
-                if root {
-                    prev_bottom += height;
-                } else if !allow_same_row_rebase {
-                    cursor.page_taffy_origin += height;
-                    own_lift += height;
-                }
+            if height.is_finite() && height > 0.0 && !allow_same_row_rebase {
+                cursor.page_taffy_origin += height;
+                own_lift += height;
             }
             if child.element_data().is_some() {
                 geometry
@@ -2877,7 +2866,7 @@ fn fragment_block_subtree_inner(
             continue;
         }
 
-        if !allow_same_row_rebase && !root {
+        if !allow_same_row_rebase {
             let beside = prev_in_flow.is_some_and(|(top, bottom)| {
                 this_top_in_parent < bottom - 0.5 && this_top_in_parent <= top + 0.5
             });
@@ -2897,20 +2886,8 @@ fn fragment_block_subtree_inner(
         // y. For grid / flex parallel siblings (same `location.y`),
         // this places them at the same page-local y; for sequential
         // block flow, it matches Taffy's stacked positions exactly.
-        //
-        // The root stacks its children instead: the gap (collapsed
-        // margins, padding before the first child) that the layout leaves
-        // between a child and the previous one's bottom is added to the
-        // lowest point placed, so a child after one that split, or after a
-        // forced break, keeps its gap below where that one ended. `max(0.0)`
-        // guards against negative gaps from sibling overlap.
-        let mut child_page_y = if root {
-            let gap = (this_top_in_parent - prev_bottom).max(0.0);
-            prev_bottom = this_top_in_parent + child_h;
-            cursor.cursor_y + gap
-        } else {
-            cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin)
-        };
+        let mut child_page_y =
+            cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin);
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
         // `gap + child_h`; for grid parallel siblings the cursor
@@ -3418,9 +3395,8 @@ fn fragment_block_subtree_inner(
             // table without its skipped header rows) takes the siblings
             // after it up with it, here and, through `lifted`, in the
             // parent's own siblings. Cells side by side in a row are not
-            // moved: the row's height is not this child's alone. The root
-            // stacks what follows below the cursor, so it needs no lift.
-            if !root && np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
+            // moved: the row's height is not this child's alone.
+            if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
                 cursor.page_taffy_origin += child_lift;
                 own_lift += child_lift;
             }
@@ -3764,7 +3740,8 @@ fn fragment_block_subtree_inner(
     // (whitespace / OOF / running) — that's intentional and matches
     // the zero-height-element path. The root closes no fragment.
     cursor.close_parent(geometry, ParentHeight::Placed);
-    if own_lift > 0.0 {
+    // The root's one fragment is its layout box, recorded before its walk.
+    if own_lift > 0.0 && !root {
         geometry.entry(parent_id).or_default().lift_px = own_lift;
         *lifted += own_lift;
     }
@@ -8153,25 +8130,6 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(at("b"), [(1, 0.0, 60.0)]);
     }
 
-    /// The body's running child gives its room back too: the body stacks
-    /// the sibling after it by the gap the layout leaves less the running
-    /// element's height.
-    #[test]
-    fn a_running_element_at_the_body_level_takes_no_room() {
-        let (doc, geometry) = running_header_pass(
-            r#"<div id="header" class="header" style="height: 30px">Header</div>
-               <div id="a" style="height: 60px; margin-top: 10px"></div>"#,
-            100.0,
-        );
-        let a = &geometry[&find_by_id(&doc, "a").unwrap()].fragments;
-        assert_eq!(
-            a.iter()
-                .map(|f| (f.page_index, f.y.to_f32()))
-                .collect::<Vec<_>>(),
-            [(0, 10.0)]
-        );
-    }
-
     /// Regression for the `--css` + hidden-ancestor running-element bug
     /// (FULGUR_CSS_FLAG_RUNNING_ELEMENT_BUG.md): `gcpm::parser::parse_gcpm`
     /// rewrites `position: running(name)` to `display: none` in its
@@ -10651,6 +10609,29 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// The body is walked as any block: a flex body's items sit side by side
+    /// at their layout position, as a nested flex container's do, instead of
+    /// one below the other.
+    #[test]
+    fn a_flex_body_places_its_items_side_by_side() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0; display: flex">
+              <div id="a" style="flex: 1; height: 50px"></div>
+              <div id="b" style="flex: 1; height: 50px"></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let geom = run_pass(doc.deref_mut(), 100.0);
+        let at = |id: &str| {
+            geom[&find_by_id(&doc, id).unwrap()]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!((at("a"), at("b")), (vec![(0, 0.0)], vec![(0, 0.0)]));
+    }
+
     /// A forced break truncates the gap above the child after it at the body
     /// level, as below it, whatever the child's height: one that nearly
     /// fills the page starts at the page top too.
@@ -12965,20 +12946,19 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
     }
 
-    /// At the body level a margin is no content either: a paragraph whose
-    /// `orphans` cannot be met, 10 px below the top of the page a forced
-    /// break opened, splits on that page instead of moving to the next.
+    /// At the body level an edge is no content either: a paragraph whose
+    /// `orphans` cannot be met, 10 px below the top of the first page, under
+    /// the body's padding, splits on that page instead of moving to the next.
     #[test]
-    fn a_body_paragraph_below_a_margin_at_the_top_of_a_page_relaxes_its_orphans() {
-        let html = r#"<html><body style="margin:0">
-              <div style="break-after:page;line-height:20px">x</div>
-              <p id="p" style="margin:10px 0 0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
+    fn a_body_paragraph_below_the_body_padding_at_the_top_of_a_page_relaxes_its_orphans() {
+        let html = r#"<html><body style="margin:0;padding-top:10px">
+              <p id="p" style="margin:0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
             </body></html>"#;
         let mut doc = parse(html, 200.0);
         let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
         let p_id = find_by_id(&doc, "p").expect("p#p");
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
-        assert_eq!(line_partition(&geom, p_id), (vec![1, 2], vec![0, 2, 3]));
+        assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
     }
 
     /// A flex row whose first item crosses the page: the next item restarts
