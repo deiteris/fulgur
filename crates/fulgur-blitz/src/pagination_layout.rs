@@ -955,11 +955,11 @@ impl<'a> PaginationLayoutTree<'a> {
                         )));
             // A box kept whole that is entered only for a skipped header row
             // moves whole first, as one not entered would; so does a box
-            // opened by a box kept whole that crosses the foot.
+            // opened by a box that places whole and crosses the foot.
             if needs_recursion
                 && cursor_y > 0.0
                 && ((!forced && avoid_inside && cursor_y + child_h > self.page_height_px)
-                    || opening_kept_box_bottom(
+                    || opening_whole_box_bottom(
                         self.doc,
                         self.column_styles,
                         child,
@@ -1975,20 +1975,25 @@ fn kept_table_row_bottom(
     (bottom - top <= page_height_px + 1.0).then_some(bottom)
 }
 
-/// The bottom, below the top of `node`, of the box kept whole
-/// (`break-inside: avoid`) that opens `node`, when it fits a strip of
-/// `page_height_px`; `None` when no such box opens it. The box is `node`'s
-/// first in-flow child, or the box that opens that child, down through block
-/// containers, as long as no padding or border parts each from its
-/// container's content edge.
+/// The bottom, below the top of `node`, of the box that opens `node` and
+/// places whole, when it fits a strip of `page_height_px`; `None` when no
+/// such box opens it. The box is `node`'s first in-flow child, or the box
+/// that opens that child, down through block containers, as long as no
+/// padding or border stands above each. A box places whole when it is kept
+/// whole (`break-inside: avoid`), an inline root of one line, a box with no
+/// children (a replaced element, a sized empty block), or transformed: the
+/// walker splits none of them, and the strip-overflow cut moves one to the
+/// next page only when something precedes it in its container.
 ///
-/// css-break-3 §4.1: a gap between a container's content edge and its first
-/// child is a class C break point. Without one, the only break point before
-/// the child is the one before its container (§3.1 propagates a first
-/// child's breaks to its container likewise). So a box kept whole that opens
-/// `node` and crosses the page foot moves `node` to the next page with it,
-/// instead of staying where `node` starts, past the foot.
-fn opening_kept_box_bottom(
+/// css-break-3 §4.1 has no break point between a container's start and its
+/// first child: breaks are between siblings, which is why §3.1 propagates a
+/// first child's `break-before` to its container. So a box that opens `node`
+/// and crosses the page foot moves `node` to the next page with it, instead
+/// of staying where `node` starts, past the foot. With padding or border
+/// above the child, the walker already moves the child alone, leaving that
+/// edge of its container on the page (it counts the edge as content above
+/// the child); the descent stops there and leaves that as it was.
+fn opening_whole_box_bottom(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     node: &blitz_dom::Node,
@@ -2024,11 +2029,19 @@ fn opening_kept_box_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
+    let one_line = first
+        .element_data()
+        .is_some_and(|el| el.inline_layout_data.is_some())
+        && collect_inline_line_metrics(first).len() <= 1;
+    let transformed = first
+        .primary_styles()
+        .is_some_and(|s| !s.get_box().transform.0.is_empty());
+    let whole = kept || one_line || first.children.is_empty() || transformed;
     let bottom = layout.location.y
-        + if kept {
+        + if whole {
             layout.size.height
         } else {
-            opening_kept_box_bottom(doc, column_styles, first, page_height_px, depth + 1)?
+            opening_whole_box_bottom(doc, column_styles, first, page_height_px, depth + 1)?
         };
     (bottom <= page_height_px + 1.0).then_some(bottom)
 }
@@ -3580,22 +3593,15 @@ fn fragment_block_subtree_inner(
         // A box kept whole that is entered only for a skipped header row
         // moves whole to the next page first, as one not entered would (the
         // strip-overflow cut below), and is entered there; so does a box
-        // opened by a box kept whole that crosses the foot, outside a row of
-        // boxes side by side. A cell of a row kept whole is moved with its
-        // row instead.
+        // opened by a box that places whole and crosses the foot, a flex or
+        // grid item too, which takes the items beside it along. A cell of a
+        // row kept whole is moved with its row instead.
         if needs_recursion
             && kept_row_bottom.is_none()
             && (child_page_y > page_start_y || (initial_page_occupied && page_index == page_in))
             && ((!forced && avoid_fits_whole_page && child_page_y + child_h > page_height_px)
-                || (!allow_same_row_rebase
-                    && opening_kept_box_bottom(
-                        doc,
-                        column_styles,
-                        child,
-                        page_height_px,
-                        depth + 1,
-                    )
-                    .is_some_and(|bottom| child_page_y + bottom > page_height_px)))
+                || opening_whole_box_bottom(doc, column_styles, child, page_height_px, depth + 1)
+                    .is_some_and(|bottom| child_page_y + bottom > page_height_px))
         {
             let should_emit = row_state
                 .as_mut()
@@ -11497,17 +11503,44 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
-    /// css-break-3 §4.1: a paragraph kept whole that opens its container,
-    /// with no padding or border between them, has no break point before it
-    /// but the one before the container. When it crosses the page foot after
-    /// other content, the container moves to the next page with it, at any
-    /// depth, instead of leaving it past the foot. Padding above it is a
-    /// break point of its own: the paragraph moves alone, and its container
-    /// starts on the first page.
+    /// The page of each fragment of the elements `ids` of `body`, laid out
+    /// on 100 px pages after 65 px of content, with 20 px paragraph lines.
+    fn pages_after_65px(body: &str, ids: &[&str]) -> Vec<Vec<u32>> {
+        let html = format!(
+            r#"<html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              p {{ margin: 0; line-height: 20px; }}
+            </style></head><body><div style="height: 5px"></div><p>X</p><p>Y</p>{body}</body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let ids: Vec<usize> = ids
+            .iter()
+            .map(|id| find_by_id(doc.deref_mut(), id).expect(id))
+            .collect();
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        ids.iter()
+            .map(|id| {
+                let mut pages: Vec<u32> = geom[id].fragments.iter().map(|f| f.page_index).collect();
+                pages.dedup();
+                pages
+            })
+            .collect()
+    }
+
+    /// css-break-3 §4.1 has no break point between a container's start and
+    /// its first child. A box the walker places whole (kept whole, one line,
+    /// a replaced element) that opens its container, with no padding or
+    /// border above it, moves the container to the next page with it when it
+    /// crosses the page foot after other content, at any depth, instead of
+    /// staying past the foot. With padding above it, the box moves alone, and
+    /// its container starts on the first page, as before.
     #[test]
-    fn a_kept_paragraph_opening_its_container_moves_the_container_to_the_next_page() {
+    fn a_box_placed_whole_opening_its_container_moves_the_container_to_the_next_page() {
         let kept = r#"<p id="k" style="break-inside: avoid">K1<br>K2</p><p>N</p>"#;
-        for (blocks, container_pages) in [
+        let line = r#"<p id="k" style="line-height: 40px">K2</p><p>N</p>"#;
+        let image = r#"<img id="k" style="display: block; width: 10px; height: 40px"><p>N</p>"#;
+        for (body, container_pages) in [
             (
                 format!(r#"<p>Z</p><div id="c">{kept}</div>"#),
                 [1].as_slice(),
@@ -11520,31 +11553,40 @@ h2 { string-set: chapter-title content(text); }
                 format!(r#"<div><p>Z</p><section id="c">{kept}</section></div>"#),
                 &[1],
             ),
+            (format!(r#"<p>Z</p><div id="c">{line}</div>"#), &[1]),
+            (format!(r#"<p>Z</p><div id="c">{image}</div>"#), &[1]),
             (
                 format!(r#"<p>Z</p><div id="c" style="padding-top: 1px">{kept}</div>"#),
                 &[0, 1],
             ),
         ] {
-            let html = format!(
-                r#"<html><head><style>
-                  html, body {{ margin: 0; padding: 0; }}
-                  p {{ margin: 0; line-height: 20px; }}
-                </style></head><body><div style="height: 5px"></div><p>X</p><p>Y</p>{blocks}</body></html>"#
+            assert_eq!(
+                pages_after_65px(&body, &["k", "c"]),
+                [&[1][..], container_pages],
+                "{body}"
             );
-            let mut doc = parse(&html, 200.0);
-            let k_id = find_by_id(doc.deref_mut(), "k").expect("p#k");
-            let c_id = find_by_id(doc.deref_mut(), "c").expect("#c");
-            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
-            let geom =
-                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-            let pages = |id: usize| -> Vec<u32> {
-                let mut pages: Vec<u32> =
-                    geom[&id].fragments.iter().map(|f| f.page_index).collect();
-                pages.dedup();
-                pages
-            };
-            assert_eq!(pages(k_id), [1], "{blocks}: geom={geom:?}");
-            assert_eq!(pages(c_id), container_pages, "{blocks}: geom={geom:?}");
+        }
+    }
+
+    /// A flex or grid item opened by a box kept whole that crosses the page
+    /// foot moves to the next page with the items beside it, as a block
+    /// container does, instead of staying past the foot while they move.
+    #[test]
+    fn a_flex_or_grid_item_opened_by_a_kept_box_moves_with_its_row() {
+        let item = r#"<div id="item"><p style="break-inside: avoid">K1<br>K2</p></div><div id="r">R</div>"#;
+        for body in [
+            format!(
+                r#"<div style="display: flex; flex-wrap: wrap"><div style="width: 100%">Z</div>{item}</div>"#
+            ),
+            format!(
+                r#"<div style="display: grid; grid-template-columns: 1fr 1fr"><div>Z</div><div>Z</div>{item}</div>"#
+            ),
+        ] {
+            assert_eq!(
+                pages_after_65px(&body, &["item", "r"]),
+                [[1], [1]],
+                "{body}"
+            );
         }
     }
 
