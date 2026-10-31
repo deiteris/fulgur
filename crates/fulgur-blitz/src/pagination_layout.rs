@@ -7488,6 +7488,72 @@ mod tests {
         assert_eq!(placements(&doc, &geometry, "d1"), [(1, 10.0)]);
     }
 
+    /// A paragraph `k` of two 20 px lines kept whole by `break-inside:
+    /// avoid`, in a `div` `wrap` that opens a cell `cell` padded 10 px above
+    /// and below: the row, after a row holding a block `first` of `first`
+    /// px when not empty, with `lead` before `wrap` in the cell, laid out
+    /// with the break styles on 100 px pages.
+    fn kept_in_padded_cell_pass(
+        first: &str,
+        lead: &str,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let before = if first.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<tr><td style="padding: 0"><div id="first" style="height: {first}px"></div></td></tr>"#
+            )
+        };
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              td {{ padding: 10px 0; }}
+              p {{ margin: 0; line-height: 20px; }}
+            </style></head><body>
+              <table><tbody>{before}<tr><td id="cell">{lead}<div id="wrap">
+                <p id="k" style="break-inside: avoid">K1<br>K2</p>
+              </div></td></tr></tbody></table>
+            </body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    /// A paragraph kept whole in a `div` that opens a padded cell.
+    ///
+    /// At the page foot, with 40 px left under a 60 px row, the cell's
+    /// first content (the padding and the 40 px paragraph, 50 px) does not
+    /// fit, so the row moves whole, the cell's padding with it
+    /// (`row_places_nothing_in`): the padding is no content of its own, and
+    /// moving the `div` alone inside the cell, at the padding's break point,
+    /// would leave the empty padded cell at the foot. At the page top the
+    /// row stays, the paragraph below the padding. After a 60 px block in
+    /// the cell, the paragraph crosses the foot and moves to the next page
+    /// with its `div`, the block before it in the cell giving the break
+    /// point, and starts below the cell's repeated padding.
+    #[test]
+    fn a_kept_paragraph_in_a_div_opening_a_padded_cell() {
+        let (doc, geometry) = kept_in_padded_cell_pass("60", "");
+        assert_eq!(placements(&doc, &geometry, "cell"), [(1, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0)]);
+
+        let (doc, geometry) = kept_in_padded_cell_pass("", "");
+        assert_eq!(placements(&doc, &geometry, "cell"), [(0, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "k"), [(0, 10.0)]);
+
+        let (doc, geometry) =
+            kept_in_padded_cell_pass("", r#"<div id="lead" style="height: 60px"></div>"#);
+        assert_eq!(placements(&doc, &geometry, "lead"), [(0, 10.0)]);
+        assert_eq!(placements(&doc, &geometry, "wrap"), [(1, 10.0)]);
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0)]);
+        assert_eq!(placements(&doc, &geometry, "cell"), [(0, 0.0), (1, 0.0)]);
+    }
+
     #[test]
     fn table_starting_mid_page_uses_remaining_first_page_capacity() {
         let html = r#"<!doctype html>
