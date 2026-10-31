@@ -2475,9 +2475,8 @@ fn fragment_repeating_table(
 ///
 /// The root also stacks its children, each below the lowest point placed by
 /// the gap its layout leaves, where a nested walk places a child at its
-/// layout position; and only the root enters a multicol container with a
-/// `column-span: all` child and keeps the gap above a child that nearly
-/// fills a page after an authored break.
+/// layout position; and only the root keeps the gap above a child that
+/// nearly fills a page after an authored break.
 ///
 /// A child taller than a page that the walk does not enter is sliced, one
 /// fragment a page, where it lies in block flow ([`slices_where_it_is`]).
@@ -3255,15 +3254,14 @@ fn fragment_block_subtree_inner(
         // `multicol_layout::run_pass`, and the outer fragmenter treats the
         // multicol container as a single unit for break decisions.
         //
-        // fulgur-916y: at the root, multicol containers with a
-        // `column-span: all` direct child get an exception — the span
-        // subtree is laid out by Taffy as a full-width block flowing
-        // between the column groups, so block-flow recursion via
-        // `fragment_block_subtree` can split it across pages when it
-        // overflows. Containers without span:all stay atomic.
+        // fulgur-916y: multicol containers with a `column-span: all`
+        // direct child get an exception — the span subtree is laid out by
+        // Taffy as a full-width block flowing between the column groups, so
+        // block-flow recursion via `fragment_block_subtree` can split it
+        // across pages when it overflows. Containers without span:all stay
+        // atomic.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
-        let multicol_has_span_all = root
-            && is_multicol
+        let multicol_has_span_all = is_multicol
             && child.children.iter().any(|&id| {
                 doc.get_node(id)
                     .is_some_and(crate::blitz_adapter::has_column_span_all)
@@ -9804,6 +9802,45 @@ h2 { string-set: chapter-title content(text); }
         assert!(
             pages >= 2,
             "expected multicol with span:all overflow to split into >=2 pages, got {pages}",
+        );
+    }
+
+    /// fulgur-916y below the body: a multicol container with a
+    /// `column-span: all` child is entered at every depth, so a nested one
+    /// whose spanning subtree overflows splits across pages between its
+    /// paragraphs, rather than being sliced with all of them on its first
+    /// slice.
+    #[test]
+    fn a_nested_multicol_container_with_a_column_span_all_child_splits() {
+        let mut long = String::new();
+        for _ in 0..40 {
+            long.push_str(
+                "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+                 Sed do eiusmod tempor incididunt ut labore et dolore magna \
+                 aliqua. Ut enim ad minim veniam, quis nostrud exercitation.</p>",
+            );
+        }
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+                body {{ margin: 10pt; font-size: 10pt; }}
+                .mc {{ column-count: 2; column-gap: 10pt; }}
+                .span {{ column-span: all; }}
+            </style></head><body>
+              <div><div class="mc">
+                <p>before column content.</p>
+                <section class="span">{long}<p id="last">last.</p></section>
+                <p>after column content.</p>
+              </div></div>
+            </body></html>"#
+        );
+
+        let mut doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 400.0_f32.as_px(), &table);
+        let last = &geom[&find_by_id(&doc, "last").unwrap()].fragments;
+        assert!(
+            last.iter().all(|f| f.page_index >= 1),
+            "the spanning subtree's last paragraph must be on a later page: {last:?}",
         );
     }
 
