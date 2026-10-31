@@ -6012,6 +6012,129 @@ pub fn implied_page_count(geometry: &PaginationGeometryTable) -> u32 {
         .unwrap_or(1)
 }
 
+/// The geometry table as text: one line per node and fragment, in tree
+/// order, so two runs of the fragmenter can be compared line by line.
+///
+/// Each line holds the node's path from the root (each step is the tag
+/// name, `#id` when the element has one, and the index in its parent's
+/// children), then the fragment's page, `x`, `y`, `width`, and `height`
+/// rounded to 0.01 px, `repeat` when the geometry is a per-page copy, the
+/// fragment's line range when the node is split at line boundaries, and
+/// the node's `lift_px` when it is not zero. A node with no fragment is
+/// one line ending in `none`.
+///
+/// Anonymous blocks are `::anon`, text nodes `#text`, and generated
+/// boxes `::before` and `::after`; a node outside its parent's DOM
+/// children takes its index in the parent's layout children.
+pub fn geometry_text(geometry: &PaginationGeometryTable, doc: &BaseDocument) -> String {
+    let mut nodes: Vec<(Vec<(usize, String)>, &PaginationGeometry)> = geometry
+        .iter()
+        .map(|(&id, g)| (geometry_path(doc, id), g))
+        .collect();
+    nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    for (path, g) in nodes {
+        let path: String = path
+            .iter()
+            .map(|(_, step)| step.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        if g.fragments.is_empty() {
+            out.push_str(&path);
+            out.push_str(" none\n");
+            continue;
+        }
+        let mut fragments: Vec<(usize, &Fragment)> = g.fragments.iter().enumerate().collect();
+        fragments.sort_by_key(|(k, f)| (f.page_index, *k));
+        for (k, f) in fragments {
+            out.push_str(&format!(
+                "{path} page={} x={} y={} w={} h={}",
+                f.page_index,
+                geometry_number(f.x.to_f32()),
+                geometry_number(f.y.to_f32()),
+                geometry_number(f.width.to_f32()),
+                geometry_number(f.height.to_f32()),
+            ));
+            if g.is_repeat {
+                out.push_str(" repeat");
+            }
+            if let (Some(start), Some(end)) =
+                (g.line_boundaries.get(k), g.line_boundaries.get(k + 1))
+            {
+                out.push_str(&format!(" lines={start}..{end}"));
+            }
+            if g.lift_px != 0.0 {
+                out.push_str(&format!(" lift={}", geometry_number(g.lift_px)));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A length rounded to 0.01 px, without a negative zero.
+fn geometry_number(v: f32) -> String {
+    let rounded = (f64::from(v) * 100.0).round() / 100.0;
+    if rounded == 0.0 {
+        "0.00".to_string()
+    } else {
+        format!("{rounded:.2}")
+    }
+}
+
+/// The steps from the root to `id`: each the sort key (the index under the
+/// parent, with the generated boxes around the children) and its text.
+fn geometry_path(doc: &BaseDocument, id: usize) -> Vec<(usize, String)> {
+    let mut steps = Vec::new();
+    let mut current = id;
+    while let Some(node) = doc.get_node(current) {
+        let parent_id = node.parent.or_else(|| node.layout_parent.get());
+        let Some(parent) = parent_id.and_then(|p| doc.get_node(p)) else {
+            break;
+        };
+        let (key, step) = if parent.before == Some(current) {
+            (0, "::before".to_string())
+        } else if parent.after == Some(current) {
+            (usize::MAX, "::after".to_string())
+        } else {
+            let index = parent
+                .children
+                .iter()
+                .position(|&c| c == current)
+                .or_else(|| {
+                    parent
+                        .layout_children
+                        .borrow()
+                        .as_ref()
+                        .and_then(|children| children.iter().position(|&c| c == current))
+                })
+                .unwrap_or(usize::MAX - 1);
+            (index + 1, format!("{}[{index}]", geometry_label(node)))
+        };
+        steps.push((key, step));
+        current = parent.id;
+    }
+    steps.reverse();
+    steps
+}
+
+/// The label of one path step: the tag name and `#id`, `::anon`, or `#text`.
+fn geometry_label(node: &blitz_dom::Node) -> String {
+    if node.is_anonymous() {
+        return "::anon".to_string();
+    }
+    if node.is_text_node() {
+        return "#text".to_string();
+    }
+    match node.element_data() {
+        Some(data) => match data.attr(blitz_dom::LocalName::from("id")) {
+            Some(id) => format!("{}#{id}", data.name.local),
+            None => data.name.local.to_string(),
+        },
+        None => "#node".to_string(),
+    }
+}
+
 /// Locate the `<body>` element id by walking the html root's children.
 ///
 /// Prefers the first child whose tag name is `body`. Falls back to
@@ -10834,6 +10957,51 @@ h2 { string-set: chapter-title content(text); }
             height: 1.0_f32.as_px(),
         });
         assert_eq!(super::implied_page_count(&geom), 3);
+    }
+
+    /// `geometry_text` writes one line per node and fragment, in tree order
+    /// and then by page: the path of tag names, `#id`, and child indices,
+    /// the box rounded to 0.01 px, then `repeat`, the fragment's line range,
+    /// and the node's lift.
+    #[test]
+    fn geometry_text_writes_one_line_per_fragment_in_tree_order() {
+        let doc = parse(
+            r#"<html><body style="margin:0"><div id="a"><p>x<br>y</p></div></body></html>"#,
+            200.0,
+        );
+        let a = find_by_id(&doc, "a").expect("div#a");
+        let p = doc.get_node(a).expect("div").children[0];
+        let fragment = |page_index: u32, y: f32| Fragment {
+            page_index,
+            x: 0.0_f32.as_px(),
+            y: y.as_px(),
+            width: 200.0_f32.as_px(),
+            height: 20.0_f32.as_px(),
+        };
+        let mut geom = PaginationGeometryTable::new();
+        geom.insert(
+            p,
+            PaginationGeometry {
+                fragments: vec![fragment(1, 0.0), fragment(0, 80.004)],
+                line_boundaries: vec![0, 1, 2],
+                ..Default::default()
+            },
+        );
+        geom.insert(
+            a,
+            PaginationGeometry {
+                fragments: vec![fragment(0, 79.996)],
+                is_repeat: true,
+                lift_px: 2.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            geometry_text(&geom, &doc),
+            "html[0]/body[1]/div#a[0] page=0 x=0.00 y=80.00 w=200.00 h=20.00 repeat lift=2.50\n\
+             html[0]/body[1]/div#a[0]/p[0] page=0 x=0.00 y=80.00 w=200.00 h=20.00 lines=1..2\n\
+             html[0]/body[1]/div#a[0]/p[0] page=1 x=0.00 y=0.00 w=200.00 h=20.00 lines=0..1\n"
+        );
     }
 
     /// Five pages: node 1 (`a`) starts on page 1 and runs on to page 2;

@@ -8,6 +8,25 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 
+/// The environment variable naming a directory where every render writes
+/// its pagination geometry as text
+/// ([`crate::pagination_layout::geometry_text`]), one file per input named
+/// `<sha256 of the input HTML>.txt`. Read once per render; unset or empty
+/// writes nothing.
+pub const GEOMETRY_DUMP_VAR: &str = "FULGUR_GEOMETRY_DUMP";
+
+/// Write `text` to `<dir>/<sha256 of html>.txt`. A dump is a diagnostic,
+/// so a failure to write it is logged, not returned.
+fn write_geometry_dump(dir: &Path, html: &str, text: &str) {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(html.as_bytes());
+    let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.txt"));
+    if let Err(err) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text)) {
+        log::warn!("cannot write the geometry dump {}: {err}", path.display());
+    }
+}
+
 /// Reusable PDF generation engine.
 pub struct Engine {
     config: Config,
@@ -72,6 +91,9 @@ struct LayoutArtifacts {
     page_facts: Vec<crate::pagination_layout::PageFacts>,
     collected_anchor_map: AnchorMap,
     needs_pass_two: bool,
+    /// [`crate::pagination_layout::geometry_text`] of the final geometry,
+    /// when the caller asked for it.
+    geometry_text: Option<String>,
 }
 
 impl Engine {
@@ -150,6 +172,10 @@ impl Engine {
     /// the fonts its stylesheets fetch (`@font-face`) into it: sharing one
     /// across passes would register each fetched font twice. Pass 2's
     /// context is the one `render_v2` hands to the margin boxes.
+    ///
+    /// When the environment variable [`GEOMETRY_DUMP_VAR`] names a
+    /// directory, the final geometry's text is written there as
+    /// `<sha256 of html>.txt`.
     fn layout_passes(
         &self,
         html: &str,
@@ -158,8 +184,28 @@ impl Engine {
         Option<AnchorMap>,
         crate::blitz_adapter::RenderFonts,
     )> {
+        let dump_dir = std::env::var_os(GEOMETRY_DUMP_VAR).filter(|dir| !dir.is_empty());
+        let (mut artifacts, anchor_map, fonts) =
+            self.layout_passes_with(html, dump_dir.is_some())?;
+        if let (Some(dir), Some(text)) = (dump_dir, artifacts.geometry_text.take()) {
+            write_geometry_dump(Path::new(&dir), html, &text);
+        }
+        Ok((artifacts, anchor_map, fonts))
+    }
+
+    /// [`Self::layout_passes`] without the dump; `geometry_text` asks for
+    /// the final geometry's text in the artifacts.
+    fn layout_passes_with(
+        &self,
+        html: &str,
+        geometry_text: bool,
+    ) -> Result<(
+        LayoutArtifacts,
+        Option<AnchorMap>,
+        crate::blitz_adapter::RenderFonts,
+    )> {
         let fonts1 = self.render_fonts();
-        let pass1 = self.layout_to_drawables(html, None, &fonts1)?;
+        let pass1 = self.layout_to_drawables(html, None, &fonts1, geometry_text)?;
         if !pass1.needs_pass_two {
             return Ok((pass1, None, fonts1));
         }
@@ -174,7 +220,7 @@ impl Engine {
         } = pass1;
         drop(fonts1);
         let fonts2 = self.render_fonts();
-        let pass2 = self.layout_to_drawables(html, Some(&anchor_map), &fonts2)?;
+        let pass2 = self.layout_to_drawables(html, Some(&anchor_map), &fonts2, geometry_text)?;
         Ok((pass2, Some(anchor_map), fonts2))
     }
 
@@ -199,6 +245,7 @@ impl Engine {
         html: &str,
         anchor_map: Option<&AnchorMap>,
         render_fonts: &crate::blitz_adapter::RenderFonts,
+        geometry_text: bool,
     ) -> Result<LayoutArtifacts> {
         // Reject non-finite/non-positive page size or margin values before
         // they reach Blitz parsing below — an unvalidated f32 here can
@@ -867,6 +914,8 @@ impl Engine {
         // `running_store` can be moved into the artifacts.
         let pagination_geometry = std::mem::take(&mut convert_ctx.pagination_geometry);
         drop(convert_ctx);
+        let geometry_text = geometry_text
+            .then(|| crate::pagination_layout::geometry_text(&pagination_geometry, &doc));
         Ok(LayoutArtifacts {
             drawables,
             pagination_geometry,
@@ -880,6 +929,7 @@ impl Engine {
             page_facts,
             collected_anchor_map,
             needs_pass_two: needs_anchor_map_for_pass_two,
+            geometry_text,
         })
     }
 
@@ -979,6 +1029,15 @@ impl Engine {
             drawables: artifacts.drawables,
             geometry: artifacts.pagination_geometry,
         })
+    }
+
+    /// Lay out `html` as [`layout`](Engine::layout) does and return
+    /// [`crate::pagination_layout::geometry_text`] of the final geometry:
+    /// the text the [`GEOMETRY_DUMP_VAR`] dump writes.
+    #[doc(hidden)]
+    pub fn geometry_text_for_testing(&self, html: &str) -> Result<String> {
+        let (artifacts, _, _) = self.layout_passes_with(html, true)?;
+        Ok(artifacts.geometry_text.unwrap_or_default())
     }
 
     /// Render a template with data to PDF bytes.
@@ -2132,6 +2191,20 @@ mod tests {
         let htmls: &[&str] = &[];
         let results = engine.render_batch(htmls);
         assert!(results.is_empty());
+    }
+
+    /// A geometry dump is named by the SHA-256 of its input HTML, in a
+    /// directory created when it does not exist.
+    #[test]
+    fn a_geometry_dump_is_named_by_the_sha256_of_its_html() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dumps");
+        write_geometry_dump(&out, "abc", "geometry\n");
+        let name = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad.txt";
+        assert_eq!(
+            std::fs::read_to_string(out.join(name)).unwrap(),
+            "geometry\n"
+        );
     }
 
     // ── Builder: system_fonts and serialize_settings ──────────────────────
