@@ -1970,11 +1970,12 @@ impl PageCursor {
 
     /// Nothing is placed on this page yet: no in-flow box with height, at
     /// any depth, above the walk's place (the boxes beside it, a flex or
-    /// grid row's items or a table row's cells, do not count). A box's padding or border, or a margin, is no content. A
-    /// break here would leave the page with nothing but such edges, so a
-    /// paragraph splits within relaxed `orphans` and `widows` rather than
-    /// move whole (css-break-3 §4.4), and a side break only moves on to its
-    /// side. Whether a break point precedes a box at all is the walker's own
+    /// grid row's items or a table row's cells, do not count). A box's
+    /// padding or border, or a margin, is no content. A break here would
+    /// leave the page with nothing but such edges, so a paragraph splits
+    /// within relaxed `orphans` and `widows` rather than move whole
+    /// (css-break-3 §4.4), and a side break only moves on to its side.
+    /// Whether a break point precedes a box at all is the walker's own
     /// question: it still moves a box that does not fit below another, or
     /// below a gap or edge, as before.
     fn at_page_top(&self) -> bool {
@@ -13315,6 +13316,35 @@ h2 { string-set: chapter-title content(text); }
             (line_partition(&geom, beside), line_partition(&geom, after)),
             ((vec![0, 1], vec![0, 2, 3]), (vec![2], vec![0, 3]))
         );
+    }
+
+    /// A cell of a table's second row lies within the height of a cell of
+    /// the first row that spans both, but below that cell's top: it is not
+    /// beside it, and the first row's content is above it on the page. Its
+    /// paragraph, crossing the page foot where its `orphans` cannot be met,
+    /// moves to the next page, and splits at its top there.
+    #[test]
+    fn a_paragraph_in_a_row_below_a_spanning_cell_moves_on_at_the_foot() {
+        let html = r#"<html><body style="margin:0">
+              <table style="border-spacing:0">
+                <tr>
+                  <td style="padding:0;line-height:20px">x</td>
+                  <td rowspan="2" style="padding:0">
+                    <img style="display:block;width:10px;height:100px">
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0">
+                    <p id="p" style="margin:0;line-height:25px;orphans:2;widows:2">a<br>b<br>c</p>
+                  </td>
+                </tr>
+              </table>
+            </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let p_id = find_by_id(&doc, "p").expect("p#p");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(line_partition(&geom, p_id), (vec![1, 2], vec![0, 2, 3]));
     }
 
     // ── StringSetPageState / PageRunningState derived-trait coverage ─────────
