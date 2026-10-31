@@ -5373,14 +5373,15 @@ fn clips_overflow(node: &blitz_dom::Node) -> bool {
 }
 
 /// Whether a box taller than a page that the walker does not enter may be
-/// sliced where it is, below the body: in block flow only. Not in a table
-/// cell or a flex or grid item: the items of a row share its height (a cell
-/// or item stretched past the page by a taller neighbour is one), and a
-/// row is no unit the walker fragments, so one that continued on the next
-/// page would take the walk of the cells or items beside it there, or back
-/// to the row's start. Nor past the bottom of an ancestor that clips its
-/// overflow ([`clips_overflow`]): what is past the clip paints nothing, so
-/// it takes no page.
+/// sliced where it is, at any depth: in block flow only. Not in a table
+/// cell or a flex or grid item, of a flex or grid body too: the items of a
+/// row share its height (a cell or item stretched past the page by a taller
+/// neighbour is one), and a row is no unit the walker fragments, so one
+/// that continued on the next page would take the walk of the cells or
+/// items beside it there, or back to the row's start. Nor past the bottom
+/// of an ancestor below the body that clips its overflow
+/// ([`clips_overflow`]): what is past the clip paints nothing, so it takes
+/// no page.
 fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
     if displays(node, DisplayInside::TableCell) {
         return false;
@@ -5388,18 +5389,18 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
     let mut bottom = node.final_layout.location.y + node.final_layout.size.height;
     let mut next = node.parent;
     while let Some(ancestor) = next.and_then(|id| doc.get_node(id)) {
-        if ancestor
+        let is_body = ancestor
             .element_data()
-            .is_some_and(|el| el.name.local.as_ref() == "body")
-        {
-            return true;
-        }
+            .is_some_and(|el| el.name.local.as_ref() == "body");
         let layout = ancestor.final_layout;
         if displays(ancestor, DisplayInside::TableCell)
             || crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
-            || (clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
+            || (!is_body && clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
         {
             return false;
+        }
+        if is_body {
+            return true;
         }
         bottom += layout.location.y;
         next = ancestor.parent;
@@ -10630,6 +10631,22 @@ h2 { string-set: chapter-title content(text); }
                 .collect::<Vec<_>>()
         };
         assert_eq!((at("a"), at("b")), (vec![(0, 0.0)], vec![(0, 0.0)]));
+    }
+
+    /// A flex body's item taller than a page is not sliced, as a nested flex
+    /// container's is not: the items of a row share its height.
+    #[test]
+    fn a_tall_item_of_a_flex_body_is_not_sliced() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0; display: flex">
+              <div id="a" style="flex: 1; height: 250px"></div>
+              <div id="b" style="flex: 1; height: 50px"></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let geom = run_pass(doc.deref_mut(), 100.0);
+        let a = &geom[&find_by_id(&doc, "a").unwrap()].fragments;
+        assert_eq!(a.len(), 1, "{a:?}");
     }
 
     /// A forced break truncates the gap above the child after it at the body
