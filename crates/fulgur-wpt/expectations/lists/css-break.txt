@@ -1,0 +1,79 @@
+# css-break-3 conformance net for the paginator (fragmentation refactor).
+#
+# Every css/css-break print or paged reftest at the pinned WPT commit that
+# the runner can classify: one relative rel=match or rel=mismatch, with
+# `-print` in its name, a `paged` flag, an @page rule, or print media
+# (62 of the directory's 1005 reftests). Tests that fragment only into
+# columns are left to the multicol lists.
+#
+# The outcome column is not measured yet: every entry is FAIL until the
+# list is seeded on Linux with poppler-utils, which turns the tests that
+# pass into PASS:
+#   scripts/wpt/fetch.sh
+#   cargo run -p fulgur-wpt --example seed -- \
+#     --list crates/fulgur-wpt/expectations/lists/css-break.txt \
+#     --wpt-root target/wpt \
+#     --out crates/fulgur-wpt/expectations/lists/css-break.txt
+
+FAIL  css/css-break/abspos-in-clipped-overflow-print.html  # not measured yet
+FAIL  css/css-break/abspos-overflow-hidden-001-print.html  # not measured yet
+FAIL  css/css-break/block-001-wm-vlr-print.html  # not measured yet
+FAIL  css/css-break/block-001-wm-vrl-print.html  # not measured yet
+FAIL  css/css-break/block-002-wm-vlr-print.html  # not measured yet
+FAIL  css/css-break/block-002-wm-vrl-print.html  # not measured yet
+FAIL  css/css-break/block-in-inline-015-print.html  # not measured yet
+FAIL  css/css-break/break-inside-avoid-multicol-001-print.html  # not measured yet
+FAIL  css/css-break/break-nested-float-in-table-001-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-063-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-064-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-075-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-076-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-080-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081a-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081b-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081c-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081d-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082a-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082b-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082c-print.html  # not measured yet
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082d-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-060-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-065-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-066-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068a-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068b-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068c-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068d-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069a-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069b-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069c-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069d-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-042-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-045-print.html  # not measured yet
+FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-046-print.html  # not measured yet
+FAIL  css/css-break/float-with-large-margin-bottom-cross-page-001-print.html  # not measured yet
+FAIL  css/css-break/float-with-large-margin-bottom-cross-page-002-print.html  # not measured yet
+FAIL  css/css-break/grid/monolithic-overflow-print.html  # not measured yet
+FAIL  css/css-break/ink-overflow-001-print.html  # not measured yet
+FAIL  css/css-break/overflowed-abs-pos-with-percentage-height-print.html  # not measured yet
+FAIL  css/css-break/overflowing-block-002-print.html  # not measured yet
+FAIL  css/css-break/overflowing-block-print.html  # not measured yet
+FAIL  css/css-break/root-margin-001-print.html  # not measured yet
+FAIL  css/css-break/table/repeated-section/fixedpos-in-footer-forced-break-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-001a-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-001b-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-001c-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-001d-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-002a-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-002b-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-002c-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-002d-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-003a-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-003b-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-003c-print.html  # not measured yet
+FAIL  css/css-break/table/table-fragmentation-003d-print.html  # not measured yet
+FAIL  css/css-break/transform-022-print.html  # not measured yet
+FAIL  css/css-break/transform-023-print.html  # not measured yet
+FAIL  css/css-break/transform-024-print.html  # not measured yet
+FAIL  css/css-break/underflow-from-next-page-print.html  # not measured yet
+FAIL  css/css-break/zero-height-page-break-001-print.html  # not measured yet
