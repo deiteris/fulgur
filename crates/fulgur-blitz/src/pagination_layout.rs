@@ -2067,6 +2067,115 @@ fn is_walked_block_container(node: &blitz_dom::Node) -> bool {
         && !crate::blitz_adapter::is_multicol_container(node)
 }
 
+/// Whether no cell of the table row that `cell` belongs to can place any
+/// content in `room` px: each cell's first content ([`leading_content_bottom`])
+/// ends below it. `false` for a node that is not a cell of a row.
+fn row_places_nothing_in(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    cell: &blitz_dom::Node,
+    room: f32,
+) -> bool {
+    let displays = |node: &blitz_dom::Node, inside: DisplayInside| {
+        node.primary_styles()
+            .is_some_and(|s| s.clone_display().inside() == inside)
+    };
+    let Some(row) = cell.parent.and_then(|id| doc.get_node(id)) else {
+        return false;
+    };
+    if !displays(cell, DisplayInside::TableCell) || !displays(row, DisplayInside::TableRow) {
+        return false;
+    }
+    let cells = |row: &blitz_dom::Node| {
+        row.children
+            .iter()
+            .filter_map(|&id| doc.get_node(id))
+            .filter(|node| displays(node, DisplayInside::TableCell))
+            .collect::<Vec<_>>()
+    };
+    // A cell spanning rows ties its rows together, which
+    // [`kept_table_row_bottom`] decides: leave its row group alone.
+    let spans = |node: &blitz_dom::Node| {
+        node.element_data()
+            .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|rowspan| rowspan > 1)
+    };
+    let group_spans = row
+        .parent
+        .and_then(|id| doc.get_node(id))
+        .is_some_and(|group| {
+            group
+                .children
+                .iter()
+                .filter_map(|&id| doc.get_node(id))
+                .filter(|node| displays(node, DisplayInside::TableRow))
+                .any(|row| cells(row).into_iter().any(spans))
+        });
+    !group_spans
+        && cells(row)
+            .into_iter()
+            .all(|node| leading_content_bottom(doc, column_styles, node, 0) > room)
+}
+
+/// The bottom, from `node`'s top, of the first content the fragmenter can
+/// leave on a page when it splits `node`: the first lines its `orphans` and
+/// `widows` let it leave when it is an inline root of several (all of them
+/// when they let it split nowhere), else, through its first in-flow child, that
+/// child's own first content, else its whole box (a child kept whole by
+/// `break-inside: avoid`, a single line, an empty box). Padding and gaps
+/// above that content count.
+fn leading_content_bottom(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node: &blitz_dom::Node,
+    depth: usize,
+) -> f32 {
+    let height = node.final_layout.size.height;
+    let kept = column_styles
+        .and_then(|styles| styles.get(&node.id))
+        .is_some_and(|props| {
+            matches!(
+                props.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        });
+    if kept || depth >= crate::MAX_DOM_DEPTH {
+        return height;
+    }
+    let lines = collect_inline_line_metrics(node);
+    if lines.len() > 1 {
+        // The fewest lines a first fragment can hold ([`split_point`]), or
+        // all of them when its `orphans` and `widows` let it split nowhere.
+        let limits = line_limits(doc, column_styles, node.id);
+        let first = (1..lines.len())
+            .find(|&fit| split_point(fit, 0, lines.len(), limits).is_some())
+            .unwrap_or(lines.len());
+        return lines[first - 1].1 - lines[0].0;
+    }
+    if !lines.is_empty() {
+        return height;
+    }
+    let children = node
+        .layout_children
+        .borrow()
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| node.children.clone(), Vec::from);
+    children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .find(|child| {
+            !crate::blitz_adapter::is_whitespace_only_text_node(child)
+                && !crate::blitz_adapter::is_out_of_flow_node(child)
+                && child.final_layout.size.height > 0.0
+        })
+        .map_or(height, |child| {
+            child.final_layout.location.y
+                + leading_content_bottom(doc, column_styles, child, depth + 1)
+        })
+}
+
 /// The bottom of the later rows that a row's cells reach, given the bottom
 /// of its cells and the extent `(top, bottom)` of the cells of each later row
 /// of its group, in order (`None` for a row without cells). A cell spanning
@@ -2485,6 +2594,17 @@ fn fragment_table_cell(
         remaining_repeat_budget,
         lifted,
     );
+    // The walk ends at the content's bottom. A cell that ends on its first
+    // page is placed by its layout box, but one that continued ends there
+    // too: its last fragment, and the row, end below its bottom padding and
+    // border, sliced at the page foot.
+    let end = if page > page_in {
+        let layout = doc.get_node(cell_id).map(|node| node.final_layout);
+        let bottom_edge = layout.map_or(0.0, |l| l.padding.bottom + l.border.bottom);
+        (cursor + content_top + bottom_edge).min(page_height_px.max(cursor + content_top))
+    } else {
+        cursor + content_top
+    };
     for (node_id, mut source) in cell_geometry {
         for fragment in &mut source.fragments {
             if node_id == cell_id && fragment.page_index > page_in {
@@ -2492,6 +2612,16 @@ fn fragment_table_cell(
             } else {
                 fragment.y = (fragment.y.to_f32() + content_top).as_px();
             }
+        }
+        if node_id == cell_id
+            && page > page_in
+            && let Some(last) = source
+                .fragments
+                .iter_mut()
+                .rev()
+                .find(|fragment| fragment.page_index == page)
+        {
+            last.height = (end - last.y.to_f32()).max(last.height.to_f32()).as_px();
         }
         let target = geometry.entry(node_id).or_default();
         if target.fragments.is_empty() {
@@ -2503,7 +2633,7 @@ fn fragment_table_cell(
         target.is_repeat |= source.is_repeat;
         target.lift_px += source.lift_px;
     }
-    (page, cursor + content_top)
+    (page, end)
 }
 
 fn fragmented_descendant_page_extent(
@@ -3354,6 +3484,41 @@ fn fragment_block_subtree_inner(
         // A cell of a row kept whole places whole too, and the row's
         // extent, not the cell's, decides whether it moves on.
         let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
+        // A row none of whose cells can place content in the rest of the
+        // page moves to the next one whole, leaving no empty cell boxes at
+        // the page foot: a cell has no break point between its top edge and
+        // its first content. Its other cells follow it there, as those of a
+        // kept row do, and a row that is the table's first leaves nothing
+        // of the table behind.
+        if kept_row_bottom.is_none()
+            && child_page_y > 0.0
+            && row_places_nothing_in(doc, column_styles, child, page_height_px - child_page_y)
+        {
+            let should_emit = cursor_y > page_start_y
+                && row_state
+                    .as_mut()
+                    .map(|rs| rs.emitted_parent_pages.insert(page_index))
+                    .unwrap_or(true);
+            if should_emit {
+                geometry
+                    .entry(parent_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index,
+                        x: parent_x_in_body.as_px(),
+                        y: page_start_y.as_px(),
+                        width: parent_w.as_px(),
+                        height: (cursor_y - page_start_y).as_px(),
+                    });
+            }
+            page_index += 1;
+            cursor_y = 0.0;
+            page_start_y = 0.0;
+            page_taffy_origin = this_top_in_parent;
+            child_page_y = 0.0;
+            initial_page_occupied = false;
+        }
         // A child taller than a page is not kept whole: it splits between
         // its lines, as at the body level, instead of being placed as one
         // fragment that runs past the page foot.
@@ -7195,12 +7360,27 @@ mod tests {
         assert!((right[0].y.to_f32() - left[0].y.to_f32()).abs() < 0.5);
     }
 
-    /// A one-cell table, its cell padded 10 px above and below and holding
-    /// ten 20 px blocks `d1` to `d10`, under `head`, laid out on 100 px pages.
-    fn padded_cell_pass(head: &str) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
-        let blocks = (1..=10)
-            .map(|n| format!(r#"<div id="d{n}">{n}</div>"#))
-            .collect::<String>();
+    /// A table on 100 px pages whose cells are padded 10 px above and below,
+    /// under `head`, after the rows `before`: a row of the cell `cell`
+    /// holding ten 20 px blocks `d1` to `d10`, then, when `side`, the cell
+    /// `side` holding `e1` to `e10`; then a 20 px block `after`. `css` comes
+    /// last.
+    fn padded_cell_pass(
+        head: &str,
+        before: &str,
+        side: bool,
+        css: &str,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let blocks = |prefix: &str| {
+            (1..=10)
+                .map(|n| format!(r#"<div id="{prefix}{n}">{n}</div>"#))
+                .collect::<String>()
+        };
+        let side = if side {
+            format!(r#"<td id="side">{}</td>"#, blocks("e"))
+        } else {
+            String::new()
+        };
         let html = format!(
             r#"<!doctype html>
             <html><head><style>
@@ -7208,15 +7388,21 @@ mod tests {
               table {{ margin: 0; border-spacing: 0; width: 100px; }}
               th {{ box-sizing: border-box; height: 20px; padding: 0; }}
               td {{ padding: 10px 0; }}
-              td > div {{ height: 20px; }}
+              td > div, #after {{ height: 20px; }}
+              {css}
             </style></head><body>
-              <table>{head}<tbody><tr><td id="cell">{blocks}</td></tr></tbody></table>
-            </body></html>"#
+              <table>{head}<tbody>{before}<tr><td id="cell">{}</td>{side}</tr></tbody></table>
+              <div id="after"></div>
+            </body></html>"#,
+            blocks("d")
         );
         let mut doc = parse(&html, 200.0);
         let geometry = run_pass(&mut doc, 100.0);
         (doc, geometry)
     }
+
+    /// The header row of [`padded_cell_pass`]'s tables that have one.
+    const PADDED_HEAD: &str = r#"<thead><tr><th id="h">H</th></tr></thead>"#;
 
     /// A cell split by a page break keeps its top padding on each page it
     /// continues on, as `box-decoration-break: clone` would: its content
@@ -7224,10 +7410,12 @@ mod tests {
     /// page. The cell's fragment there starts at the page top, so its
     /// background covers the padding. Four blocks fit each page below the
     /// padding: `d5` and `d9` open pages 1 and 2 at y 10 (at 0 without the
-    /// repeat, five blocks a page).
+    /// repeat, five blocks a page). Its last fragment ends below its bottom
+    /// padding, and so does the table: `after` follows at y 60, not against
+    /// `d10`'s bottom at 50.
     #[test]
     fn a_continued_table_cell_repeats_its_top_padding() {
-        let (doc, geometry) = padded_cell_pass("");
+        let (doc, geometry) = padded_cell_pass("", "", false, "");
 
         assert_eq!(placements(&doc, &geometry, "d4"), [(0, 70.0)]);
         assert_eq!(placements(&doc, &geometry, "d5"), [(1, 10.0)]);
@@ -7239,13 +7427,31 @@ mod tests {
             [(0, 0.0), (1, 0.0), (2, 0.0)],
             "each fragment of the cell starts at its page top"
         );
+        let cell = &geometry[&find_by_id(&doc, "cell").unwrap()].fragments;
+        assert_eq!(cell.last().unwrap().height.to_f32(), 60.0);
+        assert_eq!(placements(&doc, &geometry, "after"), [(2, 60.0)]);
+    }
+
+    /// A cell's top border repeats with its padding: its content restarts
+    /// 15 px down for a 5 px border and 10 px of padding.
+    #[test]
+    fn a_continued_table_cell_repeats_its_top_border() {
+        let (doc, geometry) =
+            padded_cell_pass("", "", false, "#cell { border-top: 5px solid black; }");
+
+        assert_eq!(placements(&doc, &geometry, "d1"), [(0, 15.0)]);
+        assert_eq!(placements(&doc, &geometry, "d4"), [(0, 75.0)]);
+        assert_eq!(placements(&doc, &geometry, "d5"), [(1, 15.0)]);
+        assert_eq!(placements(&doc, &geometry, "d9"), [(2, 15.0)]);
+        assert_eq!(placements(&doc, &geometry, "after"), [(2, 65.0)]);
     }
 
     /// Under a repeated header a continued cell starts at the header's
-    /// bottom and its content one padding lower.
+    /// bottom and its content one padding lower; each cell of the row
+    /// repeats its own padding.
     #[test]
     fn a_continued_table_cell_repeats_its_top_padding_below_a_repeated_header() {
-        let (doc, geometry) = padded_cell_pass(r#"<thead><tr><th id="h">H</th></tr></thead>"#);
+        let (doc, geometry) = padded_cell_pass(PADDED_HEAD, "", false, "");
 
         assert_eq!(placements(&doc, &geometry, "d3"), [(0, 70.0)]);
         assert_eq!(placements(&doc, &geometry, "d4"), [(1, 30.0)]);
@@ -7253,6 +7459,33 @@ mod tests {
             placements(&doc, &geometry, "cell")[..2],
             [(0, 20.0), (1, 20.0)]
         );
+
+        let (doc, geometry) = padded_cell_pass(PADDED_HEAD, "", true, "#side { padding: 20px 0; }");
+        assert_eq!(placements(&doc, &geometry, "d4"), [(1, 30.0)]);
+        assert_eq!(placements(&doc, &geometry, "e3"), [(0, 80.0)]);
+        assert_eq!(placements(&doc, &geometry, "e4"), [(1, 40.0)]);
+        assert_eq!(
+            placements(&doc, &geometry, "side")[..2],
+            [(0, 20.0), (1, 20.0)]
+        );
+    }
+
+    /// A row none of whose cells can place content in the rest of the page
+    /// moves to the next page whole, leaving no empty padded box behind: a
+    /// row below a 75 px row has 25 px, and its cell's first block ends
+    /// 30 px below its top.
+    #[test]
+    fn a_row_whose_first_content_does_not_fit_moves_whole() {
+        let before =
+            r#"<tr><td style="padding: 0"><div id="first" style="height: 75px"></div></td></tr>"#;
+        let (doc, geometry) = padded_cell_pass("", before, false, "");
+
+        assert_eq!(placements(&doc, &geometry, "first"), [(0, 0.0)]);
+        assert_eq!(
+            placements(&doc, &geometry, "cell"),
+            [(1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+        assert_eq!(placements(&doc, &geometry, "d1"), [(1, 10.0)]);
     }
 
     #[test]
