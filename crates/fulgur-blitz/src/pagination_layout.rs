@@ -5375,10 +5375,43 @@ fn clips_overflow(node: &blitz_dom::Node) -> bool {
     })
 }
 
+/// Whether `item`, a child of the flex or grid container `container`,
+/// shares its row with another item: an in-flow sibling whose layout
+/// extent overlaps its own vertically. A flex column, or a grid of one
+/// column, stacks its items, as block flow does.
+fn item_shares_its_row(
+    doc: &BaseDocument,
+    container: &blitz_dom::Node,
+    item: &blitz_dom::Node,
+) -> bool {
+    let (top, bottom) = (
+        item.final_layout.location.y,
+        item.final_layout.location.y + item.final_layout.size.height,
+    );
+    let layout_children = container.layout_children.borrow();
+    let children = layout_children
+        .as_deref()
+        .filter(|children| !children.is_empty())
+        .unwrap_or(&container.children);
+    children
+        .iter()
+        .filter(|&&id| id != item.id)
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|sibling| {
+            !crate::blitz_adapter::is_whitespace_only_text_node(sibling)
+                && !crate::blitz_adapter::is_out_of_flow_node(sibling)
+        })
+        .any(|sibling| {
+            let layout = sibling.final_layout;
+            layout.location.y < bottom - 0.5 && layout.location.y + layout.size.height > top + 0.5
+        })
+}
+
 /// Whether a box taller than a page that the walker does not enter may be
-/// sliced where it is, at any depth: in block flow only. Not in a table
-/// cell or a flex or grid item, of a flex or grid body too: the items of a
-/// row share its height (a cell or item stretched past the page by a taller
+/// sliced where it is, at any depth: in block flow, or in a flex or grid
+/// item alone in its row, only. Not in a table cell or a flex or grid item
+/// that shares its row ([`item_shares_its_row`]), of the body too: the
+/// items of a row share its height (a cell or item stretched past the page by a taller
 /// neighbour is one), and a row is no unit the walker fragments, so one
 /// that continued on the next page would take the walk of the cells or
 /// items beside it there, or back to the row's start. Nor past the bottom
@@ -5390,6 +5423,7 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
         return false;
     }
     let mut bottom = node.final_layout.location.y + node.final_layout.size.height;
+    let mut below = node;
     let mut next = node.parent;
     while let Some(ancestor) = next.and_then(|id| doc.get_node(id)) {
         let is_body = ancestor
@@ -5397,7 +5431,8 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
             .is_some_and(|el| el.name.local.as_ref() == "body");
         let layout = ancestor.final_layout;
         if displays(ancestor, DisplayInside::TableCell)
-            || crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
+            || (crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
+                && item_shares_its_row(doc, ancestor, below))
             || (!is_body && clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
         {
             return false;
@@ -5406,6 +5441,7 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
             return true;
         }
         bottom += layout.location.y;
+        below = ancestor;
         next = ancestor.parent;
     }
     true
@@ -10662,6 +10698,55 @@ h2 { string-set: chapter-title content(text); }
                 .collect::<Vec<_>>()
         };
         assert_eq!((at("a"), at("b")), (vec![(0, 0.0)], vec![(0, 0.0)]));
+    }
+
+    /// A grid of one column stacks its items: a box taller than a page in
+    /// an item alone in its row is sliced, as in block flow (WPT
+    /// `css-page/monolithic-overflow-008`).
+    #[test]
+    fn a_tall_box_in_the_item_of_a_one_column_grid_is_sliced() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0">
+              <div style="display: grid">
+                <div><div id="a" style="height: 250px"></div></div>
+              </div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let geom = run_pass(doc.deref_mut(), 100.0);
+        let a = &geom[&find_by_id(&doc, "a").unwrap()].fragments;
+        assert_eq!(a.len(), 3, "{a:?}");
+    }
+
+    /// A flex column places its items one below the other, as block flow
+    /// does: an item taller than a page is sliced, and what follows it
+    /// starts after its last slice (WPT `css-page/monolithic-overflow-005`).
+    #[test]
+    fn a_tall_item_of_a_flex_column_is_sliced() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0">
+              <div style="display: flex; flex-flow: column">
+                <div id="a" style="height: 250px"></div>
+                <div id="b" style="height: 20px"></div>
+              </div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let geom = run_pass(doc.deref_mut(), 100.0);
+        let at = |id: &str| {
+            geom[&find_by_id(&doc, id).unwrap()]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (at("a"), at("b")),
+            (
+                vec![(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)],
+                vec![(2, 50.0, 20.0)]
+            )
+        );
     }
 
     /// A flex body's item taller than a page is not sliced, as a nested flex
