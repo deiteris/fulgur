@@ -2882,11 +2882,11 @@ fn draw_table_v2(
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
-    // A split table can record a zero-height fragment — nested tables
-    // whose header does not fit the remaining outer strip do this on
-    // page 0. `table_box_size` then falls back to the full layout box
-    // (the unsplit zero-height path still needs `cached_height`), so
-    // painting here would leak a full-size frame as a sliver.
+    // A split table can record a zero-height fragment: a nested table
+    // whose last row forces a break after it closes with one on the
+    // page the break opens. `table_box_size` then falls back to the full
+    // layout box (the unsplit zero-height path still needs
+    // `cached_height`), so painting here would leak a full-size frame.
     if geom.is_split() && frag.height <= crate::units::Px::ZERO {
         return;
     }

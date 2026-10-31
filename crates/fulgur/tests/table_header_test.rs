@@ -177,12 +177,13 @@ fn repeated_table_header_renders_with_clip_link_and_tags() {
     }
 }
 
-/// Nested table whose header does not fit the remaining outer strip
-/// records a zero-height fragment on page 0. Without a paint guard,
-/// `table_box_size` falls back to the full layout box and the inner
-/// table's red frame leaks as a sliver on that page.
+/// A nested table whose last row forces a break after it closes with a
+/// zero-height fragment on the page the break opens. Without a paint
+/// guard, `table_box_size` falls back to the full layout box for that
+/// slice and the inner table's red frame leaks onto the page that holds
+/// none of its rows.
 #[test]
-fn nested_oversized_inner_table_does_not_paint_zero_height_frame() {
+fn a_zero_height_slice_of_a_split_nested_table_paints_no_frame() {
     let html = r#"<!doctype html>
 <html><head><style>
   html, body { margin: 0; padding: 0; }
@@ -191,18 +192,20 @@ fn nested_oversized_inner_table_does_not_paint_zero_height_frame() {
   th, td { box-sizing: border-box; padding: 0; }
   #outer-header { height: 20px; }
   #inner { background: rgb(255, 0, 0); }
-  #inner-header { height: 80px; }
-  #inner-body { height: 30px; }
+  .row { height: 30px; }
+  #after { height: 30px; }
 </style></head><body>
   <div id="lead"></div>
   <table><thead><tr><th id="outer-header">Outer</th></tr></thead><tbody><tr><td>
-    <table id="inner"><thead><tr><th id="inner-header">Inner</th></tr></thead>
-      <tbody><tr><td id="inner-body">Body</td></tr></tbody></table>
+    <table id="inner"><tbody>
+      <tr><td class="row">A</td></tr>
+      <tr><td class="row" style="break-after: page">B</td></tr>
+    </tbody></table>
+    <div id="after"></div>
   </td></tr></tbody></table>
 </body></html>"#;
 
-    // 200×100 CSS px content box (150×75 pt) matches the geometry fixture
-    // `nested_oversized_header_fallback_honors_occupied_outer_strip`.
+    // 200x100 CSS px content box (150x75 pt).
     let engine = Engine::builder()
         .page_size(PageSize {
             width: 150.0,
@@ -210,11 +213,6 @@ fn nested_oversized_inner_table_does_not_paint_zero_height_frame() {
         })
         .margin(fulgur::Margin::uniform(0.0))
         .build();
-    let pdf = engine.render(html).expect("render should succeed");
-    let document = lopdf::Document::load_mem(&pdf).expect("PDF should parse");
-    let pages = document.get_pages();
-    assert!(pages.len() >= 2, "inner table must continue past page 1");
-
     let layout = engine.layout(html).expect("layout should succeed");
     let inner_id = layout
         .drawables
@@ -227,39 +225,35 @@ fn nested_oversized_inner_table_does_not_paint_zero_height_frame() {
         .geometry
         .get(&inner_id)
         .expect("inner table geometry");
-    assert!(
-        inner_geom.is_split(),
-        "inner table must be split so the zero-height page-0 slice hits the leak path"
-    );
-    let page0: Vec<_> = inner_geom
+    assert!(inner_geom.is_split(), "the inner table must be split");
+    let slices: Vec<(u32, bool)> = inner_geom
         .fragments
         .iter()
-        .filter(|fragment| fragment.page_index == 0)
+        .map(|fragment| {
+            (
+                fragment.page_index,
+                fragment.height <= fulgur::units::Px::ZERO,
+            )
+        })
         .collect();
-    assert!(
-        !page0.is_empty(),
-        "inner table must record a page-0 fragment: {:?}",
-        inner_geom.fragments
-    );
-    assert!(
-        page0
-            .iter()
-            .all(|fragment| fragment.height <= fulgur::units::Px::ZERO),
-        "page-0 inner fragments must be zero-height: {page0:?}"
-    );
+    let (empty_page, _) = *slices
+        .iter()
+        .find(|(_, empty)| *empty)
+        .unwrap_or_else(|| panic!("the inner table must record a zero-height slice: {slices:?}"));
+    let (rows_page, _) = *slices
+        .iter()
+        .find(|(_, empty)| !*empty)
+        .expect("the inner table must hold its rows somewhere");
 
+    let pdf = engine.render(html).expect("render should succeed");
+    // PDF pages are numbered from 1.
     assert_eq!(
-        count_red_ops_on_page(&pdf, 1),
+        count_red_ops_on_page(&pdf, empty_page + 1),
         0,
-        "zero-height nested-table fragment must not paint its outer frame on page 1"
+        "a zero-height slice must not paint the inner table's frame"
     );
-    let later_red: usize = pages
-        .keys()
-        .filter(|&&page| page > 1)
-        .map(|&page| count_red_ops_on_page(&pdf, page))
-        .sum();
     assert!(
-        later_red > 0,
-        "inner table red frame must still paint on a later page"
+        count_red_ops_on_page(&pdf, rows_page + 1) > 0,
+        "the inner table's frame must paint where its rows are"
     );
 }
