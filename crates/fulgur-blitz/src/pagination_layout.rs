@@ -3184,9 +3184,11 @@ fn fragment_block_subtree_inner(
         // empty cell boxes at the page foot: a cell has no break point
         // between its top edge and its first content. Its other cells
         // follow it there, as those of a kept row do, and a row that is the
-        // table's first leaves nothing of the table behind.
+        // table's first leaves nothing of the table behind. A row at the top
+        // of a page, below its table's top edge, stays.
         if kept_row_bottom.is_none()
             && child_page_y > 0.0
+            && !cursor.at_page_top()
             && cell_row(doc, child).is_some_and(|row| {
                 !leading_extent(flow, row, page_height_px - child_page_y, page_height_px, 0).places
             })
@@ -3435,7 +3437,10 @@ fn fragment_block_subtree_inner(
         // unforced break `avoid` concerns itself with (fulgur-2s7p.5), and a
         // transformed box only when it is taller than a page.
         let needs_recursion = enters(flow, child, &kind, available_strip, page_height_px);
-        // A box entered with content before it on the page moves whole to
+        // A box entered after content in its container, with content before
+        // it on the page ([`PageCursor::at_page_top`]: a padded top edge or a
+        // margin above it is none, and css-break-3 §4.1 has no break point
+        // between them), moves whole to
         // the next page first, and is entered there, when nothing of it
         // places in the rest of the page: its leading unit does not fit
         // ([`leading_extent`]), as a box not entered moves (the
@@ -3446,6 +3451,7 @@ fn fragment_block_subtree_inner(
             && !displays(child, DisplayInside::TableCell)
             && (child_page_y > cursor.page_start_y
                 || (cursor.entered_below_content && cursor.page_index == page_in))
+            && !cursor.at_page_top()
         {
             let lead = leading_of(
                 flow,
@@ -3624,12 +3630,15 @@ fn fragment_block_subtree_inner(
         // A cell of a row kept whole moves when the row does not fit, also
         // as the first row of a table that starts on this page; the table
         // then leaves nothing behind when no content of it precedes the row.
+        // Nothing moves at the top of a page, below a top edge or a margin
+        // only ([`PageCursor::at_page_top`]): it would leave them alone.
         let child_extent =
             kept_row_bottom.map_or(child_h, |bottom| child_h.max(bottom - this_top_in_parent));
         let kept_row_moves = kept_row_bottom.is_some() && child_page_y > 0.0;
         if (child_page_y > cursor.page_start_y
             || (cursor.entered_below_content && cursor.page_index == page_in)
             || kept_row_moves)
+            && !cursor.at_page_top()
             && child_page_y + child_extent > page_height_px
         {
             let leaves_parent = kept_row_bottom.is_none() || cursor.cursor_y > cursor.page_start_y;
@@ -12356,6 +12365,56 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(fragments, [(0, 0.0, 48.0), (1, 0.0, 48.0)]);
         assert_eq!(geometry[&p].line_boundaries, [0, 3, 6]);
         assert_eq!(placements(&doc, &geometry, "after"), [(1, 48.0)]);
+    }
+
+    /// `body` after a forced break on 100 px pages, the page the walk then
+    /// starts empty, laid out with its break styles.
+    fn after_a_forced_break(body: &str) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let html = format!(
+            r#"<html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ border-spacing: 0; }}
+              td {{ padding: 0; }}
+            </style></head><body><div style="height: 20px; break-after: page"></div>{body}</body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    /// A box at the top of a page never moves to the next one: a padded top
+    /// edge above it is no content, and css-break-3 §4.1 has no break point
+    /// between it and the box, so moving would leave the page holding the
+    /// edge alone. A 95 px block kept whole below a 10 px top padding stays
+    /// on the page it opens (the strip cut), and so does one entered for its
+    /// children (the move before entering a box), past the foot by 5 px.
+    #[test]
+    fn a_box_below_a_padded_top_edge_at_the_page_top_stays() {
+        let (doc, geometry) = after_a_forced_break(
+            r#"<div style="padding-top: 10px"><div id="k" style="break-inside: avoid; height: 95px"></div></div>"#,
+        );
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0)]);
+
+        let (doc, geometry) = after_a_forced_break(
+            r#"<div style="padding-top: 10px"><div id="k"><div style="break-inside: avoid; height: 95px"></div><div id="n" style="height: 20px"></div></div></div>"#,
+        );
+        assert_eq!(placements(&doc, &geometry, "k")[0], (1, 10.0));
+        assert_eq!(placements(&doc, &geometry, "n"), [(2, 0.0)]);
+    }
+
+    /// A table row at the top of a page, below its table's top border, never
+    /// moves to the next page: neither one whose cell's first block does
+    /// not fit below the border (the row move) nor one kept whole.
+    #[test]
+    fn a_first_row_below_its_tables_top_edge_at_the_page_top_stays() {
+        for row in ["", " style=\"break-inside: avoid\""] {
+            let (doc, geometry) = after_a_forced_break(&format!(
+                r#"<table style="border-top: 10px solid"><tr{row}><td id="c"><div style="height: 95px"></div></td></tr></table>"#
+            ));
+            assert_eq!(placements(&doc, &geometry, "c"), [(1, 10.0)], "{row}");
+        }
     }
 
     /// A gap between a box's content edge and its first child's margin edge
