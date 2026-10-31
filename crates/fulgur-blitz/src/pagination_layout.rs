@@ -1959,21 +1959,23 @@ fn kept_table_row_bottom(
 /// The bottom, below the top of `node`, of the box that opens `node` and
 /// places whole, when it fits a strip of `page_height_px`; `None` when no
 /// such box opens it. The box is `node`'s first in-flow child, or the box
-/// that opens that child, down through block containers, as long as no
-/// padding or border stands above each. A box places whole when it is kept
-/// whole (`break-inside: avoid`), an inline root of one line, a box with no
-/// children (a replaced element, a sized empty block), or transformed: the
-/// walker splits none of them, and the strip-overflow cut moves one to the
-/// next page only when something precedes it in its container.
+/// that opens that child, down through block containers, as long as no gap
+/// parts each from its container's content edge. A box places whole when it
+/// is kept whole (`break-inside: avoid`), an inline root of one line, a box
+/// with no children (a replaced element, a sized empty block), or
+/// transformed: the walker splits none of them, and the strip-overflow cut
+/// moves one to the next page only when something precedes it in its
+/// container.
 ///
 /// css-break-3 §4.1 has no break point between a container's start and its
 /// first child: breaks are between siblings, which is why §3.1 propagates a
 /// first child's `break-before` to its container. So a box that opens `node`
 /// and crosses the page foot moves `node` to the next page with it, instead
-/// of staying where `node` starts, past the foot. With padding or border
-/// above the child, the walker already moves the child alone, leaving that
-/// edge of its container on the page (it counts the edge as content above
-/// the child); the descent stops there and leaves that as it was.
+/// of staying where `node` starts, past the foot. Padding and border lie
+/// outside the content edge, so they are no break point either: a padded
+/// container moves whole, leaving no sliver of its top edge at the foot.
+/// Only a gap between the content edge and the child's margin edge (class
+/// C) is one, and the descent stops there.
 fn opening_whole_box_bottom(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -11981,11 +11983,11 @@ h2 { string-set: chapter-title content(text); }
 
     /// css-break-3 §4.1 has no break point between a container's start and
     /// its first child. A box the walker places whole (kept whole, one line,
-    /// a replaced element) that opens its container, with no padding or
-    /// border above it, moves the container to the next page with it when it
-    /// crosses the page foot after other content, at any depth, instead of
-    /// staying past the foot. With padding above it, the box moves alone, and
-    /// its container starts on the first page, as before.
+    /// a replaced element) that opens its container moves the container to
+    /// the next page with it when it crosses the page foot after other
+    /// content, at any depth, instead of staying past the foot. Padding above
+    /// the box is no break point either: the padded container moves whole,
+    /// leaving no sliver of its top edge on the first page.
     #[test]
     fn a_box_placed_whole_opening_its_container_moves_the_container_to_the_next_page() {
         let kept = r#"<p id="k" style="break-inside: avoid">K1<br>K2</p><p>N</p>"#;
@@ -12008,7 +12010,7 @@ h2 { string-set: chapter-title content(text); }
             (format!(r#"<p>Z</p><div id="c">{image}</div>"#), &[1]),
             (
                 format!(r#"<p>Z</p><div id="c" style="padding-top: 1px">{kept}</div>"#),
-                &[0, 1],
+                &[1],
             ),
         ] {
             assert_eq!(
