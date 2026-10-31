@@ -18,7 +18,7 @@ html[1]/body[1]/table#t2[5] page=3 x=0.00 y=0.00 w=100.00 h=40.00 lift=20.00
 html[1]/body[1]/table#t2[5]/thead[0]/tr[1]/th#h2[0] page=3 x=0.00 y=0.00 w=100.00 h=20.00
 html[1]/body[1]/table#t2[5]/tbody[1]/tr[0]/td#only[0] page=3 x=0.00 y=20.00 w=100.00 h=20.00
 html[1]/body[1]/div#after2[7] page=3 x=0.00 y=40.00 w=200.00 h=20.00
-html[1]/body[1]/div[9] page=4 x=0.00 y=0.00 w=200.00 h=140.00
+html[1]/body[1]/div[9] page=4 x=0.00 y=0.00 w=200.00 h=80.00
 html[1]/body[1]/div[9] page=5 x=0.00 y=0.00 w=200.00 h=80.00
 html[1]/body[1]/div[9]/caption#c3[0] page=4 x=0.00 y=0.00 w=200.00 h=20.00
 html[1]/body[1]/div[9]/table#t3[1] page=4 x=0.00 y=20.00 w=100.00 h=60.00

@@ -3469,7 +3469,7 @@ fn fragment_block_subtree_inner(
                 rs.started_on_occupied_strip && rs.start.page_index == cursor.page_index
             });
             let pre_recursion_page = cursor.page_index;
-            let pre_recursion_cursor_y = cursor.cursor_y;
+
             // fulgur-u0p0: enter recursion from `child_page_y` (the rebased
             // page-local y of THIS child) instead of the parent's running
             // `cursor_y`. For block flow, `child_page_y == cursor_y` after
@@ -3544,25 +3544,17 @@ fn fragment_block_subtree_inner(
                 // recursion would not have advanced past that
                 // page), so the previous-page fragment spans
                 // `[page_start_y, page_height_px]` and any
-                // intermediate page is a full strip.
-                //
-                // Match the no-recursion strip-overflow shape
-                // (line ~1713): the parent fragment's height is
-                // its accumulated logical content on the
-                // previous page, treated as if the splitting
-                // child had been laid out in full (without
-                // fragmentation). The renderer clips the
-                // overflow visually. Using the visible page
-                // strip (`page_height_px - page_start_y`)
-                // instead would stop short of the page's
-                // margin-area paint that adjacent passing tests
-                // (mo-006/008) expect.
+                // intermediate page is a full strip. It ends at the
+                // page foot, not with the crossing child's whole
+                // height: a box taller than a page in the child is
+                // sliced, and a parent fragment that took its height
+                // painted the child's background of every page on
+                // the first (WPT css-page monolithic-overflow-006,
+                // -008).
                 let prev_height = if occupied_before_recursion || row_started_on_occupied_strip {
                     occupied_page_extent
                 } else {
-                    let logical_height =
-                        (pre_recursion_cursor_y + child_h - cursor.page_start_y).max(0.0);
-                    logical_height.max(cursor.parent_height(ParentHeight::ToFoot))
+                    cursor.parent_height(ParentHeight::ToFoot)
                 };
                 if prev_height > 0.0
                     && !cursor.close_parent_once(geometry, ParentHeight::Measured(prev_height))
@@ -12273,6 +12265,61 @@ h2 { string-set: chapter-title content(text); }
             ),
         ] {
             assert_eq!(pages_after_65px(&body, &["k", "c"]), [[1], [1]], "{body}");
+        }
+    }
+
+    /// A box taller than a page in the block that is the only item of a
+    /// flex column, or of a one-column grid, is sliced, and so are the item
+    /// and the container around it: their fragments on each page the box
+    /// crosses end at the page foot, and the text after the box follows the
+    /// last slice (WPT css-page `monolithic-overflow-006-print`, `-008`).
+    /// The container's first fragment took the item's whole height, so the
+    /// container painted it all on the first page.
+    #[test]
+    fn a_wrapper_item_around_a_box_taller_than_a_page_ends_at_each_page_foot() {
+        for container in [
+            "display: flex; flex-flow: column",
+            "display: grid; grid-template-columns: 1fr",
+        ] {
+            let html = format!(
+                r#"<html><head><style>
+                  html, body {{ margin: 0; padding: 0; }}
+                </style></head><body>
+                  <div id="c" style="{container}">
+                    <div id="item"><div id="tall" style="contain: size; height: 250px; width: 50px"></div><span>after</span></div>
+                  </div>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geometry =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+            let spans = |id: &str| -> Vec<(u32, f32, f32)> {
+                let node_id = find_by_id(&doc, id).expect(id);
+                geometry[&node_id]
+                    .fragments
+                    .iter()
+                    .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                    .collect()
+            };
+            assert_eq!(
+                spans("tall"),
+                [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)],
+                "{container}"
+            );
+            let item = spans("item");
+            assert_eq!(
+                item[..2],
+                [(0, 0.0, 100.0), (1, 0.0, 100.0)],
+                "{container}: {item:?}"
+            );
+            assert_eq!(item[2].0, 2, "{container}: {item:?}");
+            let outer = spans("c");
+            assert_eq!(
+                outer[..2],
+                [(0, 0.0, 100.0), (1, 0.0, 100.0)],
+                "{container}: {outer:?}"
+            );
         }
     }
 

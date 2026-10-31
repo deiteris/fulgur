@@ -1,5 +1,5 @@
 html[1]/body[1] page=0 x=0.00 y=0.00 w=200.00 h=565.00
-html[1]/body[1]/table[1] page=0 x=0.00 y=0.00 w=100.00 h=240.00
+html[1]/body[1]/table[1] page=0 x=0.00 y=0.00 w=100.00 h=100.00
 html[1]/body[1]/table[1] page=1 x=0.00 y=0.00 w=100.00 h=100.00
 html[1]/body[1]/table[1] page=2 x=0.00 y=0.00 w=100.00 h=100.00
 html[1]/body[1]/table[1] page=3 x=0.00 y=0.00 w=100.00 h=60.00
@@ -37,7 +37,7 @@ html[1]/body[1]/table[1]/tbody[1]/tr[0]/td#side[1]/div[8] page=2 x=50.00 y=70.00
 html[1]/body[1]/table[1]/tbody[1]/tr[0]/td#side[1]/div[9] page=3 x=50.00 y=30.00 w=50.00 h=20.00
 html[1]/body[1]/div[3] page=3 x=0.00 y=60.00 w=200.00 h=20.00
 html[1]/body[1]/table[5] page=4 x=0.00 y=0.00 w=100.00 h=75.00
-html[1]/body[1]/table[5] page=5 x=0.00 y=0.00 w=100.00 h=120.00
+html[1]/body[1]/table[5] page=5 x=0.00 y=0.00 w=100.00 h=100.00
 html[1]/body[1]/table[5] page=6 x=0.00 y=0.00 w=100.00 h=40.00
 html[1]/body[1]/table[5]/tbody[0]/tr[0]/td[0] page=4 x=0.00 y=0.00 w=100.00 h=75.00
 html[1]/body[1]/table[5]/tbody[0]/tr[0]/td[0]/div#first[0] page=4 x=0.00 y=0.00 w=100.00 h=75.00
