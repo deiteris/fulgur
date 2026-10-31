@@ -1568,23 +1568,6 @@ struct Leading {
     /// The box places content in the room it was asked for: the unit, or
     /// the whole box, fits it.
     places: bool,
-    /// What the unit is.
-    unit: Unit,
-}
-
-/// What a box's leading unit is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unit {
-    /// A box placed whole.
-    Box,
-    /// The first lines of an inline root of several.
-    Lines,
-    /// A box's top edge, before a gap that is a break opportunity.
-    Edge,
-    /// A flex or grid line, or a table row.
-    Row,
-    /// A table: its top edge, its repeated header, and its first row.
-    Table,
 }
 
 impl Leading {
@@ -1593,7 +1576,6 @@ impl Leading {
         Self {
             extent,
             places: extent <= room,
-            unit: Unit::Box,
         }
     }
 
@@ -1655,10 +1637,9 @@ fn leading_of(
     if depth >= crate::MAX_DOM_DEPTH {
         return whole;
     }
-    let within = |inner: Leading, offset: f32, unit: Unit| Leading {
+    let within = |inner: Leading, offset: f32| Leading {
         extent: offset + inner.extent,
         places: height <= room || inner.places,
-        unit,
     };
     match kind {
         BoxKind::Monolithic(Whole::Kept)
@@ -1706,7 +1687,6 @@ fn leading_of(
             Leading {
                 extent,
                 places: places || (!row && height <= room),
-                unit: Unit::Row,
             }
         }
         BoxKind::Table { table, .. } => {
@@ -1722,7 +1702,7 @@ fn leading_of(
                 table.final_layout.location.y
             };
             let inner = table_leading(flow, table, room - offset, page_height_px, depth + 1);
-            within(inner, offset, Unit::Table)
+            within(inner, offset)
         }
         _ => {
             if !enters(flow, node, kind, room, page_height_px) {
@@ -1740,7 +1720,6 @@ fn leading_of(
                 return Leading {
                     extent: content_top,
                     places: height <= room || content_top <= room,
-                    unit: Unit::Edge,
                 };
             }
             let inner = leading_extent(
@@ -1750,7 +1729,7 @@ fn leading_of(
                 page_height_px,
                 depth + 1,
             );
-            within(inner, layout.location.y, inner.unit)
+            within(inner, layout.location.y)
         }
     }
 }
@@ -1773,7 +1752,6 @@ fn inline_leading(lines: &[(f32, f32)], limits: LineLimits, room: f32) -> Leadin
     Leading {
         extent,
         places: extent <= room,
-        unit: Unit::Lines,
     }
 }
 
@@ -1821,7 +1799,6 @@ fn table_leading(
         return Leading {
             extent: band + inner.extent,
             places: inner.places,
-            unit: Unit::Table,
         };
     }
     let Some(row) = in_flow_children(doc, table)
@@ -1838,7 +1815,6 @@ fn table_leading(
     Leading {
         extent: top + inner.extent,
         places: inner.places,
-        unit: Unit::Table,
     }
 }
 
@@ -3479,7 +3455,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if lead.unit != Unit::Edge && lead.moves_on(page_height_px) {
+            if lead.moves_on(page_height_px) {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
                 cursor.advance();
                 cursor.page_taffy_origin = this_top_in_parent;
@@ -12298,6 +12274,26 @@ h2 { string-set: chapter-title content(text); }
         ] {
             assert_eq!(pages_after_65px(&body, &["k", "c"]), [[1], [1]], "{body}");
         }
+    }
+
+    /// A gap between a box's content edge and its first child's margin edge
+    /// is a break opportunity (class C), so a box whose top edge fits the
+    /// rest of the page is entered there; one whose top edge alone does
+    /// not, a 40 px border against the 35 px left, moves to the next page
+    /// whole instead of leaving its edge past the foot. The gap is the
+    /// margin of an empty block before the paragraph.
+    #[test]
+    fn a_box_whose_top_edge_before_a_gap_does_not_fit_moves_whole() {
+        let body = |border: u8| {
+            format!(
+                r#"<p>Z</p><div id="c" style="border-top: {border}px solid"><div style="margin-bottom: 30px"></div><p id="k">K</p></div>"#
+            )
+        };
+        assert_eq!(pages_after_65px(&body(40), &["k", "c"]), [[1], [1]]);
+        assert_eq!(
+            pages_after_65px(&body(10), &["k", "c"]),
+            [vec![1], vec![0, 1]]
+        );
     }
 
     /// A flex or grid row none of whose items places content in the rest of
