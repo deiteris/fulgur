@@ -1,0 +1,4 @@
+html[0]/body[1] page=0 x=0.00 y=0.00 w=793.00 h=204.00
+html[0]/body[1]/div[0] page=0 x=0.00 y=0.00 w=793.00 h=204.00
+html[0]/body[1]/div[0]/div[1] page=0 x=40.00 y=40.00 w=124.00 h=124.00
+html[0]/body[1]/div[0]/div[1]/div[0] page=0 x=42.00 y=42.00 w=200.00 h=200.00

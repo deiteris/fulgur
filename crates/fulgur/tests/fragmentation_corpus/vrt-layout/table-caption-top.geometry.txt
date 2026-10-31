@@ -1,0 +1,8 @@
+html[0]/body[1] page=0 x=0.00 y=0.00 w=793.00 h=211.00
+html[0]/body[1]/div[1] page=0 x=40.00 y=40.00 w=713.00 h=131.00
+html[0]/body[1]/div[1]/caption[0] page=0 x=40.00 y=40.00 w=713.00 h=38.00
+html[0]/body[1]/div[1]/table[1] page=0 x=40.00 y=78.00 w=713.00 h=93.00
+html[0]/body[1]/div[1]/table[1]/tbody[2]/tr[1]/td[0] page=0 x=40.00 y=78.00 w=366.00 h=47.00
+html[0]/body[1]/div[1]/table[1]/tbody[2]/tr[1]/td[1] page=0 x=406.00 y=78.00 w=347.00 h=47.00
+html[0]/body[1]/div[1]/table[1]/tbody[2]/tr[3]/td[0] page=0 x=40.00 y=124.00 w=366.00 h=46.00
+html[0]/body[1]/div[1]/table[1]/tbody[2]/tr[3]/td[1] page=0 x=406.00 y=124.00 w=347.00 h=46.00

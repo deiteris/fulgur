@@ -1,0 +1,20 @@
+<!-- page: 200 200 -->
+<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { border-spacing: 0; }
+  td { padding: 0; }
+  p { margin: 0; line-height: 20px; }
+  .keep { break-inside: avoid; }
+</style></head><body>
+  <div style="height: 160px"></div>
+  <div id="kept" class="keep"><div style="height: 30px"></div><div style="height: 30px"></div></div>
+  <p id="kept-p" class="keep">a<br>b<br>c</p>
+  <div style="height: 60px"></div>
+  <table><tr class="keep">
+    <td id="short">x</td>
+    <td><div id="a" style="height: 30px"></div><div style="height: 30px"></div><div style="height: 30px"></div></td>
+  </tr></table>
+  <div id="huge" class="keep"><div style="height: 120px"></div><div style="height: 120px"></div></div>
+  <p id="tall-p" class="keep">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10<br>11<br>12</p>
+</body></html>

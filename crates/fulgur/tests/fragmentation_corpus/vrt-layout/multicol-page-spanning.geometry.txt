@@ -1,0 +1,14 @@
+html[0]/body[1] page=0 x=0.00 y=0.00 w=793.00 h=240.00
+html[0]/body[1]/div[0] page=0 x=0.00 y=0.00 w=793.00 h=240.00
+html[0]/body[1]/div[0]/div[1] page=0 x=0.00 y=0.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[2] page=0 x=0.00 y=40.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[4] page=0 x=0.00 y=80.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[5] page=0 x=0.00 y=120.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[7] page=0 x=0.00 y=160.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[8] page=0 x=0.00 y=200.00 w=389.00 h=40.00
+html[0]/body[1]/div[0]/div[10] page=0 x=405.00 y=0.00 w=388.00 h=40.00
+html[0]/body[1]/div[0]/div[11] page=0 x=405.00 y=40.00 w=388.00 h=40.00
+html[0]/body[1]/div[0]/div[13] page=0 x=405.00 y=80.00 w=388.00 h=40.00
+html[0]/body[1]/div[0]/div[14] page=0 x=405.00 y=120.00 w=388.00 h=40.00
+html[0]/body[1]/div[0]/div[16] page=0 x=405.00 y=160.00 w=388.00 h=40.00
+html[0]/body[1]/div[0]/div[17] page=0 x=405.00 y=200.00 w=388.00 h=40.00

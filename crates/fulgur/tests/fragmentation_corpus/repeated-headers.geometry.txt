@@ -1,0 +1,41 @@
+html[1]/body[1] page=0 x=0.00 y=0.00 w=200.00 h=520.00
+html[1]/body[1]/table#t1[1] page=0 x=0.00 y=0.00 w=100.00 h=80.00
+html[1]/body[1]/table#t1[1] page=1 x=0.00 y=0.00 w=100.00 h=80.00
+html[1]/body[1]/table#t1[1] page=2 x=0.00 y=0.00 w=100.00 h=60.00
+html[1]/body[1]/table#t1[1]/thead[0]/tr[0]/th#note[0] page=1 x=0.00 y=0.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/table#t1[1]/thead[0]/tr[0]/th#note[0] page=2 x=0.00 y=0.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/table#t1[1]/thead[0]/tr[1]/th#h1[0] page=0 x=0.00 y=0.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/table#t1[1]/thead[0]/tr[1]/th#h1[0] page=1 x=0.00 y=20.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/table#t1[1]/thead[0]/tr[1]/th#h1[0] page=2 x=0.00 y=20.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[0]/td[0] page=0 x=0.00 y=20.00 w=100.00 h=20.00
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[1]/td[0] page=0 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[2]/td[0] page=0 x=0.00 y=60.00 w=100.00 h=20.00
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[3]/td[0] page=1 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[4]/td[0] page=1 x=0.00 y=60.00 w=100.00 h=20.00
+html[1]/body[1]/table#t1[1]/tbody[1]/tr[5]/td[0] page=2 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/div#after1[3] page=2 x=0.00 y=60.00 w=200.00 h=20.00
+html[1]/body[1]/table#t2[5] page=3 x=0.00 y=0.00 w=100.00 h=40.00 lift=20.00
+html[1]/body[1]/table#t2[5]/thead[0]/tr[1]/th#h2[0] page=3 x=0.00 y=0.00 w=100.00 h=20.00
+html[1]/body[1]/table#t2[5]/tbody[1]/tr[0]/td#only[0] page=3 x=0.00 y=20.00 w=100.00 h=20.00
+html[1]/body[1]/div#after2[7] page=3 x=0.00 y=40.00 w=200.00 h=20.00
+html[1]/body[1]/div[9] page=3 x=0.00 y=60.00 w=200.00 h=140.00
+html[1]/body[1]/div[9] page=4 x=0.00 y=0.00 w=200.00 h=80.00
+html[1]/body[1]/div[9] page=5 x=0.00 y=0.00 w=200.00 h=60.00
+html[1]/body[1]/div[9]/caption#c3[0] page=3 x=0.00 y=60.00 w=200.00 h=20.00
+html[1]/body[1]/div[9]/table#t3[1] page=4 x=0.00 y=0.00 w=100.00 h=80.00
+html[1]/body[1]/div[9]/table#t3[1] page=5 x=0.00 y=0.00 w=100.00 h=60.00
+html[1]/body[1]/div[9]/table#t3[1]/thead[0]/tr[0]/th#h3[0] page=4 x=0.00 y=0.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/div[9]/table#t3[1]/thead[0]/tr[0]/th#h3[0] page=5 x=0.00 y=0.00 w=100.00 h=20.00 repeat
+html[1]/body[1]/div[9]/table#t3[1]/tbody[1]/tr[0]/td[0] page=4 x=0.00 y=20.00 w=100.00 h=20.00
+html[1]/body[1]/div[9]/table#t3[1]/tbody[1]/tr[1]/td[0] page=4 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/div[9]/table#t3[1]/tbody[1]/tr[2]/td[0] page=4 x=0.00 y=60.00 w=100.00 h=20.00
+html[1]/body[1]/div[9]/table#t3[1]/tbody[1]/tr[3]/td[0] page=5 x=0.00 y=20.00 w=100.00 h=20.00
+html[1]/body[1]/div[9]/table#t3[1]/tbody[1]/tr[4]/td[0] page=5 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/div[11] page=5 x=0.00 y=60.00 w=200.00 h=20.00
+html[1]/body[1]/div[12] page=6 x=0.00 y=0.00 w=200.00 h=20.00
+html[1]/body[1]/div[14] page=7 x=0.00 y=0.00 w=200.00 h=80.00
+html[1]/body[1]/div[14]/caption#c4[0] page=7 x=0.00 y=0.00 w=200.00 h=20.00
+html[1]/body[1]/div[14]/table#t4[1] page=7 x=0.00 y=20.00 w=100.00 h=60.00
+html[1]/body[1]/div[14]/table#t4[1]/thead[0]/tr[0]/th#h4[0] page=7 x=0.00 y=20.00 w=100.00 h=20.00
+html[1]/body[1]/div[14]/table#t4[1]/tbody[1]/tr[0]/td[0] page=7 x=0.00 y=40.00 w=100.00 h=20.00
+html[1]/body[1]/div[14]/table#t4[1]/tbody[1]/tr[1]/td[0] page=7 x=0.00 y=60.00 w=100.00 h=20.00

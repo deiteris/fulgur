@@ -1,0 +1,15 @@
+html[1]/body[1] page=0 x=0.00 y=0.00 w=600.00 h=1600.00
+html[1]/body[1]/div[1] page=0 x=0.00 y=0.00 w=600.00 h=600.00
+html[1]/body[1]/div#rel[3] page=1 x=0.00 y=0.00 w=600.00 h=600.00
+html[1]/body[1]/div#rel[3]/div#abs-in[1] page=1 x=10.00 y=100.00 w=50.00 h=50.00
+html[1]/body[1]/div#fixed[5] page=0 x=20.00 y=10.00 w=100.00 h=50.00 repeat
+html[1]/body[1]/div#fixed[5] page=1 x=20.00 y=10.00 w=100.00 h=50.00 repeat
+html[1]/body[1]/div#fixed[5] page=2 x=20.00 y=10.00 w=100.00 h=50.00 repeat
+html[1]/body[1]/div#abs[7] page=0 x=0.00 y=0.00 w=100.00 h=1800.00
+html[1]/body[1]/div#abs[7] page=1 x=0.00 y=-800.00 w=100.00 h=1800.00
+html[1]/body[1]/div#abs[7] page=2 x=0.00 y=-1600.00 w=100.00 h=1800.00
+html[1]/body[1]/div#abs[7]/div#abs-child[1] page=0 x=0.00 y=0.00 w=50.00 h=1800.00
+html[1]/body[1]/div#abs[7]/div#abs-child[1] page=1 x=0.00 y=-800.00 w=50.00 h=1800.00
+html[1]/body[1]/div#abs[7]/div#abs-child[1] page=2 x=0.00 y=-1600.00 w=50.00 h=1800.00
+html[1]/body[1]/div#float[9] page=2 x=0.00 y=0.00 w=100.00 h=300.00
+html[1]/body[1]/div#after[11] page=2 x=0.00 y=300.00 w=600.00 h=100.00

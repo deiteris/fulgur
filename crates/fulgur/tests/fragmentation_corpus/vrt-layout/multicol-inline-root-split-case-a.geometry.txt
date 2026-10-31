@@ -1,0 +1,2 @@
+html[0]/body[1] page=0 x=0.00 y=0.00 w=793.00 h=231.40
+html[0]/body[1]/div[0] page=0 x=0.00 y=0.00 w=480.00 h=103.00 lines=0..6

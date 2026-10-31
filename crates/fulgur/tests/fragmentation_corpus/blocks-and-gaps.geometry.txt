@@ -1,0 +1,11 @@
+html[1]/body[1] page=0 x=0.00 y=0.00 w=200.00 h=764.00
+html[1]/body[1]/div#a1[1] page=0 x=0.00 y=0.00 w=200.00 h=50.00
+html[1]/body[1]/div#b1[3] page=0 x=0.00 y=70.00 w=200.00 h=84.00
+html[1]/body[1]/div#a2[5] page=1 x=0.00 y=0.00 w=200.00 h=50.00
+html[1]/body[1]/div#c1[7] page=2 x=0.00 y=0.00 w=200.00 h=200.00
+html[1]/body[1]/div#c1[7] page=3 x=0.00 y=0.00 w=200.00 h=60.00
+html[1]/body[1]/div#outer[9] page=3 x=0.00 y=60.00 w=200.00 h=120.00
+html[1]/body[1]/div#outer[9] page=4 x=0.00 y=0.00 w=200.00 h=120.00
+html[1]/body[1]/div#outer[9]/div#in1[0] page=3 x=0.00 y=60.00 w=200.00 h=120.00
+html[1]/body[1]/div#outer[9]/div#in2[1] page=4 x=0.00 y=0.00 w=200.00 h=120.00
+html[1]/body[1]/div#after[11] page=4 x=0.00 y=120.00 w=200.00 h=30.00

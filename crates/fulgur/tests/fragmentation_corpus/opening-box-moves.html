@@ -1,0 +1,20 @@
+<!-- page: 200 100 -->
+<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  p { margin: 0; line-height: 20px; }
+  .gap { height: 5px; }
+</style></head><body>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <div id="c1"><p id="k1" style="break-inside: avoid">K1<br>K2</p><p>N</p></div>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <section id="c2"><div><p id="k2" style="break-inside: avoid">K1<br>K2</p><p>N</p></div></section>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <div id="c3"><p id="k3" style="line-height: 40px">K2</p><p>N</p></div>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <div id="c4"><img id="k4" style="display: block; width: 10px; height: 40px"><p>N</p></div>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <div id="c5" style="padding-top: 1px"><p id="k5" style="break-inside: avoid">K1<br>K2</p><p>N</p></div>
+  <div class="gap"></div><p>X</p><p>Y</p><p>Z</p>
+  <div id="c6" style="border: 2px solid"><table><tr><td><div style="height: 40px"></div></td></tr></table><p>N</p></div>
+</body></html>

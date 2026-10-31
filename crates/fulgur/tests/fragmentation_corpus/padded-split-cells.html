@@ -1,0 +1,16 @@
+<!-- page: 200 100 -->
+<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th { box-sizing: border-box; height: 20px; padding: 0; }
+  td { padding: 10px 0; }
+  td > div, .after { height: 20px; }
+  p { margin: 0; line-height: 20px; }
+</style></head><body>
+  <table><thead><tr><th id="h">H</th></tr></thead><tbody><tr><td id="cell"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div><div>10</div></td><td id="side"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div><div>8</div><div>9</div><div>10</div></td></tr></tbody></table>
+  <div class="after"></div>
+  <table><tbody><tr><td style="padding: 0"><div id="first" style="height: 75px"></div></td></tr><tr><td id="cell2"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div></td></tr></tbody></table>
+  <div class="after"></div>
+  <table><tbody><tr><td style="padding: 0"><div style="height: 50px"></div></td></tr><tr><td id="cell3"><div id="wrap"><p id="k" style="break-inside: avoid">K1<br>K2</p><p>N</p></div></td></tr></tbody></table>
+</body></html>

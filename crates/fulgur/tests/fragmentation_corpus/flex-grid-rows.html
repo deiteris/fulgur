@@ -1,0 +1,21 @@
+<!-- page: 400 100 -->
+<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  p { margin: 0; line-height: 20px; }
+</style></head><body>
+  <div style="height: 80px"></div>
+  <div id="flex" style="display: flex; width: 200px;">
+    <div id="f1" style="height: 60px; width: 100px; flex: 0 0 100px"></div>
+    <div id="f2" style="height: 60px; width: 100px; flex: 0 0 100px"></div>
+  </div>
+  <div id="grid" style="display: grid; grid-template-columns: 1fr 1fr; width: 200px">
+    <div id="g1"><div style="height: 30px"></div><div style="height: 30px"></div></div>
+    <div id="g2"><p>a<br>b<br>c<br>d</p></div>
+    <div id="g3" style="height: 50px"></div>
+    <div id="g4" style="height: 20px"></div>
+  </div>
+  <div style="height: 50px"></div>
+  <div style="display: flex; flex-wrap: wrap"><div style="width: 100%">Z</div><div id="item"><p style="break-inside: avoid">K1<br>K2</p></div><div id="r">R</div></div>
+  <div id="after" style="height: 20px"></div>
+</body></html>
