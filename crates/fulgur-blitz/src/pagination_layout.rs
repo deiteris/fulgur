@@ -1374,114 +1374,512 @@ fn kept_table_row_bottom(
     (bottom - top <= page_height_px + 1.0).then_some(bottom)
 }
 
-/// The bottom, below the top of `node`, of the box that opens `node` and
-/// places whole, when it fits a strip of `page_height_px`; `None` when no
-/// such box opens it. The box is `node`'s first in-flow child, or the box
-/// that opens that child, down through block containers, as long as no gap
-/// parts each from its container's content edge. A box places whole when it
-/// is kept whole (`break-inside: avoid`), an inline root of one line, a box
-/// with no children (a replaced element, a sized empty block), or
-/// transformed: the walker splits none of them, and the strip-overflow cut
-/// moves one to the next page only when something precedes it in its
-/// container.
-///
-/// css-break-3 §4.1 has no break point between a container's start and its
-/// first child: breaks are between siblings, which is why §3.1 propagates a
-/// first child's `break-before` to its container. So a box that opens `node`
-/// and crosses the page foot moves `node` to the next page with it, instead
-/// of staying where `node` starts, past the foot. Padding and border lie
-/// outside the content edge, so they are no break point either: a padded
-/// container moves whole, leaving no sliver of its top edge at the foot.
-/// Only a gap between the content edge and the child's margin edge (class
-/// C) is one, and the descent stops there.
-fn opening_whole_box_bottom(
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    node: &blitz_dom::Node,
-    page_height_px: f32,
-    depth: usize,
-) -> Option<f32> {
-    if depth >= crate::MAX_DOM_DEPTH || !is_walked_block_container(node) {
-        return None;
+/// What a box is to the fragmenter: whether the walk places it whole,
+/// splits it between its lines, or enters it for its children, and where
+/// its leading unit ends ([`leading_extent`]). Every branch of the walk
+/// asks this one question.
+#[derive(Debug)]
+enum BoxKind {
+    /// Placed whole, never split between its children or its lines.
+    Monolithic(Whole),
+    /// An inline root, split between its `lines` within its `limits`.
+    InlineRoot {
+        lines: Vec<(f32, f32)>,
+        limits: LineLimits,
+    },
+    /// A block container whose children lie one below the other.
+    BlockFlow,
+    /// Boxes side by side: the items of a flex or grid container's first
+    /// line, or the cells of a table row. `top` is the box's own top in
+    /// their coordinates: zero for a container, the row's top in its table
+    /// for a row, which has no box of its own.
+    Parallel { tracks: Vec<usize>, top: f32 },
+    /// A table.
+    Table { table: usize },
+}
+
+/// Why a box is placed whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    /// Never entered: a replaced or childless box, a transformed box that
+    /// fits a page (it paints as one shape, CSS Transforms §6.1), a
+    /// multicol container without a spanning child (`multicol_layout`
+    /// fragments it), an atomic inline, or a box in an orthogonal flow.
+    Atomic,
+    /// Kept by `break-inside: avoid`, its own or its table row's
+    /// ([`kept_table_row_bottom`]), and fitting a page: entered only for a
+    /// forced break or a skipped header row below it, which `avoid` does
+    /// not concern.
+    Kept,
+}
+
+/// What `node` is to the fragmenter on pages `page_height_px` tall
+/// ([`BoxKind`]).
+fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxKind {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
+    let fits_page = node.final_layout.size.height <= page_height_px + 1.0;
+    let transformed = is_transformed(node);
+    let orthogonal = node
+        .parent
+        .and_then(|id| doc.get_node(id))
+        .is_some_and(|parent| crate::blitz_adapter::is_orthogonal_to_parent(parent, node));
+    if node.children.is_empty()
+        || (transformed && fits_page)
+        || crate::blitz_adapter::is_atomic_inline_container_node(node)
+        || orthogonal
+    {
+        return BoxKind::Monolithic(Whole::Atomic);
     }
+    let avoid = !displays(node, DisplayInside::TableRow)
+        && column_styles
+            .and_then(|styles| styles.get(&node.id))
+            .is_some_and(|props| {
+                matches!(
+                    props.break_inside,
+                    Some(crate::draw_primitives::BreakInside::Avoid)
+                )
+            });
+    if (avoid && fits_page)
+        || kept_table_row_bottom(doc, column_styles, node, page_height_px).is_some()
+    {
+        return BoxKind::Monolithic(Whole::Kept);
+    }
+    structure(flow, node)
+}
+
+/// What `node`, entered, holds ([`BoxKind`]), whether it is kept whole or
+/// not: lines, columns, a table, boxes side by side, or block flow.
+fn structure(flow: Flow<'_>, node: &blitz_dom::Node) -> BoxKind {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
+    // A row has no box of its own: its cells carry its `avoid`.
+    if displays(node, DisplayInside::TableRow) {
+        let tracks: Vec<usize> = row_cells(doc, node).map(|cell| cell.id).collect();
+        let top = row_cells(doc, node)
+            .map(|cell| cell.final_layout.location.y)
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        return BoxKind::Parallel { tracks, top };
+    }
+    if !is_transformed(node)
+        && node
+            .element_data()
+            .is_some_and(|el| el.inline_layout_data.is_some())
+    {
+        return BoxKind::InlineRoot {
+            lines: collect_inline_line_metrics(node),
+            limits: line_limits(doc, column_styles, node.id),
+        };
+    }
+    if crate::blitz_adapter::is_multicol_container(node)
+        && !node.children.iter().any(|&id| {
+            doc.get_node(id)
+                .is_some_and(crate::blitz_adapter::has_column_span_all)
+        })
+    {
+        return BoxKind::Monolithic(Whole::Atomic);
+    }
+    if displays(node, DisplayInside::Table) {
+        return BoxKind::Table { table: node.id };
+    }
+    if crate::blitz_adapter::is_flex_or_grid_container_node(node) {
+        let items = in_flow_children(doc, node);
+        let first_bottom = items
+            .first()
+            .and_then(|&id| doc.get_node(id))
+            .map_or(0.0, |first| {
+                first.final_layout.location.y + first.final_layout.size.height
+            });
+        let tracks = items
+            .into_iter()
+            .filter(|&id| {
+                doc.get_node(id)
+                    .is_some_and(|item| item.final_layout.location.y < first_bottom - 0.5)
+            })
+            .collect();
+        return BoxKind::Parallel { tracks, top: 0.0 };
+    }
+    BoxKind::BlockFlow
+}
+
+/// Whether `node` is transformed: it paints as one shape (CSS Transforms
+/// §6.1), so it is never split while it fits a page, nor sliced.
+fn is_transformed(node: &blitz_dom::Node) -> bool {
+    node.primary_styles()
+        .is_some_and(|s| !s.get_box().transform.0.is_empty())
+}
+
+/// The in-flow children of `node` with height, in layout order: the boxes
+/// the walk places one by one.
+fn in_flow_children(doc: &BaseDocument, node: &blitz_dom::Node) -> Vec<usize> {
     let layout_children = node.layout_children.borrow();
     let children = layout_children
         .as_deref()
         .filter(|children| !children.is_empty())
         .unwrap_or(&node.children);
-    let first = children
+    children
         .iter()
-        .filter_map(|&id| doc.get_node(id))
-        .find(|child| {
-            !crate::blitz_adapter::is_whitespace_only_text_node(child)
-                && !crate::blitz_adapter::is_out_of_flow_node(child)
-                && child.final_layout.size.height > 0.0
-        })?;
-    let layout = first.final_layout;
-    let content_top = node.final_layout.border.top + node.final_layout.padding.top;
-    if layout.location.y - layout.margin.top - content_top > 0.5 {
-        return None;
-    }
-    let kept = column_styles
-        .and_then(|styles| styles.get(&first.id))
-        .is_some_and(|props| {
-            matches!(
-                props.break_inside,
-                Some(crate::draw_primitives::BreakInside::Avoid)
-            )
-        });
-    let one_line = first
-        .element_data()
-        .is_some_and(|el| el.inline_layout_data.is_some())
-        && collect_inline_line_metrics(first).len() <= 1;
-    let transformed = first
-        .primary_styles()
-        .is_some_and(|s| !s.get_box().transform.0.is_empty());
-    let whole = kept || one_line || first.children.is_empty() || transformed;
-    let bottom = layout.location.y
-        + if whole {
-            layout.size.height
-        } else {
-            opening_whole_box_bottom(doc, column_styles, first, page_height_px, depth + 1)?
-        };
-    (bottom <= page_height_px + 1.0).then_some(bottom)
+        .copied()
+        .filter(|&id| {
+            doc.get_node(id).is_some_and(|child| {
+                !crate::blitz_adapter::is_whitespace_only_text_node(child)
+                    && !crate::blitz_adapter::is_out_of_flow_node(child)
+                    && child.final_layout.size.height > 0.0
+            })
+        })
+        .collect()
 }
 
-/// True when the fragmenter walks `node`'s children as block flow: a block
-/// box (`display: block`, `list-item`, or `flow-root`) that is no inline
-/// root, multicol container, or transformed box.
-fn is_walked_block_container(node: &blitz_dom::Node) -> bool {
-    use style::values::specified::box_::DisplayOutside;
-    let block_flow = node.primary_styles().is_some_and(|s| {
-        let display = s.clone_display();
-        display.outside() == DisplayOutside::Block
-            && matches!(
-                display.inside(),
-                DisplayInside::Flow | DisplayInside::FlowRoot
-            )
-            && s.get_box().transform.0.is_empty()
-    });
-    block_flow
-        && node
-            .element_data()
-            .is_none_or(|el| el.inline_layout_data.is_none())
-        && !crate::blitz_adapter::is_multicol_container(node)
-}
-
-/// Whether no cell of the table row that `cell` belongs to can place any
-/// content in `room` px ([`row_places_content_in`]), in a row group with no
-/// cell spanning rows, whose rows [`kept_table_row_bottom`] ties together.
-/// `false` for a node that is not a cell of a row.
-fn row_places_nothing_in(
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    cell: &blitz_dom::Node,
+/// Whether the walk enters `node`, of `kind`, for its children with
+/// `room` px left on the page, rather than place it whole: it has
+/// children and is not atomic, and a forced break, a page-name change, or
+/// a skipped header row lies below it, or (unless it is kept whole) its
+/// children would split in the room ([`would_split_block_subtree`]).
+fn enters(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    kind: &BoxKind,
     room: f32,
     page_height_px: f32,
 ) -> bool {
-    let Some(row) = cell.parent.and_then(|id| doc.get_node(id)) else {
+    if node.children.is_empty() || matches!(kind, BoxKind::Monolithic(Whole::Atomic)) {
         return false;
+    }
+    fragmentation_below(flow.doc, node.id, flow.column_styles, 0) != Below::Nothing
+        || has_page_name_change_below(flow.doc, node.id, flow.used_page_names, 0)
+        || (!matches!(kind, BoxKind::Monolithic(Whole::Kept))
+            && would_split_block_subtree(flow.doc, node.id, room, page_height_px, 0))
+}
+
+/// The leading unit of a box: the part from its top with no break
+/// opportunity inside, which a break before the box would carry to the
+/// next page ([`leading_extent`]).
+#[derive(Clone, Copy, Debug)]
+struct Leading {
+    /// Where the unit ends, below the box's top.
+    extent: f32,
+    /// The box places content in the room it was asked for: the unit, or
+    /// the whole box, fits it.
+    places: bool,
+    /// What the unit is.
+    unit: Unit,
+}
+
+/// What a box's leading unit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    /// A box placed whole.
+    Box,
+    /// The first lines of an inline root of several.
+    Lines,
+    /// A box's top edge, before a gap that is a break opportunity.
+    Edge,
+    /// A flex or grid line, or a table row.
+    Row,
+    /// A table: its top edge, its repeated header, and its first row.
+    Table,
+}
+
+/// When [`leading_extent`] descends into a box it meets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// When its children would split in the room
+    /// ([`would_split_block_subtree`]), a kept box never.
+    Split,
+    /// Always, a box with `break-inside: avoid` below the first never,
+    /// even one taller than a page.
+    Always,
+}
+
+impl Leading {
+    /// A unit `extent` tall placed whole, in `room` px.
+    fn whole(extent: f32, room: f32) -> Self {
+        Self {
+            extent,
+            places: extent <= room,
+            unit: Unit::Box,
+        }
+    }
+
+    /// Whether the box this leads moves to the next page whole instead of
+    /// starting here: nothing of it places in the room, and its unit fits
+    /// an empty page of `page_height_px`. A unit taller than a page has to
+    /// start somewhere, and moving it would leave a blank page behind.
+    fn moves_on(&self, page_height_px: f32) -> bool {
+        !self.places && self.extent <= page_height_px + 1.0
+    }
+}
+
+/// The leading unit of `node` on pages `page_height_px` tall, with `room`
+/// px left below its top: what the walk cannot part from the box's start.
+/// css-break-3 §4.1 has no break point between a box's start and its
+/// first child: breaks are between siblings, which is why §3.1 propagates
+/// a first child's `break-before` to its container. Padding and border lie
+/// outside the content edge, so they are none either; only a gap between
+/// the content edge and the first child's margin edge (class C) is one.
+///
+/// - A box placed whole ([`Whole`], or not entered, [`enters`]) leads with
+///   itself.
+/// - An inline root of several lines leads with the lines its `orphans`
+///   and `widows` cannot leave at a page foot ([`inline_leading`]).
+/// - A block container leads with its top edge and its first in-flow
+///   child's unit, or with its top edge alone before a gap.
+/// - A flex or grid container, or a table row, places content when one of
+///   its first line's boxes does, and its unit ends with the shortest.
+/// - A table leads with its top edge, its repeated header, and its first
+///   row.
+///
+/// The box places content in the room when its unit fits it, or the whole
+/// box does. `gate` says when the descent enters a box it meets.
+fn leading_extent(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+    gate: Gate,
+) -> Leading {
+    let kind = classify(flow, node, page_height_px);
+    leading_of(flow, node, &kind, room, page_height_px, depth, gate)
+}
+
+/// [`leading_extent`] of `node`, of `kind`.
+fn leading_of(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    kind: &BoxKind,
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+    gate: Gate,
+) -> Leading {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
+    let height = node.final_layout.size.height;
+    let descends = || match gate {
+        Gate::Split => would_split_block_subtree(doc, node.id, room, page_height_px, 0),
+        Gate::Always => true,
     };
+    let whole = Leading::whole(height, room);
+    if depth >= crate::MAX_DOM_DEPTH {
+        return whole;
+    }
+    let within = |inner: Leading, offset: f32, unit: Unit| Leading {
+        extent: offset + inner.extent,
+        places: height <= room || inner.places,
+        unit,
+    };
+    match kind {
+        BoxKind::Monolithic(Whole::Kept)
+            if fragmentation_below(doc, node.id, column_styles, 0) == Below::ForcedBreak
+                || has_page_name_change_below(doc, node.id, flow.used_page_names, 0) =>
+        {
+            let kind = structure(flow, node);
+            leading_of(flow, node, &kind, room, page_height_px, depth, gate)
+        }
+        BoxKind::Monolithic(_) => whole,
+        BoxKind::InlineRoot { lines, .. } if lines.len() <= 1 => whole,
+        BoxKind::InlineRoot { lines, limits } => {
+            let lead = inline_leading(lines, *limits, room);
+            Leading {
+                places: lead.places || height <= room,
+                ..lead
+            }
+        }
+        BoxKind::Parallel { tracks, top } => {
+            let row = displays(node, DisplayInside::TableRow);
+            if row
+                && let Some(bottom) =
+                    tracks
+                        .first()
+                        .and_then(|&id| doc.get_node(id))
+                        .and_then(|cell| {
+                            kept_table_row_bottom(doc, column_styles, cell, page_height_px)
+                        })
+            {
+                return Leading::whole(bottom - top, room);
+            }
+            let lead = tracks
+                .iter()
+                .filter_map(|&id| doc.get_node(id))
+                .map(|track| {
+                    let offset = track.final_layout.location.y - top;
+                    let inner =
+                        leading_extent(flow, track, room - offset, page_height_px, depth + 1, gate);
+                    (offset + inner.extent, inner.places)
+                })
+                .reduce(|(a, a_places), (b, b_places)| (a.min(b), a_places || b_places));
+            let Some((extent, places)) = lead else {
+                return whole;
+            };
+            Leading {
+                extent,
+                places: places || (!row && height <= room),
+                unit: Unit::Row,
+            }
+        }
+        BoxKind::Table { table, .. } => {
+            if !descends() {
+                return whole;
+            }
+            let Some(table) = doc.get_node(*table) else {
+                return whole;
+            };
+            let offset = if table.id == node.id {
+                0.0
+            } else {
+                table.final_layout.location.y
+            };
+            let inner = table_leading(flow, table, room - offset, page_height_px, depth + 1, gate);
+            within(inner, offset, Unit::Table)
+        }
+        _ => {
+            if !descends() {
+                return whole;
+            }
+            let Some(first) = in_flow_children(doc, node)
+                .first()
+                .and_then(|&id| doc.get_node(id))
+            else {
+                return whole;
+            };
+            let layout = first.final_layout;
+            let content_top = node.final_layout.border.top + node.final_layout.padding.top;
+            if layout.location.y - layout.margin.top - content_top > 0.5 {
+                return Leading {
+                    extent: content_top,
+                    places: height <= room || content_top <= room,
+                    unit: Unit::Edge,
+                };
+            }
+            let avoid = column_styles
+                .and_then(|styles| styles.get(&first.id))
+                .is_some_and(|props| {
+                    matches!(
+                        props.break_inside,
+                        Some(crate::draw_primitives::BreakInside::Avoid)
+                    )
+                });
+            let inner = if gate == Gate::Always && avoid {
+                Leading::whole(layout.size.height, room - layout.location.y)
+            } else {
+                leading_extent(
+                    flow,
+                    first,
+                    room - layout.location.y,
+                    page_height_px,
+                    depth + 1,
+                    gate,
+                )
+            };
+            within(inner, layout.location.y, inner.unit)
+        }
+    }
+}
+
+/// The leading unit of an inline root of `lines`, with `room` px left
+/// below its top: the first lines its `limits` cannot leave
+/// at a page foot, the first `orphans` when `widows` lines remain after
+/// them, else every line ([`split_point`], by which
+/// [`fragment_inline_root`] splits it, so the two cannot disagree). The
+/// lines are measured from the first; the root's own padding is outside
+/// them, as the split places them.
+fn inline_leading(lines: &[(f32, f32)], limits: LineLimits, room: f32) -> Leading {
+    let Some(&(first_top, _)) = lines.first() else {
+        return Leading::whole(0.0, room);
+    };
+    let unit_lines = (1..lines.len())
+        .find(|&fit| split_point(fit, 0, lines.len(), limits).is_some())
+        .unwrap_or(lines.len());
+    let extent = lines[unit_lines - 1].1 - first_top;
+    Leading {
+        extent,
+        places: extent <= room,
+        unit: Unit::Lines,
+    }
+}
+
+/// The leading unit of `table` ([`leading_extent`]): its top edge and its
+/// first row, or, under a header it repeats, the header as its first page
+/// carries it and the first body row below it, measured on the pages the
+/// header leaves the rows ([`fragment_repeating_table`]).
+fn table_leading(
+    flow: Flow<'_>,
+    table: &blitz_dom::Node,
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+    gate: Gate,
+) -> Leading {
+    let Flow {
+        doc,
+        column_styles,
+        used_page_names,
+        ..
+    } = flow;
+    let row_of = |cell: &blitz_dom::Node| {
+        cell.parent
+            .and_then(|id| doc.get_node(id))
+            .filter(|&row| displays(row, DisplayInside::TableRow))
+    };
+    let header = (depth < crate::MAX_DOM_DEPTH)
+        .then(|| repeating_table_header(doc, table.id, depth + 1, column_styles))
+        .flatten()
+        .filter(|header| {
+            header.band_height_px < page_height_px
+                && header_band_is_repeatable(doc, header, column_styles, used_page_names, depth + 1)
+        });
+    if let Some(header) = header {
+        let band = header.band_height_px - header.first_page_lift_px;
+        let Some(row) = header
+            .body_cell_ids
+            .first()
+            .and_then(|&id| doc.get_node(id))
+            .and_then(row_of)
+        else {
+            return Leading::whole(band, room);
+        };
+        let rows_page = page_height_px - header.band_height_px;
+        let inner = leading_extent(flow, row, room - band, rows_page, depth + 1, gate);
+        return Leading {
+            extent: band + inner.extent,
+            places: inner.places,
+            unit: Unit::Table,
+        };
+    }
+    let Some(row) = in_flow_children(doc, table)
+        .first()
+        .and_then(|&id| doc.get_node(id))
+        .and_then(row_of)
+    else {
+        return Leading::whole(table.final_layout.size.height, room);
+    };
+    let BoxKind::Parallel { top, .. } = classify(flow, row, page_height_px) else {
+        return Leading::whole(table.final_layout.size.height, room);
+    };
+    let inner = leading_extent(flow, row, room - top, page_height_px, depth + 1, gate);
+    Leading {
+        extent: top + inner.extent,
+        places: inner.places,
+        unit: Unit::Table,
+    }
+}
+
+/// The row of the table cell `cell`, when its row group has no cell that
+/// spans rows: the rows of such a group are tied together
+/// ([`kept_table_row_bottom`]), so no one of them moves alone. `None` for
+/// a node that is not a cell of a row.
+fn cell_row<'a>(doc: &'a BaseDocument, cell: &blitz_dom::Node) -> Option<&'a blitz_dom::Node> {
+    if !displays(cell, DisplayInside::TableCell) {
+        return None;
+    }
+    let row = doc
+        .get_node(cell.parent?)
+        .filter(|&row| displays(row, DisplayInside::TableRow))?;
     let group_spans = row
         .parent
         .and_then(|id| doc.get_node(id))
@@ -1493,10 +1891,7 @@ fn row_places_nothing_in(
                 .filter(|&node| displays(node, DisplayInside::TableRow))
                 .any(|row| row_cells(doc, row).any(may_span_rows))
         });
-    displays(cell, DisplayInside::TableCell)
-        && displays(row, DisplayInside::TableRow)
-        && !group_spans
-        && !row_places_content_in(doc, column_styles, row, room, page_height_px)
+    (!group_spans).then_some(row)
 }
 
 /// Whether `node`'s display has the inner type `inside`.
@@ -1524,85 +1919,6 @@ fn row_cells<'a>(
         .iter()
         .filter_map(|&id| doc.get_node(id))
         .filter(|&node| displays(node, DisplayInside::TableCell))
-}
-
-/// Whether some cell of `row` places content in `room` px from the row's
-/// top ([`places_content_in`]).
-fn row_places_content_in(
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    row: &blitz_dom::Node,
-    room: f32,
-    page_height_px: f32,
-) -> bool {
-    row_cells(doc, row)
-        .any(|cell| places_content_in(doc, column_styles, cell, room, page_height_px, 0))
-}
-
-/// Whether the fragmenter places any of `node`'s content in `room` px from
-/// its top, on pages `page_height_px` tall: the whole box when it fits;
-/// else, for an inline root of several lines, the first lines its
-/// `orphans` and `widows` let it leave ([`moves_whole_at_foot`]); else, for
-/// a block whose children would split there ([`would_split_block_subtree`]),
-/// its first in-flow child's own content below the padding and gap above
-/// it. A box kept whole by `break-inside: avoid` that fits a page, a single
-/// line, an empty box, and a block whose children all fit while it does not
-/// (its own height) move whole and place nothing.
-fn places_content_in(
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    node: &blitz_dom::Node,
-    room: f32,
-    page_height_px: f32,
-    depth: usize,
-) -> bool {
-    let height = node.final_layout.size.height;
-    if height <= room {
-        return true;
-    }
-    let kept = column_styles
-        .and_then(|styles| styles.get(&node.id))
-        .is_some_and(|props| {
-            matches!(
-                props.break_inside,
-                Some(crate::draw_primitives::BreakInside::Avoid)
-            )
-        });
-    if (kept && height <= page_height_px + 1.0) || depth >= crate::MAX_DOM_DEPTH || room <= 0.0 {
-        return false;
-    }
-    let lines = collect_inline_line_metrics(node);
-    if lines.len() > 1 {
-        let limits = line_limits(doc, column_styles, node.id);
-        return !moves_whole_at_foot(&lines, 0.0, room, limits);
-    }
-    if !lines.is_empty() || !would_split_block_subtree(doc, node.id, room, page_height_px, 0) {
-        return false;
-    }
-    let children = node
-        .layout_children
-        .borrow()
-        .as_deref()
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| node.children.clone(), Vec::from);
-    children
-        .iter()
-        .filter_map(|&id| doc.get_node(id))
-        .find(|child| {
-            !crate::blitz_adapter::is_whitespace_only_text_node(child)
-                && !crate::blitz_adapter::is_out_of_flow_node(child)
-                && child.final_layout.size.height > 0.0
-        })
-        .is_some_and(|child| {
-            places_content_in(
-                doc,
-                column_styles,
-                child,
-                room - child.final_layout.location.y,
-                page_height_px,
-                depth + 1,
-            )
-        })
 }
 
 /// The bottom of the later rows that a row's cells reach, given the bottom
@@ -2166,9 +2482,7 @@ fn fragment_repeating_table(
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
-    let Flow {
-        doc, column_styles, ..
-    } = flow;
+    let doc = flow.doc;
     if header.band_height_px >= page_height_px {
         log::warn!(
             "repeating table header band ({:.2}px) is not smaller than the page ({page_height_px:.2}px); using whole-table fallback",
@@ -2202,28 +2516,15 @@ fn fragment_repeating_table(
     // both rows on page 1). An orphaned header row is never useful output, and
     // css-tables-3 likewise bounds repetition to cases where it does not eat
     // the page.
-    // Whether the first body row places content in `room` px below the
-    // band, as the walk below and its row move measure it
-    // ([`row_places_content_in`]). A first body row kept whole
-    // (`break-inside: avoid`, or tied to rows by a spanning cell) has no
-    // smaller leading unit: the whole row has to clear the band.
+    // Whether the first body row places content below the band in `room`
+    // px from the table's top, as the walk below and its row move measure
+    // it ([`table_leading`]).
     let body_page_height = page_height_px - header.band_height_px;
-    let first_body_cell = header
-        .body_cell_ids
-        .first()
-        .and_then(|&id| doc.get_node(id));
+    let table = doc.get_node(header.table_id);
     let first_row_places = |room: f32| {
-        let Some(cell) = first_body_cell else {
-            return true;
-        };
-        if let Some(bottom) = kept_table_row_bottom(doc, column_styles, cell, body_page_height) {
-            return bottom - header.body_origin_px <= room;
-        }
-        cell.parent
-            .and_then(|id| doc.get_node(id))
-            .is_none_or(|row| {
-                row_places_content_in(doc, column_styles, row, room, body_page_height)
-            })
+        table.is_none_or(|table| {
+            table_leading(flow, table, room, page_height_px, depth, Gate::Split).places
+        })
     };
     // The band the table's first page carries, without the rows that skip it.
     let lift = header.first_page_lift_px;
@@ -2234,8 +2535,8 @@ fn fragment_repeating_table(
     // fits on an empty page — an oversized first row has to start somewhere,
     // and pushing it would just leave a blank page behind.
     let orphaned_header = !band_overflows
-        && !first_row_places(page_height_px - cursor_in - first_band)
-        && first_row_places(page_height_px - first_band);
+        && !first_row_places(page_height_px - cursor_in)
+        && first_row_places(page_height_px);
     let (first_page, first_table_top) = if band_overflows || orphaned_header {
         (page_in + 1, 0.0)
     } else {
@@ -2925,33 +3226,31 @@ fn fragment_block_subtree_inner(
 
         let child_x_in_body = parent_x_in_body + layout.location.x;
 
-        // fulgur-2s7p.1: an inline root splits at line boundaries. Without
-        // the line split a multi-line inline root falls through to the
-        // block-child gate below, which can only push the *whole* child to
-        // the next page or emit it as one oversized fragment, and a first
-        // in-flow child whose own content overflows the remaining strip
-        // never gets a chance to fragment (P0 silent content loss), because
-        // `child_page_y > page_start_y` is false for it and
-        // `would_split_block_subtree` only sees zero-height text nodes as
-        // its DOM children.
-        // A cell of a row kept whole places whole too, and the row's
-        // extent, not the cell's, decides whether it moves on.
+        // What the child is to the walk: placed whole, split between its
+        // lines, or entered for its children ([`classify`]). A cell of a
+        // row kept whole places whole too, and the row's extent, not the
+        // cell's, decides whether it moves on.
+        let kind = classify(flow, child, page_height_px);
         let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
         // A row none of whose cells can place content in the rest of the
-        // page moves to the next one whole, leaving no empty cell boxes at
-        // the page foot: a cell has no break point between its top edge and
-        // its first content. Its other cells follow it there, as those of a
-        // kept row do, and a row that is the table's first leaves nothing
-        // of the table behind.
+        // page ([`leading_extent`]) moves to the next one whole, leaving no
+        // empty cell boxes at the page foot: a cell has no break point
+        // between its top edge and its first content. Its other cells
+        // follow it there, as those of a kept row do, and a row that is the
+        // table's first leaves nothing of the table behind.
         if kept_row_bottom.is_none()
             && child_page_y > 0.0
-            && row_places_nothing_in(
-                doc,
-                column_styles,
-                child,
-                page_height_px - child_page_y,
-                page_height_px,
-            )
+            && cell_row(doc, child).is_some_and(|row| {
+                !leading_extent(
+                    flow,
+                    row,
+                    page_height_px - child_page_y,
+                    page_height_px,
+                    0,
+                    Gate::Split,
+                )
+                .places
+            })
         {
             if cursor.cursor_y > cursor.page_start_y {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
@@ -2961,40 +3260,34 @@ fn fragment_block_subtree_inner(
             child_page_y = 0.0;
             cursor.entered_below_content = false;
         }
-        // A child taller than a page is not kept whole: it splits between
-        // its lines instead of being placed as one fragment that runs past
-        // the page foot.
-        let avoid_inside = kept_row_bottom.is_some()
-            || (matches!(
-                break_props.break_inside,
-                Some(crate::draw_primitives::BreakInside::Avoid)
-            ) && child_h <= page_height_px + 1.0);
-        // A transformed subtree paints as a single atomic box (CSS
-        // Transforms §6.1) — same exclusion as the oversized-child
-        // slicing below. Without this, a multi-line
-        // `<p style="transform:...">` would be split into independently
-        // rendered per-page fragments and the rotation / skew / matrix
-        // would apply to each slice separately instead of the whole box,
-        // changing the painted result.
-        let has_transform = child
-            .primary_styles()
-            .is_some_and(|s| !s.get_box().transform.0.is_empty());
-        let line_metrics = if avoid_inside || has_transform {
-            Vec::new()
-        } else {
-            collect_inline_line_metrics(child)
-        };
-        if line_metrics.len() > 1 {
+        // fulgur-2s7p.1: an inline root splits at line boundaries. Without
+        // the line split a multi-line inline root falls through to the
+        // block-child gate below, which can only push the *whole* child to
+        // the next page or emit it as one oversized fragment, and a first
+        // in-flow child whose own content overflows the remaining strip
+        // never gets a chance to fragment (P0 silent content loss), because
+        // `child_page_y > page_start_y` is false for it and
+        // `would_split_block_subtree` only sees zero-height text nodes as
+        // its DOM children. One kept whole or transformed is monolithic
+        // ([`classify`]), and a child taller than a page is not kept whole:
+        // it splits between its lines instead of being placed as one
+        // fragment that runs past the page foot.
+        if let BoxKind::InlineRoot {
+            lines: line_metrics,
+            limits,
+        } = &kind
+            && line_metrics.len() > 1
+        {
             // Split-before fallback (CSS Fragmentation §4.2, class A
             // break point): if the paragraph crosses the foot of the
             // remaining strip, cannot split there within its `orphans` /
-            // `widows`, and something is already on this page, push to a
-            // fresh page before splitting. When this container's first
-            // in-flow child is itself this paragraph (`cursor_y ==
-            // page_start_y`, the fulgur-2s7p.1 repro shape), this is
-            // skipped and the split begins right where the container
-            // currently sits.
-            let limits = line_limits(doc, column_styles, child_id);
+            // `widows` (its leading lines, [`inline_leading`]), and
+            // something is already on this page, push to a fresh page
+            // before splitting. When this container's first in-flow child
+            // is itself this paragraph (`cursor_y == page_start_y`, the
+            // fulgur-2s7p.1 repro shape), this is skipped and the split
+            // begins right where the container currently sits.
+            let limits = *limits;
             // codex P1: `entry_page_index` is captured *before* the
             // split-before advance below, so `new_page_index >
             // entry_page_index` (checked further down) is true whenever
@@ -3018,7 +3311,7 @@ fn fragment_block_subtree_inner(
             // which a move whole would leave it without.
             if cursor.cursor_y > cursor.page_start_y
                 && !cursor.at_page_top()
-                && moves_whole_at_foot(&line_metrics, child_page_y, page_height_px, limits)
+                && !inline_leading(line_metrics, limits, page_height_px - child_page_y).places
             {
                 // Only widen to the full page strip when we're actually
                 // inside a grid/flex row (`row_state.is_some()`, whose open
@@ -3074,18 +3367,12 @@ fn fragment_block_subtree_inner(
                 child_x_in_body,
                 child_w,
                 &mut paragraph,
-                &line_metrics,
+                line_metrics,
                 limits,
             );
             let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
             cursor.page_has_content = paragraph.page_has_content;
-            record_inline_root_descendants(
-                geometry,
-                doc,
-                child_id,
-                &line_metrics,
-                split_frag_count,
-            );
+            record_inline_root_descendants(geometry, doc, child_id, line_metrics, split_frag_count);
             // Same shape as the recursion branch's fulgur-oc51 fix
             // below: without a parent fragment per page the split
             // crossed, the parent's own background / border would
@@ -3203,80 +3490,40 @@ fn fragment_block_subtree_inner(
         // recursion would emit a parent fragment shorter than
         // expected.
         let available_strip = (page_height_px - cursor.cursor_y).max(0.0);
-        // fulgur-7hf5: multicol containers (`column-count > 1` /
-        // `column-width: <len>`) distribute children across columns; their
-        // DOM children's flow does not match the visual flow
-        // `would_split_block_subtree` simulates. Skip recursion for them —
-        // multicol handles its own fragmentation via
-        // `multicol_layout::run_pass`, and the outer fragmenter treats the
-        // multicol container as a single unit for break decisions.
-        //
-        // fulgur-916y: multicol containers with a `column-span: all`
-        // direct child get an exception — the span subtree is laid out by
-        // Taffy as a full-width block flowing between the column groups, so
-        // block-flow recursion via `fragment_block_subtree` can split it
-        // across pages when it overflows. Containers without span:all stay
-        // atomic.
-        let is_multicol = crate::blitz_adapter::is_multicol_container(child);
-        let multicol_has_span_all = is_multicol
-            && child.children.iter().any(|&id| {
-                doc.get_node(id)
-                    .is_some_and(crate::blitz_adapter::has_column_span_all)
-            });
-        // fulgur-2s7p.5: a `break-inside: avoid` block container that fits
-        // whole on a fresh page must not be recursed into just because it
-        // doesn't fit the *remaining* strip (`would_split_block_subtree`
-        // measures against `available_strip`, not a full page), or the
-        // nested walker splits it at whatever gap-based break point it
-        // finds (e.g. the box's own top padding), leaving a sliver of its
-        // background on the current page; it moves whole instead. A forced
-        // break or page-name change below still recurses regardless: those
-        // aren't the "unforced break" `avoid` concerns itself with.
-        let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
-        // A transformed box paints as one shape (CSS Transforms §6.1): it is
-        // monolithic while it fits a page, as a kept box is, so the walk does
-        // not enter it, and it moves whole; a taller one splits between its
-        // children rather than lose what runs past the foot.
-        let monolithic = has_transform && child_h <= page_height_px + 1.0;
-        let recursable =
-            !child.children.is_empty() && !monolithic && (!is_multicol || multicol_has_span_all);
-        let below = if recursable {
-            fragmentation_below(doc, child_id, column_styles, 0)
-        } else {
-            Below::Nothing
-        };
-        let forced = below == Below::ForcedBreak
-            || (recursable && has_page_name_change_below(doc, child_id, used_page_names, 0));
-        let needs_recursion = recursable
-            && (forced
-                || below == Below::SkippedHeaderRow
-                || (!avoid_fits_whole_page
-                    && would_split_block_subtree(
-                        doc,
-                        child_id,
-                        available_strip,
-                        page_height_px,
-                        0,
-                    )));
-        // A box kept whole that is entered only for a skipped header row
-        // moves whole to the next page first, as one not entered would (the
-        // strip-overflow cut below), and is entered there; so does a box
-        // opened by a box that places whole and crosses the foot, a flex or
-        // grid item too, which takes the items beside it along. A cell of a
-        // row kept whole is moved with its row instead.
+        // fulgur-7hf5: a multicol container is not entered unless a child
+        // spans its columns ([`classify`]), a box kept whole only for a
+        // forced break or a page-name change below it, which are not the
+        // unforced break `avoid` concerns itself with (fulgur-2s7p.5), and a
+        // transformed box only when it is taller than a page.
+        let needs_recursion = enters(flow, child, &kind, available_strip, page_height_px);
+        // A box entered with content before it on the page moves whole to
+        // the next page first, and is entered there, when nothing of it
+        // places in the rest of the page: its leading unit does not fit
+        // ([`leading_extent`]), as a box not entered moves (the
+        // strip-overflow cut below). A flex or grid item takes the items
+        // beside it along; a table cell moves with its row instead (the
+        // row move above).
         if needs_recursion
-            && kept_row_bottom.is_none()
+            && !displays(child, DisplayInside::TableCell)
             && (child_page_y > cursor.page_start_y
                 || (cursor.entered_below_content && cursor.page_index == page_in))
-            && ((!forced && avoid_fits_whole_page && child_page_y + child_h > page_height_px)
-                || opening_whole_box_bottom(doc, column_styles, child, page_height_px, depth + 1)
-                    .is_some_and(|bottom| child_page_y + bottom > page_height_px))
         {
-            cursor.close_parent_once(geometry, ParentHeight::Placed);
-            cursor.advance();
-            cursor.page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
-            cursor.entered_below_content = false;
+            let lead = leading_of(
+                flow,
+                child,
+                &kind,
+                page_height_px - child_page_y,
+                page_height_px,
+                depth + 1,
+                Gate::Always,
+            );
+            if lead.unit == Unit::Box && lead.moves_on(page_height_px) {
+                cursor.close_parent_once(geometry, ParentHeight::Placed);
+                cursor.advance();
+                cursor.page_taffy_origin = this_top_in_parent;
+                child_page_y = 0.0;
+                cursor.entered_below_content = false;
+            }
         }
         if needs_recursion {
             let occupied_before_recursion = cursor.entered_below_content;
@@ -3507,7 +3754,7 @@ fn fragment_block_subtree_inner(
         // Nor is a box in a table cell or a flex or grid item, or one that
         // overflows an ancestor clipping it ([`slices_where_it_is`]), or a
         // first child entered below the page foot, which has no slice there.
-        if !has_transform
+        if !is_transformed(child)
             && child_h > page_height_px + 1.0
             && child_page_y < page_height_px
             && slices_where_it_is(doc, child)
@@ -3839,34 +4086,12 @@ fn line_limits(
     }
 }
 
-/// fulgur-s67g Phase 2.2: whether an inline root whose first line starts
-/// at `top` on a page strip of `page_height_px`, below the top of the
-/// page, moves whole to the next page rather than split at the page foot:
-/// it does when it crosses the foot and fewer than `limits.orphans` of its
-/// lines fit above it once `limits.widows` lines are kept for the next
-/// page (CSS Fragmentation §4.4), as [`fragment_inline_root`] splits it.
-fn moves_whole_at_foot(
-    line_metrics: &[(f32, f32)],
-    top: f32,
-    page_height_px: f32,
-    limits: LineLimits,
-) -> bool {
-    let Some(&(first_top, _)) = line_metrics.first() else {
-        return false;
-    };
-    let fit = line_metrics
-        .iter()
-        .take_while(|line| top + (line.1 - first_top) <= page_height_px)
-        .count();
-    fit < line_metrics.len() && split_point(fit, 0, line_metrics.len(), limits).is_none()
-}
-
 /// The line a fragment of an inline root breaks before, when lines
 /// `[start, fit)` of its `total` fit the page: after the last that fits,
 /// pulled back so the remainder keeps `limits.widows` lines, or `None`
 /// when that leaves the fragment fewer than `limits.orphans` lines or none
 /// (CSS Fragmentation §4.4). [`fragment_inline_root`] splits by it, and
-/// [`moves_whole_at_foot`] asks it, so the two cannot disagree.
+/// [`inline_leading`] asks it, so the two cannot disagree.
 fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Option<usize> {
     let split = fit.min(total.saturating_sub(limits.widows));
     (split > start && split >= start + limits.orphans).then_some(split)
@@ -6687,7 +6912,10 @@ mod tests {
     /// `body` laid out with the document's break styles on pages
     /// `page_height` px tall, with 20 px cells, captions, and `div`s, its
     /// captions moved out of their tables as the engine moves them.
-    fn header_pass(body: &str, page_height: f32) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+    fn header_pass(
+        body: &str,
+        page_height: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
         use crate::blitz_adapter::DomPass as _;
         let html = format!(
             r#"<!doctype html>
@@ -6818,7 +7046,10 @@ mod tests {
         let spacer = r#"<div style="height: 100px"></div>"#;
         for body in [
             format!("{spacer}{}", header_table(kept, NOTE_THEN_H, 5)),
-            format!("{spacer}<div{kept}>{}</div>", header_table("", NOTE_THEN_H, 5)),
+            format!(
+                "{spacer}<div{kept}>{}</div>",
+                header_table("", NOTE_THEN_H, 5)
+            ),
             format!("<div>{spacer}{}</div>", header_table(kept, NOTE_THEN_H, 5)),
         ] {
             let (doc, geometry) = header_pass(&body, 200.0);
@@ -12954,38 +13185,32 @@ h2 { string-set: chapter-title content(text); }
     }
 
     /// fulgur-s67g Phase 2.2: a paragraph crossing the page foot below the
-    /// top of a page moves whole only when the lines that fit, less the
-    /// `widows` kept for the next page, are fewer than `orphans`. Six 20px
-    /// lines from y=90 on a 200px strip: five fit.
+    /// top of a page places nothing there, and moves whole, only when the
+    /// lines that fit, less the `widows` kept for the next page, are fewer
+    /// than `orphans`: its leading unit is its first `orphans` lines, or all
+    /// of them when no break keeps `widows`. Six 20px lines with 110 px
+    /// left: five fit.
     #[test]
-    fn moves_whole_at_foot_honours_orphans_and_widows() {
+    fn an_inline_root_leads_with_the_lines_its_orphans_and_widows_keep() {
         let lines: Vec<(f32, f32)> = (0..6)
             .map(|i| (i as f32 * 20.0, (i + 1) as f32 * 20.0))
             .collect();
-        let moves = |orphans, widows| {
-            super::moves_whole_at_foot(&lines, 90.0, 200.0, super::LineLimits { orphans, widows })
+        let lead = |orphans, widows, room| {
+            super::inline_leading(&lines, super::LineLimits { orphans, widows }, room)
         };
-        assert!(!moves(1, 1), "5 + 1");
-        assert!(!moves(2, 2), "4 + 2");
-        assert!(!moves(3, 3), "3 + 3");
-        assert!(moves(4, 4), "2 + 4 leaves two orphans");
-        assert!(moves(6, 1), "five lines fit, six wanted");
-        assert!(
-            !super::moves_whole_at_foot(&lines, 80.0, 200.0, super::LineLimits::default()),
-            "the paragraph fits whole"
+        assert!(lead(1, 1, 110.0).places, "5 + 1");
+        assert!(lead(2, 2, 110.0).places, "4 + 2");
+        assert!(lead(3, 3, 110.0).places, "3 + 3");
+        assert!(!lead(4, 4, 110.0).places, "2 + 4 leaves two orphans");
+        assert_eq!(
+            lead(4, 4, 110.0).extent,
+            120.0,
+            "no break keeps four widows"
         );
-        assert!(
-            super::moves_whole_at_foot(
-                &lines,
-                185.0,
-                200.0,
-                super::LineLimits {
-                    orphans: 1,
-                    widows: 1
-                }
-            ),
-            "not even the first line fits"
-        );
+        assert!(!lead(6, 1, 110.0).places, "five lines fit, six wanted");
+        assert_eq!(lead(3, 2, 110.0).extent, 60.0, "the first three lines");
+        assert!(lead(2, 2, 120.0).places, "the paragraph fits whole");
+        assert!(!lead(1, 1, 15.0).places, "not even the first line fits");
     }
 
     /// The lines of each fragment of the inline root `id`.
