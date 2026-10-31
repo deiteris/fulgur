@@ -3475,7 +3475,9 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if matches!(lead.unit, Unit::Box | Unit::Lines) && lead.moves_on(page_height_px) {
+            if matches!(lead.unit, Unit::Box | Unit::Lines | Unit::Row)
+                && lead.moves_on(page_height_px)
+            {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
                 cursor.advance();
                 cursor.page_taffy_origin = this_top_in_parent;
@@ -11493,12 +11495,12 @@ h2 { string-set: chapter-title content(text); }
     }
 
     #[test]
-    fn grid_row_leaf_cells_cosplit_across_page_boundary() {
+    fn grid_row_leaf_cells_move_together_across_page_boundary() {
         // 2-col grid, each leaf cell 60px tall.
         // spacer 80px pushes grid to y=80 on a 100px page.
-        // pre-fix: cell 2 pushed to page 1 at y=0 (whole cell).
-        // post-fix: both cells split — page 0 y=80..100 (20px),
-        //           page 1 y=0..40 (40px).
+        // pre-fix: cell 2 pushed to page 1 at y=0 (whole cell) while cell 1
+        // stayed. Neither cell places anything in the 20 px left, so the
+        // row moves to page 1 whole, both cells at its top.
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 80px"></div>
@@ -11523,21 +11525,15 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         frags.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let on_page0: Vec<_> = frags.iter().filter(|(p, _, _)| *p == 0).collect();
         assert_eq!(
-            on_page0.len(),
-            2,
-            "both leaf cells must have a fragment on page 0 (co-split); frags={frags:?}"
-        );
-        let ys: Vec<f32> = on_page0.iter().map(|(_, _, y)| *y).collect();
-        assert!(
-            (ys[0] - ys[1]).abs() < 0.5,
-            "page-0 fragments must share the same y (parallel row); ys={ys:?}"
+            frags,
+            [(1, 0.0, 0.0), (1, 100.0, 0.0)],
+            "both leaf cells move to page 1, side by side at its top"
         );
     }
 
     #[test]
-    fn flex_row_leaf_cells_cosplit_across_page_boundary() {
+    fn flex_row_leaf_cells_move_together_across_page_boundary() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 80px"></div>
@@ -11561,35 +11557,29 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         frags.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let on_page0: Vec<_> = frags.iter().filter(|(p, _, _)| *p == 0).collect();
         assert_eq!(
-            on_page0.len(),
-            2,
-            "both leaf cells must have a fragment on page 0 (co-split); frags={frags:?}"
-        );
-        let ys: Vec<f32> = on_page0.iter().map(|(_, _, y)| *y).collect();
-        assert!(
-            (ys[0] - ys[1]).abs() < 0.5,
-            "page-0 fragments must share the same y; ys={ys:?}"
+            frags,
+            [(1, 0.0, 0.0), (1, 100.0, 0.0)],
+            "both leaf cells move to page 1, side by side at its top"
         );
     }
 
     #[test]
     fn grid_row_recursive_cells_cosplit_across_page_boundary() {
         // 2-col grid, each cell has 2 inner divs (40px each) = 80px total.
-        // spacer 70px, page_height 100px → grid starts at y=70.
-        // Row bottom = 70 + 80 = 150 > 100 → crosses page boundary.
+        // spacer 50px, page_height 100px → grid starts at y=50.
+        // Row bottom = 50 + 80 = 130 > 100 → crosses page boundary.
         //
         // pre-fix: cell 2 recursion starts at page 1 cursor=0 (because
         //   cell 1's recursion advanced page_index to 1) → both inner
         //   divs of cell 2 land entirely on page 1.
-        // post-fix: both cells start recursion at page 0 cursor=70 →
-        //   first inner div (40px) splits at page boundary, landing
-        //   partly on page 0 (y=70..100) and partly on page 1 (y=0..10).
+        // post-fix: both cells start recursion at page 0 cursor=50 →
+        //   the first inner div (40px) of each stays on page 0 (y=50..90)
+        //   and the second moves to page 1.
         //   Specifically: both columns' first inner divs must appear on page 0.
         let html = r#"
             <html><body style="margin: 0; padding: 0">
-              <div style="height: 70px"></div>
+              <div style="height: 50px"></div>
               <div style="display: grid; grid-template-columns: 100px 100px; width: 200px;">
                 <div style="width: 100px">
                   <div style="height: 40px; width: 100px"></div>
@@ -11619,19 +11609,19 @@ h2 { string-set: chapter-title content(text); }
 
         // Each column has 2 inner divs (40px each).
         // After the fix, both columns' FIRST inner div must appear on page 0
-        // (at y≈70, since the grid row starts there).
+        // (at y≈50, since the grid row starts there).
         // Pre-fix: only cell 1's first inner div is on page 0; cell 2's
         // recursion starts from page 1 so its inner divs are at y=0,40 on page 1.
         let _first_divs_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, _, y)| *p == 0 && *y > 60.0)
+            .filter(|(p, _, y)| *p == 0 && *y > 40.0)
             .collect();
         // The critical assertion: the RIGHT column's first inner div must also
-        // appear on page 0 (at x=100, y≈70). Pre-fix: cell 2's recursion starts
+        // appear on page 0 (at x=100, y≈50). Pre-fix: cell 2's recursion starts
         // from page 1, so its inner divs land at x=100 only on page 1.
         let right_col_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 60.0)
+            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 40.0)
             .collect();
         assert!(
             !right_col_page0.is_empty(),
@@ -11643,7 +11633,7 @@ h2 { string-set: chapter-title content(text); }
     fn flex_row_recursive_cells_cosplit_across_page_boundary() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
-              <div style="height: 70px"></div>
+              <div style="height: 50px"></div>
               <div style="display: flex; width: 200px;">
                 <div style="width: 100px; flex: 0 0 100px">
                   <div style="height: 40px; width: 100px"></div>
@@ -11672,7 +11662,7 @@ h2 { string-set: chapter-title content(text); }
 
         let right_col_page0: Vec<_> = inner
             .iter()
-            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 60.0)
+            .filter(|(p, x, y)| *p == 0 && (x - 100.0).abs() < 0.5 && *y > 40.0)
             .collect();
         assert!(
             !right_col_page0.is_empty(),
@@ -12277,6 +12267,38 @@ h2 { string-set: chapter-title content(text); }
             ),
         ] {
             assert_eq!(pages_after_65px(&body, &["k", "c"]), [[1], [1]], "{body}");
+        }
+    }
+
+    /// A flex or grid row none of whose items places content in the rest of
+    /// the page moves to the next page with its items, and with the box it
+    /// opens, at the body level and nested: two items kept whole, 40 px
+    /// each, against the 35 px left.
+    #[test]
+    fn a_flex_or_grid_row_that_places_nothing_moves_with_its_container() {
+        let kept = r#"<p style="break-inside: avoid">K1<br>K2</p>"#;
+        let row = |display: &str| {
+            format!(
+                r#"<div id="row" style="display: {display}; grid-template-columns: 1fr 1fr"><div id="a">{kept}</div><div id="b">{kept}</div></div>"#
+            )
+        };
+        for display in ["flex", "grid"] {
+            let row = row(display);
+            for body in [
+                format!(r#"<p>Z</p>{row}"#),
+                format!(r#"<p>Z</p><div id="c">{row}</div>"#),
+                format!(
+                    r#"<div><p>Z</p><section id="c" style="padding-top: 1px">{row}</section></div>"#
+                ),
+            ] {
+                let ids: &[&str] = if body.contains(r#"id="c""#) {
+                    &["a", "b", "row", "c"]
+                } else {
+                    &["a", "b", "row"]
+                };
+                let pages = pages_after_65px(&body, ids);
+                assert!(pages.iter().all(|pages| pages == &[1]), "{body}: {pages:?}");
+            }
         }
     }
 
