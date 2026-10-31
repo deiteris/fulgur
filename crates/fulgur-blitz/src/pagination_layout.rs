@@ -1394,7 +1394,8 @@ enum BoxKind {
     /// their coordinates: zero for a container, the row's top in its table
     /// for a row, which has no box of its own.
     Parallel { tracks: Vec<usize>, top: f32 },
-    /// A table.
+    /// A table: `table` itself, or the box the caption pass wraps around
+    /// it and its caption ([`crate::blitz_adapter::captioned_table_of`]).
     Table { table: usize },
 }
 
@@ -1484,6 +1485,9 @@ fn structure(flow: Flow<'_>, node: &blitz_dom::Node) -> BoxKind {
     }
     if displays(node, DisplayInside::Table) {
         return BoxKind::Table { table: node.id };
+    }
+    if let Some(table) = crate::blitz_adapter::captioned_table_of(doc, node) {
+        return BoxKind::Table { table };
     }
     if crate::blitz_adapter::is_flex_or_grid_container_node(node) {
         let items = in_flow_children(doc, node);
@@ -1619,7 +1623,7 @@ impl Leading {
 /// - A flex or grid container, or a table row, places content when one of
 ///   its first line's boxes does, and its unit ends with the shortest.
 /// - A table leads with its top edge, its repeated header, and its first
-///   row.
+///   row; below its caption, in the box around both.
 ///
 /// The box places content in the room when its unit fits it, or the whole
 /// box does.
@@ -3475,9 +3479,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if matches!(lead.unit, Unit::Box | Unit::Lines | Unit::Row)
-                && lead.moves_on(page_height_px)
-            {
+            if lead.unit != Unit::Edge && lead.moves_on(page_height_px) {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
                 cursor.advance();
                 cursor.page_taffy_origin = this_top_in_parent;
@@ -7457,6 +7459,34 @@ mod tests {
         assert_eq!(placements(&doc, &geometry, "wrap"), [(1, 10.0)]);
         assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0)]);
         assert_eq!(placements(&doc, &geometry, "cell"), [(0, 0.0), (1, 0.0)]);
+    }
+
+    /// A table whose first row moves to the next page takes its caption and
+    /// its top edge along: a captioned table at y 150 of a 200 px page,
+    /// whose first row's cell opens with a 50 px block against the 30 px
+    /// left under the 20 px caption, starts on the next page, caption first;
+    /// and a table with a 10 px top border leaves no fragment of it behind.
+    #[test]
+    fn a_table_moves_with_its_caption_and_top_edge_when_its_first_row_moves() {
+        let row =
+            r#"<tr><td id="cell" style="height: auto"><div style="height: 50px"></div></td></tr>"#;
+        let (doc, geometry) = header_pass(
+            &format!(
+                r#"<div style="height: 150px"></div><table><caption id="cap">C</caption>{row}</table>"#
+            ),
+            200.0,
+        );
+        assert_eq!(placements(&doc, &geometry, "cap"), [(1, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "cell"), [(1, 20.0)]);
+
+        let (doc, geometry) = header_pass(
+            &format!(
+                r#"<div style="height: 150px"></div><table id="t" style="border-top: 10px solid">{row}</table>"#
+            ),
+            200.0,
+        );
+        assert_eq!(placements(&doc, &geometry, "t"), [(1, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "cell"), [(1, 10.0)]);
     }
 
     /// A table whose first body row places nothing under its header in the

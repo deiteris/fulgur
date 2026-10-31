@@ -3070,7 +3070,10 @@ impl DomPass for CaptionRestructurePass {
 /// `caption` and one `table`. Only the pass puts a `caption` outside a
 /// `table`, since the HTML parser drops a `caption` tag outside table
 /// context.
-pub(crate) fn captioned_table_of(doc: &HtmlDocument, node: &blitz_dom::Node) -> Option<usize> {
+pub(crate) fn captioned_table_of(
+    doc: &blitz_dom::BaseDocument,
+    node: &blitz_dom::Node,
+) -> Option<usize> {
     let mut caption = false;
     let mut table = None;
     for &child_id in &node.children {
