@@ -2475,8 +2475,7 @@ fn fragment_repeating_table(
 ///
 /// The root also stacks its children, each below the lowest point placed by
 /// the gap its layout leaves, where a nested walk places a child at its
-/// layout position; and only the root keeps the gap above a child that
-/// nearly fills a page after an authored break.
+/// layout position.
 ///
 /// A child taller than a page that the walk does not enter is sliced, one
 /// fragment a page, where it lies in block flow ([`slices_where_it_is`]).
@@ -2905,12 +2904,8 @@ fn fragment_block_subtree_inner(
         // lowest point placed, so a child after one that split, or after a
         // forced break, keeps its gap below where that one ended. `max(0.0)`
         // guards against negative gaps from sibling overlap.
-        let gap = if root {
-            (this_top_in_parent - prev_bottom).max(0.0)
-        } else {
-            0.0
-        };
         let mut child_page_y = if root {
+            let gap = (this_top_in_parent - prev_bottom).max(0.0);
             prev_bottom = this_top_in_parent + child_h;
             cursor.cursor_y + gap
         } else {
@@ -2937,21 +2932,6 @@ fn fragment_block_subtree_inner(
             // Fragmentation §3 (margins at forced breaks truncate).
             cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
-            // At the root, a child that nearly fills a page keeps its gap
-            // above it after an authored break, when the two still fit.
-            let page_filling_break_child = gap > 0.0
-                && child_h >= page_height_px * 0.9
-                && gap + child_h <= page_height_px + 0.5;
-            if root
-                && page_filling_break_child
-                && matches!(
-                    break_props.break_before,
-                    Some(crate::draw_primitives::BreakBefore::Page)
-                )
-            {
-                child_page_y = gap;
-                cursor.cursor_y = gap;
-            }
         } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
             // Nothing is placed on this page yet, here or above: a side
             // break only moves on to its side.
@@ -10671,8 +10651,11 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// A forced break truncates the gap above the child after it at the body
+    /// level, as below it, whatever the child's height: one that nearly
+    /// fills the page starts at the page top too.
     #[test]
-    fn body_level_break_before_preserves_own_top_margin_on_new_page() {
+    fn a_page_filling_child_after_a_forced_break_starts_at_the_page_top() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 40px; margin: 0"></div>
@@ -10694,8 +10677,8 @@ h2 { string-set: chapter-title content(text); }
             "expected only the second child on page 1, geom={geom:?}"
         );
         assert!(
-            (second_on_page1[0].y.to_f32() - 10.0).abs() < 0.5,
-            "body-level break-before should keep the element's own top margin on the new page; geom={geom:?}"
+            second_on_page1[0].y.to_f32().abs() < 0.5,
+            "the gap above a child after a forced break is truncated; geom={geom:?}"
         );
     }
 
