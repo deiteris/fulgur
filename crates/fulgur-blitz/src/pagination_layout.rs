@@ -2476,9 +2476,9 @@ fn fragment_repeating_table(
 /// The root also stacks its children, each below the lowest point placed by
 /// the gap its layout leaves, where a nested walk places a child at its
 /// layout position; and only the root slices a child taller than a page
-/// that it does not enter, enters a multicol container with a `column-span: all` child,
-/// splits a transformed paragraph between its lines, and keeps the gap
-/// above a child that nearly fills a page after an authored break.
+/// that it does not enter, enters a multicol container with a
+/// `column-span: all` child, and keeps the gap above a child that nearly
+/// fills a page after an authored break.
 ///
 /// Skips out-of-flow and whitespace-text children. Bails at
 /// [`crate::MAX_DOM_DEPTH`] — any nodes below that depth go unrecorded
@@ -3013,7 +3013,7 @@ fn fragment_block_subtree_inner(
             ) && child_h <= page_height_px + 1.0);
         // A transformed subtree paints as a single atomic box (CSS
         // Transforms §6.1) — same exclusion as the oversized-child
-        // slicing below. Without this, a nested multi-line
+        // slicing below. Without this, a multi-line
         // `<p style="transform:...">` would be split into independently
         // rendered per-page fragments and the rotation / skew / matrix
         // would apply to each slice separately instead of the whole box,
@@ -3021,7 +3021,7 @@ fn fragment_block_subtree_inner(
         let has_transform = child
             .primary_styles()
             .is_some_and(|s| !s.get_box().transform.0.is_empty());
-        let line_metrics = if avoid_inside || (has_transform && !root) {
+        let line_metrics = if avoid_inside || has_transform {
             Vec::new()
         } else {
             collect_inline_line_metrics(child)
@@ -10483,6 +10483,26 @@ h2 { string-set: chapter-title content(text); }
              not be split at line boundaries: {:?}",
             p_geom.fragments
         );
+    }
+
+    /// A transformed paragraph is as atomic at the body level as nested:
+    /// crossing the page foot, it moves whole to the next page instead of
+    /// splitting between its lines.
+    #[test]
+    fn a_transformed_paragraph_is_not_split_at_the_body_level() {
+        let html = r#"<!doctype html><html><body style="margin:0; font-size:12px">
+            <div style="height:50px"></div>
+            <p id="p" style="margin:0; padding:0; line-height:20px; width:20px; transform:rotate(1deg)">one two three four</p>
+        </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let p_id = find_by_id(&doc, "p").unwrap();
+        let table = run_pass(doc.deref_mut(), 100.0);
+        let pages = table[&p_id]
+            .fragments
+            .iter()
+            .map(|f| f.page_index)
+            .collect::<Vec<_>>();
+        assert_eq!(pages, [1]);
     }
 
     /// Devin Review on PR #285 (fulgur-a36m Phase 3.1.5b):
