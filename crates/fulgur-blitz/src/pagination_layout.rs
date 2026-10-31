@@ -3233,7 +3233,10 @@ fn fragment_block_subtree_inner(
         // break or page-name change below still recurses regardless: those
         // aren't the "unforced break" `avoid` concerns itself with.
         let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
-        let recursable = !child.children.is_empty() && (!is_multicol || multicol_has_span_all);
+        // A transformed box paints as one shape (CSS Transforms §6.1): it is
+        // monolithic, so the walk does not enter it, and it moves whole.
+        let recursable =
+            !child.children.is_empty() && !has_transform && (!is_multicol || multicol_has_span_all);
         let below = if recursable {
             fragmentation_below(doc, child_id, column_styles, 0)
         } else {
@@ -10536,6 +10539,34 @@ h2 { string-set: chapter-title content(text); }
              not be split at line boundaries: {:?}",
             p_geom.fragments
         );
+    }
+
+    /// A transformed block is monolithic at every depth: one holding several
+    /// paragraphs that crosses the page foot moves whole to the next page,
+    /// at the body level and nested, instead of splitting between them.
+    #[test]
+    fn a_transformed_block_of_paragraphs_moves_whole_at_the_page_foot() {
+        for (open, close) in [("", ""), ("<div>", "</div>")] {
+            let html = format!(
+                r#"<!doctype html><html><body style="margin:0; font-size:12px">{open}
+                <div style="height:50px"></div>
+                <div id="t" style="transform:rotate(1deg)">
+                  <p style="margin:0; line-height:20px">a</p>
+                  <p style="margin:0; line-height:20px">b</p>
+                  <p style="margin:0; line-height:20px">c</p>
+                </div>{close}
+            </body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let t = find_by_id(&doc, "t").unwrap();
+            let table = run_pass(doc.deref_mut(), 100.0);
+            let pages = table[&t]
+                .fragments
+                .iter()
+                .map(|f| f.page_index)
+                .collect::<Vec<_>>();
+            assert_eq!(pages, [1], "{open}");
+        }
     }
 
     /// A transformed paragraph is as atomic at the body level as nested:
