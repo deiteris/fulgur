@@ -199,12 +199,12 @@ pub struct PaginationLayoutTree<'a> {
     pub(crate) column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
     /// fulgur-s67g Phase 2.2: `position: running()` element instances
     /// registered by [`crate::blitz_adapter::RunningElementPass`].
-    /// `fragment_pagination_root` consults this store to skip running-
-    /// named children — they are placed into `@page` margin boxes per
-    /// page, not into the body's flow, so they must not contribute to
-    /// the body cursor or page-fragment geometry. `None` (the default
-    /// for unit-test entry points) means "no running mappings"; the
-    /// fragmenter treats every body child as in-flow.
+    /// The fragmenter consults this store to skip running-named elements
+    /// at any depth — they are placed into `@page` margin boxes per page,
+    /// not into the flow, so they must not contribute to the cursor or
+    /// page-fragment geometry. `None` (the default for unit-test entry
+    /// points) means "no running mappings"; the fragmenter treats every
+    /// element as in-flow.
     pub(crate) running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
     /// fulgur-uebl: per-element used page-name (CSS Page 3 §5.3),
     /// resolved from the same author-facing `page` declarations the
@@ -2475,9 +2475,8 @@ fn fragment_repeating_table(
 ///
 /// The root also stacks its children, each below the lowest point placed by
 /// the gap its layout leaves, where a nested walk places a child at its
-/// layout position; and only the root takes `position: running()` children
-/// out of the flow, slices a child taller than a page that it does not
-/// enter, enters a multicol container with a `column-span: all` child,
+/// layout position; and only the root slices a child taller than a page
+/// that it does not enter, enters a multicol container with a `column-span: all` child,
 /// splits a transformed paragraph between its lines, and keeps the gap
 /// above a child that nearly fills a page after an authored break.
 ///
@@ -2657,14 +2656,27 @@ fn fragment_block_subtree_inner(
             }
         }
         let layout = child.final_layout;
-        // fulgur-s67g Phase 2.2: `position: running()` named children are
+        // fulgur-s67g Phase 2.2: `position: running()` named elements are
         // removed from the flow and placed into `@page` margin boxes per
-        // page; they take no room. Phase 3.4 follow-up (PR #296 Devin): a
-        // zero-height fragment at the cursor still enters the running node
-        // into `geometry`, on the page on which its source position lands —
-        // what `collect_running_element_states` needs to map running
-        // instances to their per-page state.
-        if root && running_store.is_some_and(|s| s.instance_for_node(child_id).is_some()) {
+        // page; they take no room, at any depth. Phase 3.4 follow-up (PR
+        // #296 Devin): a zero-height fragment at the cursor still enters
+        // the running node into `geometry`, on the page on which its source
+        // position lands — what `collect_running_element_states` needs to
+        // map running instances to their per-page state. The engine's
+        // stylesheet gives a running element `display: none`; one the
+        // layout still gives a height (an inline `position: running()`)
+        // gives that room back: what follows it moves up by its height, as
+        // the siblings after a lifted table do.
+        if running_store.is_some_and(|s| s.instance_for_node(child_id).is_some()) {
+            let height = layout.size.height;
+            if height.is_finite() && height > 0.0 {
+                if root {
+                    prev_bottom += height;
+                } else if !allow_same_row_rebase {
+                    cursor.page_taffy_origin += height;
+                    own_lift += height;
+                }
+            }
             if child.element_data().is_some() {
                 geometry
                     .entry(child_id)
@@ -8029,6 +8041,79 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(
             entry.instance_ids,
             vec![store.instance_for_node(node_id).unwrap()]
+        );
+    }
+
+    /// `body` laid out on pages `page_height` px tall with its
+    /// `.header { position: running(pageHeader) }` elements registered as
+    /// running, which the layout still gives their height.
+    fn running_header_pass(
+        body: &str,
+        page_height: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        use crate::gcpm::parser::parse_gcpm;
+        use std::sync::Arc;
+
+        let css = ".header { position: running(pageHeader); }";
+        let html = format!(
+            "<!DOCTYPE html><html><head><style>{css} div {{ margin: 0 }}</style></head>\
+             <body style=\"margin: 0\">{body}</body></html>"
+        );
+        let gcpm = parse_gcpm(css);
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = blitz_adapter::parse(&html, 600.0, &fonts);
+        let pass = blitz_adapter::RunningElementPass::new(gcpm.running_mappings.clone());
+        let pass_ctx = blitz_adapter::PassContext { font_data: &fonts };
+        blitz_adapter::apply_single_pass(&pass, &mut doc, &pass_ctx);
+        let store = pass.into_running_store();
+        blitz_adapter::resolve(&mut doc);
+        let column_styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let (geometry, _) =
+            run_pass_with_break_and_running(doc.deref_mut(), page_height, &column_styles, &store);
+        (doc, geometry)
+    }
+
+    /// A `position: running()` element is out of the flow at every depth:
+    /// in a block the walker enters, the sibling after it sits where it
+    /// would without it, and the running element is placed with no height.
+    #[test]
+    fn a_nested_running_element_takes_no_room() {
+        let (doc, geometry) = running_header_pass(
+            r#"<div id="wrap">
+                 <div id="header" class="header" style="height: 30px">Header</div>
+                 <div id="a" style="height: 60px"></div>
+                 <div id="b" style="height: 60px"></div>
+               </div>"#,
+            100.0,
+        );
+        let at = |id: &str| {
+            geometry[&find_by_id(&doc, id).unwrap()]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at("header"), [(0, 0.0, 0.0)]);
+        assert_eq!(at("a"), [(0, 0.0, 60.0)]);
+        assert_eq!(at("b"), [(1, 0.0, 60.0)]);
+    }
+
+    /// The body's running child gives its room back too: the body stacks
+    /// the sibling after it by the gap the layout leaves less the running
+    /// element's height.
+    #[test]
+    fn a_running_element_at_the_body_level_takes_no_room() {
+        let (doc, geometry) = running_header_pass(
+            r#"<div id="header" class="header" style="height: 30px">Header</div>
+               <div id="a" style="height: 60px; margin-top: 10px"></div>"#,
+            100.0,
+        );
+        let a = &geometry[&find_by_id(&doc, "a").unwrap()].fragments;
+        assert_eq!(
+            a.iter()
+                .map(|f| (f.page_index, f.y.to_f32()))
+                .collect::<Vec<_>>(),
+            [(0, 10.0)]
         );
     }
 
