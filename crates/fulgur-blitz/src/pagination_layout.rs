@@ -1583,17 +1583,6 @@ enum Unit {
     Table,
 }
 
-/// When [`leading_extent`] descends into a box it meets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Gate {
-    /// When its children would split in the room
-    /// ([`would_split_block_subtree`]), a kept box never.
-    Split,
-    /// Always, a box with `break-inside: avoid` below the first never,
-    /// even one taller than a page.
-    Always,
-}
-
 impl Leading {
     /// A unit `extent` tall placed whole, in `room` px.
     fn whole(extent: f32, room: f32) -> Self {
@@ -1633,17 +1622,16 @@ impl Leading {
 ///   row.
 ///
 /// The box places content in the room when its unit fits it, or the whole
-/// box does. `gate` says when the descent enters a box it meets.
+/// box does.
 fn leading_extent(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
     room: f32,
     page_height_px: f32,
     depth: usize,
-    gate: Gate,
 ) -> Leading {
     let kind = classify(flow, node, page_height_px);
-    leading_of(flow, node, &kind, room, page_height_px, depth, gate)
+    leading_of(flow, node, &kind, room, page_height_px, depth)
 }
 
 /// [`leading_extent`] of `node`, of `kind`.
@@ -1654,16 +1642,11 @@ fn leading_of(
     room: f32,
     page_height_px: f32,
     depth: usize,
-    gate: Gate,
 ) -> Leading {
     let Flow {
         doc, column_styles, ..
     } = flow;
     let height = node.final_layout.size.height;
-    let descends = || match gate {
-        Gate::Split => would_split_block_subtree(doc, node.id, room, page_height_px, 0),
-        Gate::Always => true,
-    };
     let whole = Leading::whole(height, room);
     if depth >= crate::MAX_DOM_DEPTH {
         return whole;
@@ -1679,7 +1662,7 @@ fn leading_of(
                 || has_page_name_change_below(doc, node.id, flow.used_page_names, 0) =>
         {
             let kind = structure(flow, node);
-            leading_of(flow, node, &kind, room, page_height_px, depth, gate)
+            leading_of(flow, node, &kind, room, page_height_px, depth)
         }
         BoxKind::Monolithic(_) => whole,
         BoxKind::InlineRoot { lines, .. } if lines.len() <= 1 => whole,
@@ -1709,7 +1692,7 @@ fn leading_of(
                 .map(|track| {
                     let offset = track.final_layout.location.y - top;
                     let inner =
-                        leading_extent(flow, track, room - offset, page_height_px, depth + 1, gate);
+                        leading_extent(flow, track, room - offset, page_height_px, depth + 1);
                     (offset + inner.extent, inner.places)
                 })
                 .reduce(|(a, a_places), (b, b_places)| (a.min(b), a_places || b_places));
@@ -1723,7 +1706,7 @@ fn leading_of(
             }
         }
         BoxKind::Table { table, .. } => {
-            if !descends() {
+            if !enters(flow, node, kind, room, page_height_px) {
                 return whole;
             }
             let Some(table) = doc.get_node(*table) else {
@@ -1734,11 +1717,11 @@ fn leading_of(
             } else {
                 table.final_layout.location.y
             };
-            let inner = table_leading(flow, table, room - offset, page_height_px, depth + 1, gate);
+            let inner = table_leading(flow, table, room - offset, page_height_px, depth + 1);
             within(inner, offset, Unit::Table)
         }
         _ => {
-            if !descends() {
+            if !enters(flow, node, kind, room, page_height_px) {
                 return whole;
             }
             let Some(first) = in_flow_children(doc, node)
@@ -1756,26 +1739,13 @@ fn leading_of(
                     unit: Unit::Edge,
                 };
             }
-            let avoid = column_styles
-                .and_then(|styles| styles.get(&first.id))
-                .is_some_and(|props| {
-                    matches!(
-                        props.break_inside,
-                        Some(crate::draw_primitives::BreakInside::Avoid)
-                    )
-                });
-            let inner = if gate == Gate::Always && avoid {
-                Leading::whole(layout.size.height, room - layout.location.y)
-            } else {
-                leading_extent(
-                    flow,
-                    first,
-                    room - layout.location.y,
-                    page_height_px,
-                    depth + 1,
-                    gate,
-                )
-            };
+            let inner = leading_extent(
+                flow,
+                first,
+                room - layout.location.y,
+                page_height_px,
+                depth + 1,
+            );
             within(inner, layout.location.y, inner.unit)
         }
     }
@@ -1813,7 +1783,6 @@ fn table_leading(
     room: f32,
     page_height_px: f32,
     depth: usize,
-    gate: Gate,
 ) -> Leading {
     let Flow {
         doc,
@@ -1844,7 +1813,7 @@ fn table_leading(
             return Leading::whole(band, room);
         };
         let rows_page = page_height_px - header.band_height_px;
-        let inner = leading_extent(flow, row, room - band, rows_page, depth + 1, gate);
+        let inner = leading_extent(flow, row, room - band, rows_page, depth + 1);
         return Leading {
             extent: band + inner.extent,
             places: inner.places,
@@ -1861,7 +1830,7 @@ fn table_leading(
     let BoxKind::Parallel { top, .. } = classify(flow, row, page_height_px) else {
         return Leading::whole(table.final_layout.size.height, room);
     };
-    let inner = leading_extent(flow, row, room - top, page_height_px, depth + 1, gate);
+    let inner = leading_extent(flow, row, room - top, page_height_px, depth + 1);
     Leading {
         extent: top + inner.extent,
         places: inner.places,
@@ -2522,9 +2491,7 @@ fn fragment_repeating_table(
     let body_page_height = page_height_px - header.band_height_px;
     let table = doc.get_node(header.table_id);
     let first_row_places = |room: f32| {
-        table.is_none_or(|table| {
-            table_leading(flow, table, room, page_height_px, depth, Gate::Split).places
-        })
+        table.is_none_or(|table| table_leading(flow, table, room, page_height_px, depth).places)
     };
     // The band the table's first page carries, without the rows that skip it.
     let lift = header.first_page_lift_px;
@@ -3241,15 +3208,7 @@ fn fragment_block_subtree_inner(
         if kept_row_bottom.is_none()
             && child_page_y > 0.0
             && cell_row(doc, child).is_some_and(|row| {
-                !leading_extent(
-                    flow,
-                    row,
-                    page_height_px - child_page_y,
-                    page_height_px,
-                    0,
-                    Gate::Split,
-                )
-                .places
+                !leading_extent(flow, row, page_height_px - child_page_y, page_height_px, 0).places
             })
         {
             if cursor.cursor_y > cursor.page_start_y {
@@ -3515,7 +3474,6 @@ fn fragment_block_subtree_inner(
                 page_height_px - child_page_y,
                 page_height_px,
                 depth + 1,
-                Gate::Always,
             );
             if lead.unit == Unit::Box && lead.moves_on(page_height_px) {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
