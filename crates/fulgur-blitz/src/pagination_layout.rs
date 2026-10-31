@@ -1969,8 +1969,8 @@ impl PageCursor {
     }
 
     /// Nothing is placed on this page yet: no in-flow box with height, at
-    /// any depth, above the walk's place (cells beside it in a row do not
-    /// count). A box's padding or border, or a margin, is no content. A
+    /// any depth, above the walk's place (the boxes beside it, a flex or
+    /// grid row's items or a table row's cells, do not count). A box's padding or border, or a margin, is no content. A
     /// break here would leave the page with nothing but such edges, so a
     /// paragraph splits within relaxed `orphans` and `widows` rather than
     /// move whole (css-break-3 §4.4), and a side break only moves on to its
@@ -3340,6 +3340,14 @@ fn fragment_block_subtree_inner(
     // for the rationale and the outer-Option semantics.
     let mut prev_used_page: Option<Option<String>> = None;
     let mut row_state: Option<RowState> = None;
+    // Outside a flex or grid row (whose `RowState` does the same): the
+    // previous in-flow child's layout top and bottom, and the page and
+    // `page_has_content` where the children side by side with it started.
+    // Blitz lays a table out as a grid of its cells, so the cells of a row
+    // are such children; a child beside another is placed below what was
+    // on the page when the first of them started, not below its neighbour.
+    let mut prev_in_flow: Option<(f32, f32)> = None;
+    let mut beside_start = (cursor.page_index, cursor.page_has_content);
     // fulgur-uebl: flex / grid containers establish a flex/grid
     // formatting context where children are not class A break points
     // (CSS Fragmentation 3 §3.2). The `page` property doesn't apply to
@@ -3586,6 +3594,18 @@ fn fragment_block_subtree_inner(
                 prev_used_page = Some(used_end.clone());
             }
             continue;
+        }
+
+        if !allow_same_row_rebase {
+            let beside = prev_in_flow.is_some_and(|(top, bottom)| {
+                this_top_in_parent < bottom - 0.5 && this_top_in_parent <= top + 0.5
+            });
+            if beside {
+                cursor.page_has_content = cursor.page_index == beside_start.0 && beside_start.1;
+            } else {
+                beside_start = (cursor.page_index, cursor.page_has_content);
+            }
+            prev_in_flow = Some((this_top_in_parent, this_top_in_parent + child_h));
         }
 
         // fulgur-kv0r: place the child at its Taffy-reported parent-
@@ -13227,6 +13247,74 @@ h2 { string-set: chapter-title content(text); }
         let p_id = find_by_id(&doc, "p").expect("p#p");
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
         assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
+    }
+
+    /// Blitz lays a table out as a grid of its cells: the first cell of a
+    /// row sits beside the second, not above it, so the second cell's
+    /// paragraph at the top of a page splits there within relaxed `orphans`
+    /// and `widows`, as the first cell's would.
+    #[test]
+    fn a_paragraph_in_the_second_cell_of_a_table_row_at_the_top_of_a_page_relaxes_its_orphans() {
+        let html = r#"<html><body style="margin:0">
+              <table style="border-spacing:0"><tr>
+                <td style="padding:0;line-height:20px">x</td>
+                <td style="padding:0">
+                  <p id="p" style="margin:0;line-height:25px;orphans:2;widows:2">a<br>b<br>c</p>
+                </td>
+              </tr></table>
+            </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let p_id = find_by_id(&doc, "p").expect("p#p");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
+    }
+
+    /// At the body level a margin is no content either: a paragraph whose
+    /// `orphans` cannot be met, 10 px below the top of the page a forced
+    /// break opened, splits on that page instead of moving to the next.
+    #[test]
+    fn a_body_paragraph_below_a_margin_at_the_top_of_a_page_relaxes_its_orphans() {
+        let html = r#"<html><body style="margin:0">
+              <div style="break-after:page;line-height:20px">x</div>
+              <p id="p" style="margin:10px 0 0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
+            </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let p_id = find_by_id(&doc, "p").expect("p#p");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(line_partition(&geom, p_id), (vec![1, 2], vec![0, 2, 3]));
+    }
+
+    /// A flex row whose first item crosses the page: the next item restarts
+    /// where the row did, at the top of an empty page, so its paragraph
+    /// splits there within relaxed minimums; the row ends on the page the
+    /// first item reached, which holds its content though the row's last
+    /// item, empty, was placed on the first page: a paragraph after the row
+    /// that cannot split there moves whole.
+    #[test]
+    fn a_flex_row_restores_its_empty_page_for_each_item_and_ends_on_its_last_page_with_content() {
+        let html = r#"<html><body style="margin:0">
+              <div style="display:flex">
+                <div style="flex:1 1 0">
+                  <p style="margin:0;line-height:20px">a<br>b<br>c<br>d<br>e</p>
+                </div>
+                <div style="flex:1 1 0;align-self:flex-start;padding-top:10px">
+                  <p id="beside" style="margin:0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
+                </div>
+                <div style="flex:1 1 0;align-self:flex-start"></div>
+              </div>
+              <p id="after" style="margin:0;line-height:20px">a<br>b<br>c</p>
+            </body></html>"#;
+        let mut doc = parse(html, 300.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let beside = find_by_id(&doc, "beside").expect("p#beside");
+        let after = find_by_id(&doc, "after").expect("p#after");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(
+            (line_partition(&geom, beside), line_partition(&geom, after)),
+            ((vec![0, 1], vec![0, 2, 3]), (vec![2], vec![0, 3]))
+        );
     }
 
     // ── StringSetPageState / PageRunningState derived-trait coverage ─────────
