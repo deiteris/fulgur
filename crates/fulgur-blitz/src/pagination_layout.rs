@@ -1426,6 +1426,13 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
         .parent
         .and_then(|id| doc.get_node(id))
         .is_some_and(|parent| crate::blitz_adapter::is_orthogonal_to_parent(parent, node));
+    // An atomic inline or a box in an orthogonal flow is monolithic (CSS
+    // Writing Modes 4 §9), which the walk did not decide before `classify`:
+    // an orthogonal inline root was split between its lines. Neither reaches
+    // the walk today: a walked child is a block box (an inline-level one is
+    // wrapped in an anonymous block, a flex or grid item blockified), and the
+    // engine's style system computes every `writing-mode` as `horizontal-tb`,
+    // so no test can build one.
     if node.children.is_empty()
         || (transformed && fits_page)
         || crate::blitz_adapter::is_atomic_inline_container_node(node)
@@ -1642,6 +1649,11 @@ fn leading_of(
         places: height <= room || inner.places,
     };
     match kind {
+        // A kept box is measured through its structure only when a forced
+        // break or a page-name change below it splits it. `enters` also
+        // enters one for a skipped header row, which leaves it unsplit: its
+        // unit is still the whole box, as the move of a kept box entered so
+        // needs.
         BoxKind::Monolithic(Whole::Kept)
             if fragmentation_below(doc, node.id, column_styles, 0) == Below::ForcedBreak
                 || has_page_name_change_below(doc, node.id, flow.used_page_names, 0) =>
