@@ -68,8 +68,6 @@ enum Invariant {
 mod fix {
     /// One page cursor: one rule for a parent's fragment on each page.
     pub const PAGE_CURSOR: &str = "page cursor";
-    /// One walker for the body and nested boxes.
-    pub const ONE_WALKER: &str = "one walker";
     /// One measure of a box's leading unbreakable extent, lines included.
     pub const LEADING_EXTENT: &str = "leading extent";
     /// Lines measured from the line box (baseline and line height), not
@@ -517,6 +515,14 @@ fn within(case: &Case, b: usize, kinds: &[Kind]) -> bool {
     false
 }
 
+/// Whether a paragraph in `b`'s subtree measures its lines past its box.
+fn overmeasured_paragraph_in(placed: &Placed<'_>, b: usize) -> bool {
+    placed.case.boxes[b].children.iter().any(|&c| {
+        (placed.case.boxes[c].kind == Kind::Para && placed.excess(c) > EPS)
+            || overmeasured_paragraph_in(placed, c)
+    })
+}
+
 /// `(page, y)` ordered with a tolerance: whether `a` lies before `b` by
 /// more than [`EPS`].
 fn before(a: (u32, f32), b: (u32, f32)) -> bool {
@@ -548,8 +554,9 @@ impl Placed<'_> {
         let frags = &self.fragments[b];
         if frags.len() > 1 && info.parent.is_none() {
             return (
-                fix::ONE_WALKER,
-                "the body walker's fragment of a split box ends past the foot",
+                fix::PAGE_CURSOR,
+                "a split box's fragment on the page a child crossed takes that \
+                 child's whole height",
             );
         }
         if info.kind == Kind::Para && frags.len() > 1 && self.excess(b) > EPS {
@@ -568,10 +575,22 @@ impl Placed<'_> {
             && frags.len() == 1
             && self.layout_height[b] > self.page_height + EPS
         {
-            return (
-                fix::ONE_WALKER,
-                "a nested childless box taller than a page is not sliced",
-            );
+            return if within(self.case, b, &[Kind::Table]) {
+                (
+                    fix::TABLE_WALKER,
+                    "a box taller than a page in a table cell is not sliced",
+                )
+            } else if within(self.case, b, &[Kind::Flex, Kind::Item]) {
+                (
+                    fix::LEADING_EXTENT,
+                    "a box taller than a page in a flex item is not sliced",
+                )
+            } else {
+                (
+                    fix::LEADING_EXTENT,
+                    "a box taller than a page entered below the page foot is not sliced",
+                )
+            };
         }
         for child in enclosed(self.case, b) {
             if !self.past[child].is_disjoint(&self.past[b]) || self.excess(child) > EPS {
@@ -794,6 +813,11 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                     (
                         fix::LINE_BOX,
                         "the paragraph before it measures its lines past its box",
+                    )
+                } else if overmeasured_paragraph_in(&placed, a) {
+                    (
+                        fix::LINE_BOX,
+                        "a paragraph in the box before it measures its lines past its box",
                     )
                 } else {
                     (fix::UNEXPLAINED, "it starts before the box before it ends")
