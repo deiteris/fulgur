@@ -954,12 +954,19 @@ impl<'a> PaginationLayoutTree<'a> {
                             0,
                         )));
             // A box kept whole that is entered only for a skipped header row
-            // moves whole first, as one not entered would.
+            // moves whole first, as one not entered would; so does a box
+            // opened by a box kept whole that crosses the foot.
             if needs_recursion
-                && !forced
-                && avoid_inside
                 && cursor_y > 0.0
-                && cursor_y + child_h > self.page_height_px
+                && ((!forced && avoid_inside && cursor_y + child_h > self.page_height_px)
+                    || opening_kept_box_bottom(
+                        self.doc,
+                        self.column_styles,
+                        child,
+                        self.page_height_px,
+                        0,
+                    )
+                    .is_some_and(|bottom| cursor_y + bottom > self.page_height_px))
             {
                 page_index += 1;
                 cursor_y = 0.0;
@@ -1966,6 +1973,85 @@ fn kept_table_row_bottom(
         None => return None,
     };
     (bottom - top <= page_height_px + 1.0).then_some(bottom)
+}
+
+/// The bottom, below the top of `node`, of the box kept whole
+/// (`break-inside: avoid`) that opens `node`, when it fits a strip of
+/// `page_height_px`; `None` when no such box opens it. The box is `node`'s
+/// first in-flow child, or the box that opens that child, down through block
+/// containers, as long as no padding or border parts each from its
+/// container's content edge.
+///
+/// css-break-3 §4.1: a gap between a container's content edge and its first
+/// child is a class C break point. Without one, the only break point before
+/// the child is the one before its container (§3.1 propagates a first
+/// child's breaks to its container likewise). So a box kept whole that opens
+/// `node` and crosses the page foot moves `node` to the next page with it,
+/// instead of staying where `node` starts, past the foot.
+fn opening_kept_box_bottom(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> Option<f32> {
+    if depth >= crate::MAX_DOM_DEPTH || !is_walked_block_container(node) {
+        return None;
+    }
+    let layout_children = node.layout_children.borrow();
+    let children = layout_children
+        .as_deref()
+        .filter(|children| !children.is_empty())
+        .unwrap_or(&node.children);
+    let first = children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .find(|child| {
+            !crate::blitz_adapter::is_whitespace_only_text_node(child)
+                && !crate::blitz_adapter::is_out_of_flow_node(child)
+                && child.final_layout.size.height > 0.0
+        })?;
+    let layout = first.final_layout;
+    let content_top = node.final_layout.border.top + node.final_layout.padding.top;
+    if layout.location.y - layout.margin.top - content_top > 0.5 {
+        return None;
+    }
+    let kept = column_styles
+        .and_then(|styles| styles.get(&first.id))
+        .is_some_and(|props| {
+            matches!(
+                props.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        });
+    let bottom = layout.location.y
+        + if kept {
+            layout.size.height
+        } else {
+            opening_kept_box_bottom(doc, column_styles, first, page_height_px, depth + 1)?
+        };
+    (bottom <= page_height_px + 1.0).then_some(bottom)
+}
+
+/// True when the fragmenter walks `node`'s children as block flow: a block
+/// box (`display: block`, `list-item`, or `flow-root`) that is no inline
+/// root, multicol container, or transformed box.
+fn is_walked_block_container(node: &blitz_dom::Node) -> bool {
+    use style::values::specified::box_::DisplayOutside;
+    let block_flow = node.primary_styles().is_some_and(|s| {
+        let display = s.clone_display();
+        display.outside() == DisplayOutside::Block
+            && matches!(
+                display.inside(),
+                DisplayInside::Flow | DisplayInside::FlowRoot
+            )
+            && s.get_box().transform.0.is_empty()
+    });
+    block_flow
+        && node
+            .element_data()
+            .is_none_or(|el| el.inline_layout_data.is_none())
+        && !crate::blitz_adapter::is_multicol_container(node)
 }
 
 /// The bottom of the later rows that a row's cells reach, given the bottom
@@ -3493,14 +3579,23 @@ fn fragment_block_subtree_inner(
                     )));
         // A box kept whole that is entered only for a skipped header row
         // moves whole to the next page first, as one not entered would (the
-        // strip-overflow cut below), and is entered there.
-        // A cell of a row kept whole is moved with its row instead.
+        // strip-overflow cut below), and is entered there; so does a box
+        // opened by a box kept whole that crosses the foot, outside a row of
+        // boxes side by side. A cell of a row kept whole is moved with its
+        // row instead.
         if needs_recursion
-            && !forced
-            && avoid_fits_whole_page
             && kept_row_bottom.is_none()
             && (child_page_y > page_start_y || (initial_page_occupied && page_index == page_in))
-            && child_page_y + child_h > page_height_px
+            && ((!forced && avoid_fits_whole_page && child_page_y + child_h > page_height_px)
+                || (!allow_same_row_rebase
+                    && opening_kept_box_bottom(
+                        doc,
+                        column_styles,
+                        child,
+                        page_height_px,
+                        depth + 1,
+                    )
+                    .is_some_and(|bottom| child_page_y + bottom > page_height_px)))
         {
             let should_emit = row_state
                 .as_mut()
@@ -11399,6 +11494,57 @@ h2 { string-set: chapter-title content(text); }
                 [(0, 180.0), (1, 180.0)],
                 "six lines on each page; wrapped: {wrap}; geom={geom:?}"
             );
+        }
+    }
+
+    /// css-break-3 §4.1: a paragraph kept whole that opens its container,
+    /// with no padding or border between them, has no break point before it
+    /// but the one before the container. When it crosses the page foot after
+    /// other content, the container moves to the next page with it, at any
+    /// depth, instead of leaving it past the foot. Padding above it is a
+    /// break point of its own: the paragraph moves alone, and its container
+    /// starts on the first page.
+    #[test]
+    fn a_kept_paragraph_opening_its_container_moves_the_container_to_the_next_page() {
+        let kept = r#"<p id="k" style="break-inside: avoid">K1<br>K2</p><p>N</p>"#;
+        for (blocks, container_pages) in [
+            (
+                format!(r#"<p>Z</p><div id="c">{kept}</div>"#),
+                [1].as_slice(),
+            ),
+            (
+                format!(r#"<p>Z</p><section id="c"><div>{kept}</div></section>"#),
+                &[1],
+            ),
+            (
+                format!(r#"<div><p>Z</p><section id="c">{kept}</section></div>"#),
+                &[1],
+            ),
+            (
+                format!(r#"<p>Z</p><div id="c" style="padding-top: 1px">{kept}</div>"#),
+                &[0, 1],
+            ),
+        ] {
+            let html = format!(
+                r#"<html><head><style>
+                  html, body {{ margin: 0; padding: 0; }}
+                  p {{ margin: 0; line-height: 20px; }}
+                </style></head><body><div style="height: 5px"></div><p>X</p><p>Y</p>{blocks}</body></html>"#
+            );
+            let mut doc = parse(&html, 200.0);
+            let k_id = find_by_id(doc.deref_mut(), "k").expect("p#k");
+            let c_id = find_by_id(doc.deref_mut(), "c").expect("#c");
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            let pages = |id: usize| -> Vec<u32> {
+                let mut pages: Vec<u32> =
+                    geom[&id].fragments.iter().map(|f| f.page_index).collect();
+                pages.dedup();
+                pages
+            };
+            assert_eq!(pages(k_id), [1], "{blocks}: geom={geom:?}");
+            assert_eq!(pages(c_id), container_pages, "{blocks}: geom={geom:?}");
         }
     }
 
