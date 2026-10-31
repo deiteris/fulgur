@@ -6,74 +6,73 @@
 # (62 of the directory's 1005 reftests). Tests that fragment only into
 # columns are left to the multicol lists.
 #
-# The outcome column is not measured yet: every entry is FAIL until the
-# list is seeded on Linux with poppler-utils, which turns the tests that
-# pass into PASS:
+# Outcomes measured once, in the Debian image with poppler-utils, by
 #   scripts/wpt/fetch.sh
 #   cargo run -p fulgur-wpt --example seed -- \
 #     --list crates/fulgur-wpt/expectations/lists/css-break.txt \
 #     --wpt-root target/wpt \
 #     --out crates/fulgur-wpt/expectations/lists/css-break.txt
+# with the workspace's Blitz fork: 10 PASS, 52 FAIL.
 
-FAIL  css/css-break/abspos-in-clipped-overflow-print.html  # not measured yet
-FAIL  css/css-break/abspos-overflow-hidden-001-print.html  # not measured yet
-FAIL  css/css-break/block-001-wm-vlr-print.html  # not measured yet
-FAIL  css/css-break/block-001-wm-vrl-print.html  # not measured yet
-FAIL  css/css-break/block-002-wm-vlr-print.html  # not measured yet
-FAIL  css/css-break/block-002-wm-vrl-print.html  # not measured yet
-FAIL  css/css-break/block-in-inline-015-print.html  # not measured yet
-FAIL  css/css-break/break-inside-avoid-multicol-001-print.html  # not measured yet
-FAIL  css/css-break/break-nested-float-in-table-001-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-063-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-064-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-075-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-076-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-080-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081a-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081b-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081c-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081d-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082a-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082b-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082c-print.html  # not measured yet
-FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082d-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-060-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-065-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-066-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068a-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068b-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068c-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068d-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069a-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069b-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069c-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069d-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-042-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-045-print.html  # not measured yet
-FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-046-print.html  # not measured yet
-FAIL  css/css-break/float-with-large-margin-bottom-cross-page-001-print.html  # not measured yet
-FAIL  css/css-break/float-with-large-margin-bottom-cross-page-002-print.html  # not measured yet
-FAIL  css/css-break/grid/monolithic-overflow-print.html  # not measured yet
-FAIL  css/css-break/ink-overflow-001-print.html  # not measured yet
-FAIL  css/css-break/overflowed-abs-pos-with-percentage-height-print.html  # not measured yet
-FAIL  css/css-break/overflowing-block-002-print.html  # not measured yet
-FAIL  css/css-break/overflowing-block-print.html  # not measured yet
-FAIL  css/css-break/root-margin-001-print.html  # not measured yet
-FAIL  css/css-break/table/repeated-section/fixedpos-in-footer-forced-break-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-001a-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-001b-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-001c-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-001d-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-002a-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-002b-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-002c-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-002d-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-003a-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-003b-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-003c-print.html  # not measured yet
-FAIL  css/css-break/table/table-fragmentation-003d-print.html  # not measured yet
-FAIL  css/css-break/transform-022-print.html  # not measured yet
-FAIL  css/css-break/transform-023-print.html  # not measured yet
-FAIL  css/css-break/transform-024-print.html  # not measured yet
-FAIL  css/css-break/underflow-from-next-page-print.html  # not measured yet
-FAIL  css/css-break/zero-height-page-break-001-print.html  # not measured yet
+PASS  css/css-break/abspos-in-clipped-overflow-print.html
+FAIL  css/css-break/abspos-overflow-hidden-001-print.html  # page 1 diff: 2602/891662 pixels exceed tol (max_ch=3)
+FAIL  css/css-break/block-001-wm-vlr-print.html  # page 1 diff: 430/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/block-001-wm-vrl-print.html  # page 1 diff: 430/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/block-002-wm-vlr-print.html  # page count mismatch: test=2 ref=3
+FAIL  css/css-break/block-002-wm-vrl-print.html  # page count mismatch: test=2 ref=3
+FAIL  css/css-break/block-in-inline-015-print.html  # page count mismatch: test=1 ref=4
+FAIL  css/css-break/break-inside-avoid-multicol-001-print.html  # page 1 diff: 36864/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/break-nested-float-in-table-001-print.html  # page count mismatch: test=1 ref=3
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-063-print.html  # page 2 diff: 11234/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-064-print.html  # page count mismatch: test=3 ref=4
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-075-print.html  # page 2 diff: 36815/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-076-print.html  # page count mismatch: test=3 ref=2
+PASS  css/css-break/flexbox/multi-line-row-flex-fragmentation-080-print.html
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081a-print.html  # page 1 diff: 5467/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081b-print.html  # page 1 diff: 21894/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081c-print.html  # page 1 diff: 4304/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-081d-print.html  # page 1 diff: 5467/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082a-print.html  # page 1 diff: 28185/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082b-print.html  # page 1 diff: 30172/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082c-print.html  # page 1 diff: 27282/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-082d-print.html  # page 1 diff: 27619/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-060-print.html  # page count mismatch: test=2 ref=3
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-065-print.html
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-066-print.html
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-068a-print.html
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068b-print.html  # page 1 diff: 720/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068c-print.html  # page 1 diff: 18954/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068d-print.html  # page 1 diff: 19046/138240 pixels exceed tol (max_ch=255)
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-069a-print.html
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069b-print.html  # page 1 diff: 18452/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069c-print.html  # page 1 diff: 703/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069d-print.html  # page 1 diff: 17268/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-042-print.html  # page 2 diff: 2105/138240 pixels exceed tol (max_ch=255)
+PASS  css/css-break/flexbox/single-line-row-flex-fragmentation-045-print.html
+PASS  css/css-break/flexbox/single-line-row-flex-fragmentation-046-print.html
+FAIL  css/css-break/float-with-large-margin-bottom-cross-page-001-print.html  # page 2 diff: 3200/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/float-with-large-margin-bottom-cross-page-002-print.html  # page count mismatch: test=1 ref=2
+FAIL  css/css-break/grid/monolithic-overflow-print.html  # page count mismatch: test=2 ref=3
+FAIL  css/css-break/ink-overflow-001-print.html  # harness error: canonicalize target/wpt/css/css-break/about:blank
+PASS  css/css-break/overflowed-abs-pos-with-percentage-height-print.html
+FAIL  css/css-break/overflowing-block-002-print.html  # page 1 diff: 4704/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/overflowing-block-print.html  # page count mismatch: test=4 ref=3
+FAIL  css/css-break/root-margin-001-print.html  # page count mismatch: test=1 ref=2
+FAIL  css/css-break/table/repeated-section/fixedpos-in-footer-forced-break-print.html  # page count mismatch: test=3 ref=4
+FAIL  css/css-break/table/table-fragmentation-001a-print.html  # page 1 diff: 12672/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/table/table-fragmentation-001b-print.html  # page 1 diff: 12672/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/table/table-fragmentation-001c-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-001d-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-002a-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-002b-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-002c-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-002d-print.html  # page count mismatch: test=3 ref=2
+FAIL  css/css-break/table/table-fragmentation-003a-print.html  # page 1 diff: 29952/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/table/table-fragmentation-003b-print.html  # page 1 diff: 26112/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/table/table-fragmentation-003c-print.html  # page 1 diff: 30240/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/table/table-fragmentation-003d-print.html  # page 1 diff: 31104/138240 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/transform-022-print.html  # page count mismatch: test=1 ref=5
+FAIL  css/css-break/transform-023-print.html  # page 2 diff: 5350/891662 pixels exceed tol (max_ch=255)
+FAIL  css/css-break/transform-024-print.html  # page count mismatch: test=2 ref=5
+FAIL  css/css-break/underflow-from-next-page-print.html  # page 1 diff: 288/891662 pixels exceed tol (max_ch=255)
+PASS  css/css-break/zero-height-page-break-001-print.html
