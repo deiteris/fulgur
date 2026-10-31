@@ -6296,6 +6296,9 @@ fn compute_pagination_layout(
 }
 
 #[cfg(test)]
+mod invariants;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::blitz_adapter;
