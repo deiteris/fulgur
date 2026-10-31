@@ -967,9 +967,11 @@ impl<'a> PaginationLayoutTree<'a> {
                 let mut lifted = 0.0;
                 let (new_page, new_cursor) = fragment_block_subtree(
                     &mut self.geometry,
-                    self.doc,
-                    self.column_styles,
-                    self.used_page_names.as_ref(),
+                    Flow {
+                        doc: self.doc,
+                        column_styles: self.column_styles,
+                        used_page_names: self.used_page_names.as_ref(),
+                    },
                     child_id,
                     child_w,
                     child_x_in_body,
@@ -2650,12 +2652,19 @@ fn repeating_table_header(
     })
 }
 
+/// What every walk of the fragmenter reads: the laid-out document and the
+/// side tables of its break properties and used page names.
+#[derive(Clone, Copy)]
+struct Flow<'a> {
+    doc: &'a BaseDocument,
+    column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
+    used_page_names: Option<&'a crate::blitz_adapter::UsedPageNameTable>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree(
     geometry: &mut PaginationGeometryTable,
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    flow: Flow<'_>,
     parent_id: usize,
     parent_w: f32,
     parent_x_in_body: f32,
@@ -2668,15 +2677,18 @@ fn fragment_block_subtree(
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
+    let Flow {
+        doc,
+        column_styles,
+        used_page_names,
+    } = flow;
     if depth < crate::MAX_DOM_DEPTH
         && let Some(header) = repeating_table_header(doc, parent_id, depth + 1, column_styles)
         && header_band_is_repeatable(doc, &header, column_styles, used_page_names, depth + 1)
     {
         return fragment_repeating_table(
             geometry,
-            doc,
-            column_styles,
-            used_page_names,
+            flow,
             &header,
             parent_w,
             parent_x_in_body,
@@ -2693,9 +2705,7 @@ fn fragment_block_subtree(
     if let Some(content_top) = table_cell_content_top(doc, parent_id) {
         return fragment_table_cell(
             geometry,
-            doc,
-            column_styles,
-            used_page_names,
+            flow,
             parent_id,
             parent_w,
             parent_x_in_body,
@@ -2712,9 +2722,7 @@ fn fragment_block_subtree(
     }
     fragment_block_subtree_inner(
         geometry,
-        doc,
-        column_styles,
-        used_page_names,
+        flow,
         parent_id,
         parent_w,
         parent_x_in_body,
@@ -2761,9 +2769,7 @@ fn table_cell_content_top(doc: &BaseDocument, node_id: usize) -> Option<f32> {
 #[allow(clippy::too_many_arguments)]
 fn fragment_table_cell(
     geometry: &mut PaginationGeometryTable,
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    flow: Flow<'_>,
     cell_id: usize,
     cell_w: f32,
     cell_x_in_body: f32,
@@ -2780,9 +2786,7 @@ fn fragment_table_cell(
     let mut cell_geometry = PaginationGeometryTable::new();
     let (page, cursor) = fragment_block_subtree_inner(
         &mut cell_geometry,
-        doc,
-        column_styles,
-        used_page_names,
+        flow,
         cell_id,
         cell_w,
         cell_x_in_body,
@@ -2803,7 +2807,7 @@ fn fragment_table_cell(
     // too: its last fragment, and the row, end below its bottom padding and
     // border, sliced at the page foot.
     let end = if page > page_in {
-        let layout = doc.get_node(cell_id).map(|node| node.final_layout);
+        let layout = flow.doc.get_node(cell_id).map(|node| node.final_layout);
         let bottom_edge = layout.map_or(0.0, |l| l.padding.bottom + l.border.bottom);
         (cursor + content_top + bottom_edge).min(page_height_px.max(cursor + content_top))
     } else {
@@ -2970,9 +2974,7 @@ fn append_repeated_header_fragments(
 #[allow(clippy::too_many_arguments)]
 fn fragment_repeating_table(
     geometry: &mut PaginationGeometryTable,
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    flow: Flow<'_>,
     header: &RepeatingTableHeader,
     parent_w: f32,
     parent_x_in_body: f32,
@@ -2985,6 +2987,9 @@ fn fragment_repeating_table(
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
     if header.band_height_px >= page_height_px {
         log::warn!(
             "repeating table header band ({:.2}px) is not smaller than the page ({page_height_px:.2}px); using whole-table fallback",
@@ -2992,9 +2997,7 @@ fn fragment_repeating_table(
         );
         return fragment_block_subtree_inner(
             geometry,
-            doc,
-            column_styles,
-            used_page_names,
+            flow,
             header.table_id,
             parent_w,
             parent_x_in_body,
@@ -3093,9 +3096,7 @@ fn fragment_repeating_table(
     *page_has_content &= first_page == page_in;
     let (body_end_page, body_end_cursor) = fragment_block_subtree_inner(
         &mut body_geometry,
-        doc,
-        column_styles,
-        used_page_names,
+        flow,
         header.table_id,
         parent_w,
         parent_x_in_body,
@@ -3272,9 +3273,7 @@ fn fragment_repeating_table(
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree_inner(
     geometry: &mut PaginationGeometryTable,
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    flow: Flow<'_>,
     parent_id: usize,
     parent_w: f32,
     parent_x_in_body: f32,
@@ -3290,6 +3289,11 @@ fn fragment_block_subtree_inner(
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
+    let Flow {
+        doc,
+        column_styles,
+        used_page_names,
+    } = flow;
     // The parent's fragment on each page starts at the cursor's
     // `page_start_y`: the walk closes one and starts the next each time it
     // crosses a page boundary. fulgur-kv0r: `page_taffy_origin` is the
@@ -4018,9 +4022,7 @@ fn fragment_block_subtree_inner(
             let mut child_lift = 0.0;
             let (np, nc) = fragment_block_subtree(
                 geometry,
-                doc,
-                column_styles,
-                used_page_names,
+                flow,
                 child_id,
                 child_w,
                 child_x_in_body,
@@ -6488,9 +6490,11 @@ mod tests {
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
         let (page_out, cursor_out) = fragment_block_subtree(
             &mut geom,
-            &doc, // &BaseDocument via deref coercion
-            None, // column_styles
-            None, // used_page_names
+            Flow {
+                doc: &doc,
+                column_styles: None,
+                used_page_names: None,
+            },
             parent_id,
             600.0,                // parent_w
             0.0,                  // parent_x_in_body
@@ -6564,9 +6568,11 @@ mod tests {
 
         let (page_out, cursor_out) = fragment_block_subtree(
             &mut geometry,
-            &doc,
-            None,
-            None,
+            Flow {
+                doc: &doc,
+                column_styles: None,
+                used_page_names: None,
+            },
             table_id,
             200.0,
             0.0,
