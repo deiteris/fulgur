@@ -2381,6 +2381,25 @@ fn fragment_block_subtree(
             lifted,
         );
     }
+    if let Some(content_top) = table_cell_content_top(doc, parent_id) {
+        return fragment_table_cell(
+            geometry,
+            doc,
+            column_styles,
+            used_page_names,
+            parent_id,
+            parent_w,
+            parent_x_in_body,
+            page_in,
+            cursor_in,
+            page_height_px,
+            depth,
+            initial_page_occupied,
+            remaining_repeat_budget,
+            lifted,
+            content_top,
+        );
+    }
     fragment_block_subtree_inner(
         geometry,
         doc,
@@ -2400,6 +2419,91 @@ fn fragment_block_subtree(
         remaining_repeat_budget,
         lifted,
     )
+}
+
+/// The offset of a table cell's content box from its border box top (its
+/// top border and padding), or `None` for a node that is not a table cell
+/// or has neither.
+fn table_cell_content_top(doc: &BaseDocument, node_id: usize) -> Option<f32> {
+    let node = doc.get_node(node_id)?;
+    let is_cell = node
+        .primary_styles()
+        .is_some_and(|s| s.clone_display().inside() == DisplayInside::TableCell);
+    let layout = node.final_layout;
+    let top = layout.border.top + layout.padding.top;
+    (is_cell && top > 0.0).then_some(top)
+}
+
+/// Fragment a table cell whose content starts `content_top` below its top
+/// edge, keeping that top border and padding on each page the cell
+/// continues on, as `box-decoration-break: clone` would and as print
+/// tables commonly do: the borders of every fragment of a split cell are
+/// painted already, and without the repeat its continued content sat
+/// against its top edge, or against a repeated header.
+///
+/// The cell is fragmented on a strip `content_top` shorter, whose top is
+/// `content_top` below each page's top, so its content restarts that far
+/// down on every continued page and the edge takes room from the page.
+/// Its first page is unchanged: the strip ends at the page foot, and the
+/// content starts where it did. On every later page the cell's own
+/// fragment starts at the page top and holds the edge.
+#[allow(clippy::too_many_arguments)]
+fn fragment_table_cell(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    cell_id: usize,
+    cell_w: f32,
+    cell_x_in_body: f32,
+    page_in: u32,
+    cursor_in: f32,
+    page_height_px: f32,
+    depth: usize,
+    initial_page_occupied: bool,
+    remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
+    content_top: f32,
+) -> (u32, f32) {
+    let mut cell_geometry = PaginationGeometryTable::new();
+    let (page, cursor) = fragment_block_subtree_inner(
+        &mut cell_geometry,
+        doc,
+        column_styles,
+        used_page_names,
+        cell_id,
+        cell_w,
+        cell_x_in_body,
+        page_in,
+        cursor_in - content_top,
+        page_height_px - content_top,
+        depth,
+        None,
+        0.0,
+        false,
+        initial_page_occupied,
+        remaining_repeat_budget,
+        lifted,
+    );
+    for (node_id, mut source) in cell_geometry {
+        for fragment in &mut source.fragments {
+            if node_id == cell_id && fragment.page_index > page_in {
+                fragment.height = (fragment.height.to_f32() + content_top).as_px();
+            } else {
+                fragment.y = (fragment.y.to_f32() + content_top).as_px();
+            }
+        }
+        let target = geometry.entry(node_id).or_default();
+        if target.fragments.is_empty() {
+            target.line_boundaries = source.line_boundaries;
+        } else {
+            target.line_boundaries.clear();
+        }
+        target.fragments.extend(source.fragments);
+        target.is_repeat |= source.is_repeat;
+        target.lift_px += source.lift_px;
+    }
+    (page, cursor + content_top)
 }
 
 fn fragmented_descendant_page_extent(
@@ -7089,6 +7193,66 @@ mod tests {
         assert!(left.len() > 1);
         assert_eq!(right[0].page_index, left[0].page_index);
         assert!((right[0].y.to_f32() - left[0].y.to_f32()).abs() < 0.5);
+    }
+
+    /// A one-cell table, its cell padded 10 px above and below and holding
+    /// ten 20 px blocks `d1` to `d10`, under `head`, laid out on 100 px pages.
+    fn padded_cell_pass(head: &str) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let blocks = (1..=10)
+            .map(|n| format!(r#"<div id="d{n}">{n}</div>"#))
+            .collect::<String>();
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              th {{ box-sizing: border-box; height: 20px; padding: 0; }}
+              td {{ padding: 10px 0; }}
+              td > div {{ height: 20px; }}
+            </style></head><body>
+              <table>{head}<tbody><tr><td id="cell">{blocks}</td></tr></tbody></table>
+            </body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let geometry = run_pass(&mut doc, 100.0);
+        (doc, geometry)
+    }
+
+    /// A cell split by a page break keeps its top padding on each page it
+    /// continues on, as `box-decoration-break: clone` would: its content
+    /// restarts below the padding, and the padding takes room from the
+    /// page. The cell's fragment there starts at the page top, so its
+    /// background covers the padding. Four blocks fit each page below the
+    /// padding: `d5` and `d9` open pages 1 and 2 at y 10 (at 0 without the
+    /// repeat, five blocks a page).
+    #[test]
+    fn a_continued_table_cell_repeats_its_top_padding() {
+        let (doc, geometry) = padded_cell_pass("");
+
+        assert_eq!(placements(&doc, &geometry, "d4"), [(0, 70.0)]);
+        assert_eq!(placements(&doc, &geometry, "d5"), [(1, 10.0)]);
+        assert_eq!(placements(&doc, &geometry, "d8"), [(1, 70.0)]);
+        assert_eq!(placements(&doc, &geometry, "d9"), [(2, 10.0)]);
+        assert_eq!(placements(&doc, &geometry, "d10"), [(2, 30.0)]);
+        assert_eq!(
+            placements(&doc, &geometry, "cell"),
+            [(0, 0.0), (1, 0.0), (2, 0.0)],
+            "each fragment of the cell starts at its page top"
+        );
+    }
+
+    /// Under a repeated header a continued cell starts at the header's
+    /// bottom and its content one padding lower.
+    #[test]
+    fn a_continued_table_cell_repeats_its_top_padding_below_a_repeated_header() {
+        let (doc, geometry) = padded_cell_pass(r#"<thead><tr><th id="h">H</th></tr></thead>"#);
+
+        assert_eq!(placements(&doc, &geometry, "d3"), [(0, 70.0)]);
+        assert_eq!(placements(&doc, &geometry, "d4"), [(1, 30.0)]);
+        assert_eq!(
+            placements(&doc, &geometry, "cell")[..2],
+            [(0, 20.0), (1, 20.0)]
+        );
     }
 
     #[test]
