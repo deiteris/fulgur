@@ -3933,14 +3933,16 @@ fn fragment_block_subtree_inner(
     (cursor.page_index, cursor.cursor_y)
 }
 
-/// fulgur-p55h: read per-line `(min_coord, max_coord)` pairs from a
-/// node's Parley `inline_layout_data`, if any.
-///
-/// `min_coord` is the line's top-most Y in the paragraph's local
-/// coordinate system; `max_coord` is its bottom-most Y. Both are in
-/// CSS pixels and accumulate top-to-bottom across the line vector.
-/// Returns an empty vec for non-inline-root nodes (block / text /
-/// element with no inline children) so callers can branch on
+/// fulgur-p55h: the `(top, bottom)` of each line box of a node's Parley
+/// `inline_layout_data`, if any, in the paragraph's local coordinates, in
+/// CSS pixels: each line `line_height` tall, from the bottom of the line
+/// before it, the boxes Parley stacks to the layout's height and the
+/// renderer slices a split paragraph by. Parley's `min_coord` and
+/// `max_coord` are the selection box, which clamps a negative half-leading
+/// to zero: with a `line-height` below the font's ascent and descent, each
+/// line measured more than its line height, and a split paragraph ran past
+/// its layout box. Returns an empty vec for non-inline-root nodes (block /
+/// text / element with no inline children) so callers can branch on
 /// `metrics.len() > 1` to decide between line-aware and block paths.
 fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
     let Some(elem) = node.element_data() else {
@@ -3949,12 +3951,14 @@ fn collect_inline_line_metrics(node: &blitz_dom::Node) -> Vec<(f32, f32)> {
     let Some(text_layout) = elem.inline_layout_data.as_deref() else {
         return Vec::new();
     };
+    let mut bottom = 0.0_f32;
     text_layout
         .layout
         .lines()
         .map(|line| {
-            let m = line.metrics();
-            (m.min_coord, m.max_coord)
+            let top = bottom;
+            bottom = top + line.metrics().line_height;
+            (top, bottom)
         })
         .collect()
 }
@@ -6354,10 +6358,10 @@ mod tests {
             </body></html>
         "#;
         let mut doc = parse(html, 600.0);
-        let table = run_pass(&mut doc, 60.0);
+        let table = run_pass(&mut doc, 50.0);
         let p = &table[&find_by_id(&doc, "p").expect("paragraph")].fragments;
         let im = &table[&find_by_id(&doc, "im").expect("image")].fragments;
-        // Two 21px lines fit a 60px page, so the 5-line paragraph takes
+        // Two 20px lines fit a 50px page, so the 5-line paragraph takes
         // three fragments: 2, 2, and a 1-line tail (widows relaxed at the
         // top of a page, where the minimums cannot be met).
         assert_eq!(p.len(), 3, "the paragraph splits: {p:?}");
@@ -12321,6 +12325,37 @@ h2 { string-set: chapter-title content(text); }
                 "{container}: {outer:?}"
             );
         }
+    }
+
+    /// A paragraph split between pages measures its lines by their line
+    /// boxes, each `line-height` tall, as its layout box holds them: six
+    /// 16 px lines in 16 px Noto Sans, whose ascent and descent take more
+    /// than 16 px, split three and three on 50 px pages, 48 px a page. The
+    /// shaper's selection box clamps the negative half-leading to zero, so
+    /// each line measured its ascent and descent, and the split paragraph
+    /// ran past its box.
+    #[test]
+    fn a_split_paragraph_measures_its_lines_from_the_line_box() {
+        let html = r#"<!doctype html><html><head><style>
+              html, body { margin: 0; padding: 0; font-family: 'Noto Sans'; }
+              p { margin: 0; font-size: 16px; line-height: 16px; orphans: 1; widows: 1; }
+            </style></head><body><p id="p">1<br>2<br>3<br>4<br>5<br>6</p><div id="after" style="height: 2px"></div></body></html>"#;
+        let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
+        let (mut doc, _, _) =
+            blitz_adapter::parse_html_with_local_resources(html, 200.0, 10000, &fonts, false, None);
+        blitz_adapter::resolve(&mut doc);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 50.0_f32.as_px(), &styles);
+        let p = find_by_id(&doc, "p").expect("p");
+        let fragments: Vec<(u32, f32, f32)> = geometry[&p]
+            .fragments
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+            .collect();
+        assert_eq!(fragments, [(0, 0.0, 48.0), (1, 0.0, 48.0)]);
+        assert_eq!(geometry[&p].line_boundaries, [0, 3, 6]);
+        assert_eq!(placements(&doc, &geometry, "after"), [(1, 48.0)]);
     }
 
     /// A gap between a box's content edge and its first child's margin edge

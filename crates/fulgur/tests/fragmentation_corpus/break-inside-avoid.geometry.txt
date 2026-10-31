@@ -15,5 +15,5 @@ html[1]/body[1]/div#huge[11] page=3 x=0.00 y=0.00 w=200.00 h=120.00
 html[1]/body[1]/div#huge[11] page=4 x=0.00 y=0.00 w=200.00 h=120.00
 html[1]/body[1]/div#huge[11]/div[0] page=3 x=0.00 y=0.00 w=200.00 h=120.00
 html[1]/body[1]/div#huge[11]/div[1] page=4 x=0.00 y=0.00 w=200.00 h=120.00
-html[1]/body[1]/p#tall-p[13] page=4 x=0.00 y=120.00 w=200.00 h=62.00 lines=0,3,12
-html[1]/body[1]/p#tall-p[13] page=5 x=0.00 y=0.00 w=200.00 h=182.00 lines=0,3,12
+html[1]/body[1]/p#tall-p[13] page=4 x=0.00 y=120.00 w=200.00 h=80.00 lines=0,4,12
+html[1]/body[1]/p#tall-p[13] page=5 x=0.00 y=0.00 w=200.00 h=160.00 lines=0,4,12
