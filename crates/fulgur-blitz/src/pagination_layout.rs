@@ -1920,37 +1920,18 @@ fn kept_table_row_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    fn displays(node: &blitz_dom::Node, inside: DisplayInside) -> bool {
-        node.primary_styles()
-            .is_some_and(|s| s.clone_display().inside() == inside)
-    }
-    fn cells<'a>(
-        doc: &'a BaseDocument,
-        row: &'a blitz_dom::Node,
-    ) -> impl Iterator<Item = &'a blitz_dom::Node> {
-        row.children
-            .iter()
-            .filter_map(|&id| doc.get_node(id))
-            .filter(|node| displays(node, DisplayInside::TableCell))
-    }
     if !displays(row, DisplayInside::TableRow) {
         return None;
     }
     // Only a cell with `rowspan` may span rows; whether it does is read from
     // the layout below, as Blitz ends a span with its row group.
-    let may_span = |node: &blitz_dom::Node| {
-        node.element_data()
-            .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
-            .and_then(|value| value.parse::<u16>().ok())
-            .is_some_and(|rowspan| rowspan > 1)
-    };
-    if !avoid && !cells(doc, row).any(may_span) {
+    if !avoid && !row_cells(doc, row).any(may_span_rows) {
         return None;
     }
     // The extent of a row's cells: every cell starts at its row's top, and a
     // cell spanning rows ends below the row.
     let extent = |row: &blitz_dom::Node| {
-        cells(doc, row)
+        row_cells(doc, row)
             .map(|node| {
                 let layout = node.final_layout;
                 (layout.location.y, layout.location.y + layout.size.height)
@@ -2068,38 +2049,18 @@ fn is_walked_block_container(node: &blitz_dom::Node) -> bool {
 }
 
 /// Whether no cell of the table row that `cell` belongs to can place any
-/// content in `room` px: each cell's first content ([`leading_content_bottom`])
-/// ends below it. `false` for a node that is not a cell of a row.
+/// content in `room` px ([`row_places_content_in`]), in a row group with no
+/// cell spanning rows, whose rows [`kept_table_row_bottom`] ties together.
+/// `false` for a node that is not a cell of a row.
 fn row_places_nothing_in(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     cell: &blitz_dom::Node,
     room: f32,
+    page_height_px: f32,
 ) -> bool {
-    let displays = |node: &blitz_dom::Node, inside: DisplayInside| {
-        node.primary_styles()
-            .is_some_and(|s| s.clone_display().inside() == inside)
-    };
     let Some(row) = cell.parent.and_then(|id| doc.get_node(id)) else {
         return false;
-    };
-    if !displays(cell, DisplayInside::TableCell) || !displays(row, DisplayInside::TableRow) {
-        return false;
-    }
-    let cells = |row: &blitz_dom::Node| {
-        row.children
-            .iter()
-            .filter_map(|&id| doc.get_node(id))
-            .filter(|node| displays(node, DisplayInside::TableCell))
-            .collect::<Vec<_>>()
-    };
-    // A cell spanning rows ties its rows together, which
-    // [`kept_table_row_bottom`] decides: leave its row group alone.
-    let spans = |node: &blitz_dom::Node| {
-        node.element_data()
-            .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
-            .and_then(|value| value.parse::<u16>().ok())
-            .is_some_and(|rowspan| rowspan > 1)
     };
     let group_spans = row
         .parent
@@ -2109,29 +2070,76 @@ fn row_places_nothing_in(
                 .children
                 .iter()
                 .filter_map(|&id| doc.get_node(id))
-                .filter(|node| displays(node, DisplayInside::TableRow))
-                .any(|row| cells(row).into_iter().any(spans))
+                .filter(|&node| displays(node, DisplayInside::TableRow))
+                .any(|row| row_cells(doc, row).any(may_span_rows))
         });
-    !group_spans
-        && cells(row)
-            .into_iter()
-            .all(|node| leading_content_bottom(doc, column_styles, node, 0) > room)
+    displays(cell, DisplayInside::TableCell)
+        && displays(row, DisplayInside::TableRow)
+        && !group_spans
+        && !row_places_content_in(doc, column_styles, row, room, page_height_px)
 }
 
-/// The bottom, from `node`'s top, of the first content the fragmenter can
-/// leave on a page when it splits `node`: the first lines its `orphans` and
-/// `widows` let it leave when it is an inline root of several (all of them
-/// when they let it split nowhere), else, through its first in-flow child, that
-/// child's own first content, else its whole box (a child kept whole by
-/// `break-inside: avoid`, a single line, an empty box). Padding and gaps
-/// above that content count.
-fn leading_content_bottom(
+/// Whether `node`'s display has the inner type `inside`.
+fn displays(node: &blitz_dom::Node, inside: DisplayInside) -> bool {
+    node.primary_styles()
+        .is_some_and(|s| s.clone_display().inside() == inside)
+}
+
+/// Whether `cell` has a `rowspan` above 1: only such a cell may span rows,
+/// and whether it does is read from the layout, as Blitz ends a span with
+/// its row group.
+fn may_span_rows(cell: &blitz_dom::Node) -> bool {
+    cell.element_data()
+        .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_some_and(|rowspan| rowspan > 1)
+}
+
+/// The table cells of `row`.
+fn row_cells<'a>(
+    doc: &'a BaseDocument,
+    row: &'a blitz_dom::Node,
+) -> impl Iterator<Item = &'a blitz_dom::Node> {
+    row.children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|&node| displays(node, DisplayInside::TableCell))
+}
+
+/// Whether some cell of `row` places content in `room` px from the row's
+/// top ([`places_content_in`]).
+fn row_places_content_in(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    row: &blitz_dom::Node,
+    room: f32,
+    page_height_px: f32,
+) -> bool {
+    row_cells(doc, row)
+        .any(|cell| places_content_in(doc, column_styles, cell, room, page_height_px, 0))
+}
+
+/// Whether the fragmenter places any of `node`'s content in `room` px from
+/// its top, on pages `page_height_px` tall: the whole box when it fits;
+/// else, for an inline root of several lines, the first lines its
+/// `orphans` and `widows` let it leave ([`moves_whole_at_foot`]); else, for
+/// a block whose children would split there ([`would_split_block_subtree`]),
+/// its first in-flow child's own content below the padding and gap above
+/// it. A box kept whole by `break-inside: avoid` that fits a page, a single
+/// line, an empty box, and a block whose children all fit while it does not
+/// (its own height) move whole and place nothing.
+fn places_content_in(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     node: &blitz_dom::Node,
+    room: f32,
+    page_height_px: f32,
     depth: usize,
-) -> f32 {
+) -> bool {
     let height = node.final_layout.size.height;
+    if height <= room {
+        return true;
+    }
     let kept = column_styles
         .and_then(|styles| styles.get(&node.id))
         .is_some_and(|props| {
@@ -2140,21 +2148,16 @@ fn leading_content_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    if kept || depth >= crate::MAX_DOM_DEPTH {
-        return height;
+    if (kept && height <= page_height_px + 1.0) || depth >= crate::MAX_DOM_DEPTH || room <= 0.0 {
+        return false;
     }
     let lines = collect_inline_line_metrics(node);
     if lines.len() > 1 {
-        // The fewest lines a first fragment can hold ([`split_point`]), or
-        // all of them when its `orphans` and `widows` let it split nowhere.
         let limits = line_limits(doc, column_styles, node.id);
-        let first = (1..lines.len())
-            .find(|&fit| split_point(fit, 0, lines.len(), limits).is_some())
-            .unwrap_or(lines.len());
-        return lines[first - 1].1 - lines[0].0;
+        return !moves_whole_at_foot(&lines, 0.0, room, limits);
     }
-    if !lines.is_empty() {
-        return height;
+    if !lines.is_empty() || !would_split_block_subtree(doc, node.id, room, page_height_px, 0) {
+        return false;
     }
     let children = node
         .layout_children
@@ -2170,9 +2173,15 @@ fn leading_content_bottom(
                 && !crate::blitz_adapter::is_out_of_flow_node(child)
                 && child.final_layout.size.height > 0.0
         })
-        .map_or(height, |child| {
-            child.final_layout.location.y
-                + leading_content_bottom(doc, column_styles, child, depth + 1)
+        .is_some_and(|child| {
+            places_content_in(
+                doc,
+                column_styles,
+                child,
+                room - child.final_layout.location.y,
+                page_height_px,
+                depth + 1,
+            )
         })
 }
 
@@ -2212,10 +2221,6 @@ struct RepeatingTableHeader {
     /// of the skipped rows to the top of the first row that prints there (or
     /// of the body, when every header row skips). Zero when no row skips.
     first_page_lift_px: f32,
-    /// Smallest leading fragmentable unit of the first body row. The band
-    /// alone fitting is not enough to start the table on a page — if not even
-    /// this clears the band, the page carries only a repeated header.
-    first_body_lead_px: f32,
 }
 
 fn collect_repeating_table_cells(
@@ -2390,56 +2395,6 @@ fn repeating_table_header(
         0.0
     };
 
-    // Cells sharing the body's top edge form the first body row. What has to
-    // clear the band is not the whole row but its smallest leading
-    // fragmentable unit — a cell whose content splits can put its first block
-    // on this page and carry the rest over, which is useful output rather than
-    // an orphaned header. Take each first-row cell's leading child (its own
-    // box when it has no children) and keep the smallest: if even that does
-    // not fit, no body content can land here.
-    let first_body_lead_px = body_cell_ids
-        .iter()
-        .filter_map(|&id| doc.get_node(id))
-        .filter(|cell| (cell.final_layout.location.y - body_origin_px).abs() < 0.5)
-        .map(|cell| {
-            // Count real boxes, not raw children. Blitz keeps whitespace-only
-            // text nodes between formatted elements, so indented markup gives
-            // `[ws, div, ws, div, ws]` — testing `children.len()` there passes
-            // the multi-child branch and then measures the leading whitespace
-            // node at height 0, which silently defeated the orphan check on
-            // any normally-formatted document.
-            let boxes: Vec<_> = cell
-                .children
-                .iter()
-                .filter_map(|&child| doc.get_node(child))
-                .filter(|child| {
-                    // Same filters the body fragmenter applies: whitespace
-                    // formatting nodes carry no content, and out-of-flow boxes
-                    // do not hold the row open, so neither can be the leading
-                    // unit that has to fit under the band.
-                    !crate::blitz_adapter::is_whitespace_only_text_node(child)
-                        && !crate::blitz_adapter::is_out_of_flow_node(child)
-                        && child.final_layout.size.height > 0.0
-                })
-                .collect();
-
-            // Only a cell with several boxes has a leading unit smaller than
-            // itself: the first can stay on this page while the rest move on.
-            // A cell holding one box — or bare text, which Blitz wraps in a
-            // single anonymous box — places all or nothing, and its height is
-            // usually set on the cell anyway (fulgur-naj7.6: a text-only
-            // `td { height: 30px }` otherwise measured one ~16px line).
-            let Some(lead) = boxes.first().filter(|_| boxes.len() >= 2) else {
-                return cell.final_layout.size.height;
-            };
-
-            // The leading unit's *bottom*, not its height: padding-top and any
-            // gap above it also have to fit before the row places content.
-            lead.final_layout.location.y + lead.final_layout.size.height
-        })
-        .reduce(f32::min)
-        .unwrap_or(0.0);
-
     Some(RepeatingTableHeader {
         table_id,
         header_cell_ids,
@@ -2448,7 +2403,6 @@ fn repeating_table_header(
         band_height_px,
         first_page_cell_ids,
         first_page_lift_px,
-        first_body_lead_px,
     })
 }
 
@@ -2813,37 +2767,40 @@ fn fragment_repeating_table(
     // both rows on page 1). An orphaned header row is never useful output, and
     // css-tables-3 likewise bounds repetition to cases where it does not eat
     // the page.
-    // A first body row kept whole (`break-inside: avoid`) has no smaller
-    // leading unit: the whole row has to clear the band.
-    let first_body_lead_px = header
+    // Whether the first body row places content in `room` px below the
+    // band, as the walk below and its row move measure it
+    // ([`row_places_content_in`]). A first body row kept whole
+    // (`break-inside: avoid`, or tied to rows by a spanning cell) has no
+    // smaller leading unit: the whole row has to clear the band.
+    let body_page_height = page_height_px - header.band_height_px;
+    let first_body_cell = header
         .body_cell_ids
         .first()
-        .and_then(|&id| doc.get_node(id))
-        .and_then(|cell| {
-            kept_table_row_bottom(
-                doc,
-                column_styles,
-                cell,
-                page_height_px - header.band_height_px,
-            )
-        })
-        .map_or(header.first_body_lead_px, |bottom| {
-            header
-                .first_body_lead_px
-                .max(bottom - header.body_origin_px)
-        });
+        .and_then(|&id| doc.get_node(id));
+    let first_row_places = |room: f32| {
+        let Some(cell) = first_body_cell else {
+            return true;
+        };
+        if let Some(bottom) = kept_table_row_bottom(doc, column_styles, cell, body_page_height) {
+            return bottom - header.body_origin_px <= room;
+        }
+        cell.parent
+            .and_then(|id| doc.get_node(id))
+            .is_none_or(|row| {
+                row_places_content_in(doc, column_styles, row, room, body_page_height)
+            })
+    };
     // The band the table's first page carries, without the rows that skip it.
     let lift = header.first_page_lift_px;
     let first_band = header.band_height_px - lift;
-    let first_row_reserve = first_band + first_body_lead_px;
     let band_overflows = cursor_in + first_band > page_height_px;
     // The band fits but its first body row does not: starting here would emit
     // a header with nothing under it. Only worth moving if the pair actually
     // fits on an empty page — an oversized first row has to start somewhere,
     // and pushing it would just leave a blank page behind.
     let orphaned_header = !band_overflows
-        && cursor_in + first_row_reserve > page_height_px
-        && first_row_reserve <= page_height_px;
+        && !first_row_places(page_height_px - cursor_in - first_band)
+        && first_row_places(page_height_px - first_band);
     let (first_page, first_table_top) = if band_overflows || orphaned_header {
         (page_in + 1, 0.0)
     } else {
@@ -2877,7 +2834,6 @@ fn fragment_repeating_table(
         );
     }
 
-    let body_page_height = page_height_px - header.band_height_px;
     let mut body_geometry = PaginationGeometryTable::new();
     let (body_end_page, body_end_cursor) = fragment_block_subtree_inner(
         &mut body_geometry,
@@ -3492,7 +3448,13 @@ fn fragment_block_subtree_inner(
         // of the table behind.
         if kept_row_bottom.is_none()
             && child_page_y > 0.0
-            && row_places_nothing_in(doc, column_styles, child, page_height_px - child_page_y)
+            && row_places_nothing_in(
+                doc,
+                column_styles,
+                child,
+                page_height_px - child_page_y,
+                page_height_px,
+            )
         {
             let should_emit = cursor_y > page_start_y
                 && row_state
@@ -7552,6 +7514,32 @@ mod tests {
         assert_eq!(placements(&doc, &geometry, "wrap"), [(1, 10.0)]);
         assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0)]);
         assert_eq!(placements(&doc, &geometry, "cell"), [(0, 0.0), (1, 0.0)]);
+    }
+
+    /// A table whose first body row places nothing under its header in the
+    /// rest of the page starts on the next page, header and all, as the row
+    /// would move there whole: the check reads the row's first content as
+    /// the row move does, here the 10 px padding and two lines, the
+    /// paragraph's `orphans`, of a 15-line paragraph, 50 px against the
+    /// 30 px left under a 20 px header at y 150. Measuring the one-box cell
+    /// whole (320 px, more than a page) started the table and left the
+    /// header alone at the foot.
+    #[test]
+    fn a_header_whose_first_row_places_nothing_moves_with_it() {
+        let lines = (1..=15)
+            .map(|n| format!("L{n}"))
+            .collect::<Vec<_>>()
+            .join("<br>");
+        let body = format!(
+            r#"<div style="height: 150px"></div><table><thead><tr><th id="h">H</th></tr></thead>
+            <tbody><tr><td style="padding: 10px 0; height: auto">
+            <p id="p" style="margin: 0; line-height: 20px; orphans: 2">{lines}</p>
+            </td></tr></tbody></table>"#
+        );
+        let (doc, geometry) = header_pass(&body, 200.0);
+
+        assert_eq!(placements(&doc, &geometry, "h")[0], (1, 0.0));
+        assert_eq!(placements(&doc, &geometry, "p")[0], (1, 30.0));
     }
 
     #[test]
