@@ -679,7 +679,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 ) || zero_page_name_changed;
                 if zero_force_break && cursor.cursor_y > 0.0 {
                     cursor.break_to(self.doc, zero_break_props.break_before_side);
-                } else if cursor.page_index > 0 && cursor.cursor_y <= 0.0 {
+                } else if cursor.page_index > 0 && cursor.at_page_top() {
                     cursor.move_to_side(self.doc, zero_break_props.break_before_side);
                 }
                 if child.element_data().is_some() {
@@ -760,10 +760,9 @@ impl<'a> PaginationLayoutTree<'a> {
                 if explicit_break_before && page_filling_break_child {
                     cursor.cursor_y = gap;
                 }
-            } else if cursor.page_index > 0 && cursor.cursor_y <= 0.0 {
+            } else if cursor.page_index > 0 && cursor.at_page_top() {
                 // Nothing is placed on this page yet (a `break-after`
-                // moved here, and no margin gap was added above): a side
-                // break only moves on to its side.
+                // moved here): a side break only moves on to its side.
                 cursor.move_to_side(self.doc, break_props.break_before_side);
             }
 
@@ -798,7 +797,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 // the "split before the child" fallback (CSS
                 // Fragmentation §4.2, class A break point).
                 let limits = line_limits(self.doc, self.column_styles, child_id);
-                if cursor.cursor_y > 0.0
+                if !cursor.at_page_top()
                     && moves_whole_at_foot(
                         &line_metrics,
                         cursor.cursor_y,
@@ -979,6 +978,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.page_height_px,
                     0,
                     false,
+                    &mut cursor.page_has_content,
                     &mut remaining_repeat_budget,
                     &mut lifted,
                 );
@@ -1070,6 +1070,7 @@ impl<'a> PaginationLayoutTree<'a> {
                         width: child_w.as_px(),
                         height: first_slice_h.as_px(),
                     });
+                cursor.place(first_slice_h);
                 record_subtree_descendants(
                     &mut self.geometry,
                     self.doc,
@@ -1148,6 +1149,7 @@ impl<'a> PaginationLayoutTree<'a> {
                                 width: child_w.as_px(),
                                 height: last_slice_h.as_px(),
                             });
+                        cursor.place(last_slice_h);
                         remaining -= last_slice_h;
                     }
                     if remaining > 0.0 {
@@ -1215,6 +1217,7 @@ impl<'a> PaginationLayoutTree<'a> {
             );
 
             cursor.cursor_y += child_h;
+            cursor.place(child_h);
             emitted += 1;
             prev_bottom_y_in_body = this_top_in_body + child_h;
             if !is_float {
@@ -1858,6 +1861,8 @@ struct RowState {
     started_on_occupied_strip: bool,
     max_end_page: u32,
     max_end_cursor_y: f32,
+    /// A cell placed content on `max_end_page`.
+    max_end_has_content: bool,
     /// Taffy `location.y` of the first cell in this row (reserved for future use).
     _row_top: f32,
     /// Max `location.y + height` seen across cells in this row.
@@ -1870,13 +1875,16 @@ struct RowState {
 }
 
 impl RowState {
-    /// Records where a cell of the row ended, when it is past every other.
+    /// Records where a cell of the row ended, when it is past every other,
+    /// and whether the row placed content on its last page.
     fn reach(&mut self, cursor: &PageCursor) {
-        if cursor.page_index > self.max_end_page
-            || (cursor.page_index == self.max_end_page && cursor.cursor_y > self.max_end_cursor_y)
-        {
+        if cursor.page_index > self.max_end_page {
             self.max_end_page = cursor.page_index;
             self.max_end_cursor_y = cursor.cursor_y;
+            self.max_end_has_content = cursor.page_has_content;
+        } else if cursor.page_index == self.max_end_page {
+            self.max_end_cursor_y = self.max_end_cursor_y.max(cursor.cursor_y);
+            self.max_end_has_content |= cursor.page_has_content;
         }
     }
 }
@@ -1914,6 +1922,7 @@ struct PageMark {
     page_start_y: f32,
     page_taffy_origin: f32,
     entered_below_content: bool,
+    page_has_content: bool,
 }
 
 /// A walker's place in the page sequence: the page it fills, the lowest
@@ -1933,8 +1942,12 @@ struct PageCursor {
     page_taffy_origin: f32,
     /// The walk entered on a page holding content above it, and has not
     /// placed its first child yet (the first row's cells, side by side,
-    /// each start so).
+    /// each start so): the parent's fragment on a page a child crosses is
+    /// then measured from what its children placed there.
     entered_below_content: bool,
+    /// An in-flow box with height is placed on this page, at any depth:
+    /// the page is no longer empty ([`Self::at_page_top`]).
+    page_has_content: bool,
     /// The height of the page strip the walk fills.
     page_height_px: f32,
     parent: Option<ParentSink>,
@@ -1949,9 +1962,28 @@ impl PageCursor {
             page_start_y: cursor_y,
             page_taffy_origin: 0.0,
             entered_below_content: false,
+            page_has_content: false,
             page_height_px,
             parent: None,
         }
+    }
+
+    /// Nothing is placed on this page yet: no in-flow box with height, at
+    /// any depth, above the walk's place (cells beside it in a row do not
+    /// count). A box's padding or border, or a margin, is no content. A
+    /// break here would leave the page with nothing but such edges, so a
+    /// paragraph splits within relaxed `orphans` and `widows` rather than
+    /// move whole (css-break-3 §4.4), and a side break only moves on to its
+    /// side. Whether a break point precedes a box at all is the walker's own
+    /// question: it still moves a box that does not fit below another, or
+    /// below a gap or edge, as before.
+    fn at_page_top(&self) -> bool {
+        !self.page_has_content
+    }
+
+    /// Records that a box of `height` is placed on this page.
+    fn place(&mut self, height: f32) {
+        self.page_has_content |= height > 0.0;
     }
 
     /// Moves to the top of the next page.
@@ -1959,6 +1991,7 @@ impl PageCursor {
         self.page_index += 1;
         self.cursor_y = 0.0;
         self.page_start_y = 0.0;
+        self.page_has_content = false;
     }
 
     /// Moves on to the page of `side` when this page is not on it (a side
@@ -1980,6 +2013,7 @@ impl PageCursor {
             page_start_y: self.page_start_y,
             page_taffy_origin: self.page_taffy_origin,
             entered_below_content: self.entered_below_content,
+            page_has_content: self.page_has_content,
         }
     }
 
@@ -1989,6 +2023,7 @@ impl PageCursor {
         self.page_start_y = mark.page_start_y;
         self.page_taffy_origin = mark.page_taffy_origin;
         self.entered_below_content = mark.entered_below_content;
+        self.page_has_content = mark.page_has_content;
     }
 
     /// Opens a flex or grid row: until [`Self::close_row`], the parent is
@@ -2628,6 +2663,7 @@ fn fragment_block_subtree(
     page_height_px: f32,
     depth: usize,
     entered_below_content: bool,
+    page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
@@ -2648,6 +2684,7 @@ fn fragment_block_subtree(
             page_height_px,
             depth,
             entered_below_content,
+            page_has_content,
             remaining_repeat_budget,
             lifted,
         );
@@ -2666,6 +2703,7 @@ fn fragment_block_subtree(
             page_height_px,
             depth,
             entered_below_content,
+            page_has_content,
             remaining_repeat_budget,
             lifted,
             content_top,
@@ -2687,6 +2725,7 @@ fn fragment_block_subtree(
         0.0,
         false,
         entered_below_content,
+        page_has_content,
         remaining_repeat_budget,
         lifted,
     )
@@ -2732,6 +2771,7 @@ fn fragment_table_cell(
     page_height_px: f32,
     depth: usize,
     entered_below_content: bool,
+    page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
     content_top: f32,
@@ -2753,6 +2793,7 @@ fn fragment_table_cell(
         0.0,
         false,
         entered_below_content,
+        page_has_content,
         remaining_repeat_budget,
         lifted,
     );
@@ -2939,6 +2980,7 @@ fn fragment_repeating_table(
     page_height_px: f32,
     depth: usize,
     entered_below_content: bool,
+    page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
@@ -2963,6 +3005,7 @@ fn fragment_repeating_table(
             0.0,
             false,
             entered_below_content,
+            page_has_content,
             remaining_repeat_budget,
             lifted,
         );
@@ -3043,6 +3086,10 @@ fn fragment_repeating_table(
     }
 
     let mut body_geometry = PaginationGeometryTable::new();
+    // A table moved on starts on an empty page; the band above the rows is
+    // no content for them: a first row's paragraph under it on an otherwise
+    // empty page splits there rather than leave the band alone.
+    *page_has_content &= first_page == page_in;
     let (body_end_page, body_end_cursor) = fragment_block_subtree_inner(
         &mut body_geometry,
         doc,
@@ -3059,6 +3106,7 @@ fn fragment_repeating_table(
         header.body_origin_px,
         true,
         first_table_top > 0.0,
+        page_has_content,
         remaining_repeat_budget,
         // The rows place their cells side by side and apply no lift.
         &mut 0.0,
@@ -3237,6 +3285,7 @@ fn fragment_block_subtree_inner(
     initial_taffy_origin: f32,
     co_split_rows: bool,
     entered_below_content: bool,
+    page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
@@ -3258,6 +3307,7 @@ fn fragment_block_subtree_inner(
         page_start_y: cursor_in,
         page_taffy_origin: initial_taffy_origin,
         entered_below_content,
+        page_has_content: *page_has_content,
         page_height_px,
         parent: Some(ParentSink {
             id: parent_id,
@@ -3274,6 +3324,7 @@ fn fragment_block_subtree_inner(
             .map(|n| n.final_layout.size.height)
             .unwrap_or(0.0);
         cursor.close_parent(geometry, ParentHeight::Measured(h));
+        *page_has_content |= h > 0.0;
         return (page_in, cursor_in + h);
     }
     let Some(parent) = doc.get_node(parent_id) else {
@@ -3432,11 +3483,17 @@ fn fragment_block_subtree_inner(
                         cursor.restore(rs.start);
                         origin_pending_target_y = None;
                         origin_pending_same_row = None;
+                    } else {
+                        // If crossed_by_recursion is false (e.g., a previous
+                        // cell crossed via the non-recursion strip-overflow
+                        // path), the existing origin_pending_same_row mechanism
+                        // already handles correct placement — no additional
+                        // restore is needed. The cells before this one sit
+                        // beside it, not above: the page holds content above
+                        // it only as it did when the row started there.
+                        cursor.page_has_content =
+                            cursor.page_index == rs.start.page_index && rs.start.page_has_content;
                     }
-                    // If crossed_by_recursion is false (e.g., a previous cell
-                    // crossed via the non-recursion strip-overflow path), the
-                    // existing origin_pending_same_row mechanism already handles
-                    // correct placement — no additional restore is needed.
                 }
                 Some(false) => {
                     // New row: advance outer cursor to the max end reached
@@ -3444,6 +3501,7 @@ fn fragment_block_subtree_inner(
                     let rs = row_state.take().unwrap();
                     cursor.page_index = rs.max_end_page;
                     cursor.cursor_y = rs.max_end_cursor_y;
+                    cursor.page_has_content = rs.max_end_has_content;
                     if rs.max_end_page > rs.start.page_index {
                         cursor.page_start_y = 0.0;
                         origin_pending_target_y = Some(rs.max_end_cursor_y);
@@ -3461,6 +3519,7 @@ fn fragment_block_subtree_inner(
                     started_on_occupied_strip: cursor.entered_below_content,
                     max_end_page: cursor.page_index,
                     max_end_cursor_y: cursor.cursor_y,
+                    max_end_has_content: cursor.page_has_content,
                     _row_top: this_top_in_parent,
                     row_bottom: this_top_in_parent + child_h,
                     crossed_by_recursion: false,
@@ -3496,11 +3555,7 @@ fn fragment_block_subtree_inner(
                 // on the new page — apply origin rebase eagerly.
                 cursor.page_taffy_origin = this_top_in_parent;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
-            } else if !suppress_page_check
-                && !cursor.entered_below_content
-                && cursor.page_index > 0
-                && cursor.cursor_y <= 0.0
-            {
+            } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
                 cursor.move_to_side(doc, break_props.break_before_side);
             }
             if child.element_data().is_some() {
@@ -3564,11 +3619,7 @@ fn fragment_block_subtree_inner(
             // Fragmentation §3 (margins at forced breaks truncate).
             cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
-        } else if !suppress_page_check
-            && !cursor.entered_below_content
-            && cursor.page_index > 0
-            && cursor.cursor_y <= 0.0
-        {
+        } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
             // Nothing is placed on this page yet, here or above: a side
             // break only moves on to its side, as at the body level.
             cursor.move_to_side(doc, break_props.break_before_side);
@@ -3682,11 +3733,13 @@ fn fragment_block_subtree_inner(
             // grid/flex row cell, `cursor_y` is the previous cell's row
             // bottom, which can overflow the page even when this cell
             // would fit fine at its own row-local y. The leading
-            // `cursor_y > page_start_y` guard is kept as-is: it answers
-            // "is there real content already on this page" (the
-            // fulgur-2s7p.1 first-child exemption), which `cursor_y`
-            // correctly proxies for regardless of row position.
+            // `cursor_y > page_start_y` guard answers whether anything of
+            // this container precedes the paragraph on this page (the
+            // fulgur-2s7p.1 first-child exemption), regardless of row
+            // position; `at_page_top` whether the page holds any content,
+            // which a move whole would leave it without.
             if cursor.cursor_y > cursor.page_start_y
+                && !cursor.at_page_top()
                 && moves_whole_at_foot(&line_metrics, child_page_y, page_height_px, limits)
             {
                 // Only widen to the full page strip when we're actually
@@ -3736,6 +3789,7 @@ fn fragment_block_subtree_inner(
             // this cell's row-local start (fulgur-u0p0, mirrored from
             // the recursion branch below).
             let mut paragraph = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
+            paragraph.page_has_content = cursor.page_has_content;
             let split_frag_count = fragment_inline_root(
                 geometry,
                 child_id,
@@ -3746,6 +3800,7 @@ fn fragment_block_subtree_inner(
                 limits,
             );
             let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
+            cursor.page_has_content = paragraph.page_has_content;
             record_inline_root_descendants(
                 geometry,
                 doc,
@@ -3953,6 +4008,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
                 cursor.entered_below_content,
+                &mut cursor.page_has_content,
                 remaining_repeat_budget,
                 &mut child_lift,
             );
@@ -4144,6 +4200,7 @@ fn fragment_block_subtree_inner(
         // `cursor_y` to `max(cursor_y, child_page_y + child_h)` —
         // the per-row max bottom).
         cursor.cursor_y = cursor.cursor_y.max(child_page_y + child_h);
+        cursor.place(child_h);
 
         // Honour `break-after: page` after the child fragment lands
         // (and the descendant walk records same-page entries).
@@ -4166,6 +4223,7 @@ fn fragment_block_subtree_inner(
         cursor.close_row();
         cursor.page_index = rs.max_end_page;
         cursor.cursor_y = rs.max_end_cursor_y;
+        cursor.page_has_content = rs.max_end_has_content;
         if rs.max_end_page > rs.start.page_index {
             cursor.page_start_y = 0.0;
         }
@@ -4195,6 +4253,7 @@ fn fragment_block_subtree_inner(
         *lifted += own_lift;
     }
 
+    *page_has_content = cursor.page_has_content;
     (cursor.page_index, cursor.cursor_y)
 }
 
@@ -4390,7 +4449,7 @@ fn fragment_inline_root(
             continue;
         }
 
-        let at_page_top = cursor.cursor_y <= 0.0;
+        let at_page_top = cursor.at_page_top();
         if i == fragment_start_idx {
             // Not even the first line of this fragment fits.
             if at_page_top {
@@ -4434,6 +4493,7 @@ fn fragment_inline_root(
         // `PaginationGeometry::line_boundaries`.
         entry.line_boundaries.push(fragment_start_idx);
         emitted += 1;
+        cursor.place(frag_h);
 
         cursor.advance();
         fragment_start_idx = split;
@@ -4465,6 +4525,7 @@ fn fragment_inline_root(
     emitted += 1;
 
     cursor.cursor_y += frag_h;
+    cursor.place(frag_h);
     emitted
 }
 
@@ -6291,6 +6352,8 @@ mod tests {
         limits: LineLimits,
     ) -> (u32, f32, usize) {
         let mut cursor = PageCursor::new(page_index, cursor_y, page_height_px);
+        // A paragraph that starts below the top of its page follows content.
+        cursor.page_has_content = cursor_y > 0.0;
         let emitted = fragment_inline_root(
             geometry,
             child_id,
@@ -6415,6 +6478,7 @@ mod tests {
             800.0,                // page_height_px
             crate::MAX_DOM_DEPTH, // depth → trips the guard immediately
             false,
+            &mut false,
             &mut remaining_repeat_budget,
             &mut 0.0,
         );
@@ -6490,6 +6554,7 @@ mod tests {
             100.0,
             crate::MAX_DOM_DEPTH,
             false,
+            &mut false,
             &mut remaining_repeat_budget,
             &mut 0.0,
         );
@@ -13122,6 +13187,46 @@ h2 { string-set: chapter-title content(text); }
         };
         assert_eq!(split(1), (vec![0, 1], vec![0, 5, 6]), "5 + 1");
         assert_eq!(split(4), (vec![1], vec![0, 6]), "moves whole");
+    }
+
+    /// A box's padding is no content: a paragraph that opens a padded box
+    /// at the top of a page is at the top of the page, where moving it
+    /// gains nothing, so it splits after the lines that fit though its
+    /// `orphans` and `widows` cannot be met (css-break-3 §4.4), rather than
+    /// moving whole and leaving the box empty. Three 20px lines below 10px
+    /// of padding on a 60px page: two fit.
+    #[test]
+    fn a_paragraph_at_the_top_of_a_page_inside_a_padded_box_relaxes_its_orphans() {
+        let html = r#"<html><body style="margin:0">
+              <div style="padding-top:10px">
+                <p id="p" style="margin:0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
+              </div>
+            </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let p_id = find_by_id(&doc, "p").expect("p#p");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
+    }
+
+    /// The flex item before a paragraph's item sits beside it, not above:
+    /// the paragraph, in a padded item at the top of a page, still splits
+    /// there within relaxed `orphans` and `widows`.
+    #[test]
+    fn a_paragraph_beside_a_flex_item_at_the_top_of_a_page_relaxes_its_orphans() {
+        let html = r#"<html><body style="margin:0">
+              <div style="display:flex">
+                <div style="flex:1 1 0"><div style="height:50px"></div></div>
+                <div style="flex:1 1 0;padding-top:10px">
+                  <p id="p" style="margin:0;line-height:20px;orphans:3;widows:2">a<br>b<br>c</p>
+                </div>
+              </div>
+            </body></html>"#;
+        let mut doc = parse(html, 200.0);
+        let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let p_id = find_by_id(&doc, "p").expect("p#p");
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+        assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
     }
 
     // ── StringSetPageState / PageRunningState derived-trait coverage ─────────
