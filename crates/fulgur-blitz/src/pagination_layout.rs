@@ -5028,7 +5028,8 @@ pub fn append_position_absolute_body_direct_fragments(
 /// location plus the node's accumulated `final_layout.location` offset
 /// from that root. A size-contained box taller than a page is sliced into
 /// one fragment a page where block flow slices it, and is otherwise kept on
-/// its first page ([`is_monolithic_in_absolute_subtree`]).
+/// its first page ([`is_monolithic_in_absolute_subtree`]). The pages its
+/// slices reach join the budget of the whole subtree, past the flow's.
 ///
 /// Skips out-of-flow descendants (their own pass handles them) and
 /// whitespace-only text nodes (mirrors `fragment_pagination_root`).
@@ -5074,6 +5075,9 @@ fn record_subtree_fragments_at_offset(
         cb_size: (f32, f32),
         depth: usize,
         emitted: &mut usize,
+        // The number of pages the slices of the sliced boxes walked so far
+        // reach, budget or not.
+        sliced_pages: &mut u32,
         running_store: Option<&crate::gcpm::running::RunningElementStore>,
     ) {
         if depth >= crate::MAX_DOM_DEPTH {
@@ -5205,6 +5209,10 @@ fn record_subtree_fragments_at_offset(
             // (Codex review). A box must appear on at least its (snapped) start
             // page, so never let the last page precede the first.
             last_page_f = last_page_f.max(first_page_f);
+            if is_sliced && last_page_f.is_finite() {
+                let pages = (last_page_f.max(0.0) as u32).min(crate::MAX_PAGES);
+                *sliced_pages = (*sliced_pages).max(pages.saturating_add(1));
+            }
             // fulgur-xa9q: an abs whose START is at/beyond the existing in-flow
             // page budget extends the page count even with in-flow content
             // present (Chrome-compatible) — UNLESS it sits inside a containment
@@ -5438,6 +5446,7 @@ fn record_subtree_fragments_at_offset(
                             child_cb_size,
                             depth + 1,
                             emitted,
+                            sliced_pages,
                             running_store,
                         );
                         continue;
@@ -5470,6 +5479,7 @@ fn record_subtree_fragments_at_offset(
                 child_cb_size,
                 depth + 1,
                 emitted,
+                sliced_pages,
                 running_store,
             );
             flow_bottom =
@@ -5480,28 +5490,46 @@ fn record_subtree_fragments_at_offset(
         }
     }
 
-    walk(
-        geometry,
-        doc,
-        subtree_root_id,
-        (0.0, 0.0),
-        root_xy_for_paging,
-        body_offset,
-        page_h_px,
-        page_stride_px,
-        total_pages,
-        may_extend_pages,
-        // fulgur-xa9q: the subtree root starts outside any containment boundary.
-        false,
-        // Initial CB: the subtree root is the body-direct abs (positioned),
-        // so it overrides these on the first frame — seed with the root's own
-        // anchor/size for correctness if that ever changes.
-        (0.0, 0.0),
-        (0.0, 0.0),
-        0,
-        emitted,
-        running_store,
-    );
+    let emitted_before = *emitted;
+    let mut sliced_pages = 0;
+    let walk_within = |geometry: &mut PaginationGeometryTable,
+                       emitted: &mut usize,
+                       total_pages: u32,
+                       sliced_pages: &mut u32| {
+        walk(
+            geometry,
+            doc,
+            subtree_root_id,
+            (0.0, 0.0),
+            root_xy_for_paging,
+            body_offset,
+            page_h_px,
+            page_stride_px,
+            total_pages,
+            may_extend_pages,
+            // fulgur-xa9q: the subtree root starts outside any containment boundary.
+            false,
+            // Initial CB: the subtree root is the body-direct abs (positioned),
+            // so it overrides these on the first frame — seed with the root's own
+            // anchor/size for correctness if that ever changes.
+            (0.0, 0.0),
+            (0.0, 0.0),
+            0,
+            emitted,
+            sliced_pages,
+            running_store,
+        )
+    };
+    walk_within(geometry, emitted, total_pages, &mut sliced_pages);
+    // The slices of a box block flow would slice take pages past the flow's,
+    // as block flow's slices do, and the subtree around them reaches those
+    // pages too: walk it again with them in the budget. Each node then emits
+    // on at least the pages it did, so every entry of the first walk is
+    // rewritten.
+    if !may_extend_pages && sliced_pages > total_pages {
+        *emitted = emitted_before;
+        walk_within(geometry, emitted, sliced_pages, &mut sliced_pages);
+    }
 }
 
 /// Which axes of an out-of-flow element carry an explicit (length /
@@ -5626,12 +5654,16 @@ fn item_shares_its_row(
 /// items beside it there, or back to the row's start. Nor past the bottom
 /// of an ancestor below the body that clips its overflow
 /// ([`clips_overflow`]): what is past the clip paints nothing, so it takes
-/// no page. The ancestors end at the body, or at the root of the absolute
-/// or fixed subtree the box is in.
+/// no page. Rows and cells count up to the root of the absolute or fixed
+/// subtree the box is in, which may be the box itself; clips up to the body.
 fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
     if displays(node, DisplayInside::TableCell) {
         return false;
     }
+    // The rows and cells are those of the flow the box is in, which ends at
+    // the root of an absolute or fixed subtree: that root is no item or cell
+    // of its parent. The clips go on up to the body.
+    let mut in_flow = !is_out_of_flow_positioned(node);
     let mut bottom = node.final_layout.location.y + node.final_layout.size.height;
     let mut below = node;
     let mut next = node.parent;
@@ -5640,18 +5672,18 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
             .element_data()
             .is_some_and(|el| el.name.local.as_ref() == "body");
         let layout = ancestor.final_layout;
-        if displays(ancestor, DisplayInside::TableCell)
-            || (crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
-                && item_shares_its_row(doc, ancestor, below))
+        if (in_flow
+            && (displays(ancestor, DisplayInside::TableCell)
+                || (crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
+                    && item_shares_its_row(doc, ancestor, below))))
             || (!is_body && clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
         {
             return false;
         }
-        // The root of an absolute or fixed subtree is no item or cell of
-        // its parent.
-        if is_body || is_out_of_flow_positioned(ancestor) {
+        if is_body {
             return true;
         }
+        in_flow &= !is_out_of_flow_positioned(ancestor);
         bottom += layout.location.y;
         below = ancestor;
         next = ancestor.parent;
@@ -9233,104 +9265,179 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
+    /// `html` through the absolute-positioning pass alone, on pages
+    /// 600 x 100 px, of which the flow laid out `total_pages`.
+    fn absolute_pass(
+        html: &str,
+        total_pages: u32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let mut doc = parse(html, 600.0);
+        let mut geom = PaginationGeometryTable::new();
+        super::append_position_absolute_body_direct_fragments(
+            &mut geom,
+            doc.deref_mut(),
+            total_pages,
+            600.0,
+            100.0,
+            None,
+        );
+        (doc, geom)
+    }
+
+    /// The page, y, and height of each fragment of the element `#id`.
+    fn fragments_of(
+        doc: &blitz_dom::BaseDocument,
+        geom: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<(u32, f32, f32)> {
+        geom.get(&find_by_id(doc, id).unwrap())
+            .map(|g| {
+                g.fragments
+                    .iter()
+                    .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The pages of the fragments of the element `#id`.
+    fn pages_of(
+        doc: &blitz_dom::BaseDocument,
+        geom: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<u32> {
+        fragments_of(doc, geom, id).iter().map(|f| f.0).collect()
+    }
+
     /// A size-contained box taller than a page in an absolute subtree is
     /// sliced into one fragment a page, as block flow slices it, and what
     /// follows it lands after its last slice, extending the page count
     /// (WPT `monolithic-overflow-013-print`).
     #[test]
     fn a_tall_box_in_an_absolute_subtree_is_sliced() {
-        let html = r#"
-            <html><body style="margin: 0">
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
               <div style="position: absolute; top: 0; width: 100%">
                 <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
                 <p id="after" style="margin: 0">after</p>
               </div>
-            </body></html>
-        "#;
-        let mut doc = parse(html, 600.0);
-        let mut geom = PaginationGeometryTable::new();
-        super::append_position_absolute_body_direct_fragments(
-            &mut geom,
-            doc.deref_mut(),
+            </body></html>"#,
             1,
-            600.0,
-            100.0,
-            None,
         );
-        let fragments = |id: &str| {
-            geom[&find_by_id(&doc, id).unwrap()]
-                .fragments
-                .iter()
-                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
-                .collect::<Vec<_>>()
-        };
         assert_eq!(
-            fragments("tall"),
+            fragments_of(&doc, &geom, "tall"),
             [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)]
         );
-        let after: Vec<(u32, f32)> = fragments("after").iter().map(|f| (f.0, f.1)).collect();
+        let after: Vec<(u32, f32)> = fragments_of(&doc, &geom, "after")
+            .iter()
+            .map(|f| (f.0, f.1))
+            .collect();
         assert_eq!(after, [(2, 50.0)]);
     }
 
+    /// The slices of a tall box in an absolute subtree take pages past the
+    /// flow's, as block flow's do, and the subtree around them reaches
+    /// those pages too: none is left blank.
+    #[test]
+    fn a_sliced_box_in_an_absolute_subtree_extends_the_pages_of_the_flow() {
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
+              <p style="margin: 0">in flow</p>
+              <div id="root" style="position: absolute; top: 0; width: 100%">
+                <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
+                <p id="after" style="margin: 0">after</p>
+              </div>
+            </body></html>"#,
+            1,
+        );
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0, 1, 2]);
+        assert_eq!(pages_of(&doc, &geom, "root"), [0, 1, 2]);
+    }
+
     /// A table cell is no place block flow slices a box, in an absolute
-    /// subtree too: the tall box keeps one fragment on its first page.
+    /// subtree too: the tall box keeps one fragment on its first page, and
+    /// what follows it in the cell moves up by its excess over a page.
     #[test]
     fn a_tall_box_in_a_table_cell_of_an_absolute_subtree_is_not_sliced() {
-        let html = r#"
-            <html><body style="margin: 0">
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
               <div style="position: absolute; top: 0; width: 100%">
                 <table style="border-spacing: 0"><tr><td style="padding: 0">
                   <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
+                  <div id="after" style="width: 50px; height: 10px"></div>
                 </td></tr></table>
               </div>
-            </body></html>
-        "#;
-        let mut doc = parse(html, 600.0);
-        let mut geom = PaginationGeometryTable::new();
-        super::append_position_absolute_body_direct_fragments(
-            &mut geom,
-            doc.deref_mut(),
+            </body></html>"#,
             1,
-            600.0,
-            100.0,
-            None,
         );
-        let pages: Vec<u32> = geom[&find_by_id(&doc, "tall").unwrap()]
-            .fragments
-            .iter()
-            .map(|f| f.page_index)
-            .collect();
-        assert_eq!(pages, [0]);
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0]);
+        assert_eq!(fragments_of(&doc, &geom, "after"), [(1, 0.0, 10.0)]);
     }
 
     /// The root of an absolute subtree is no item of a flex body, so an
     /// in-flow item beside it does not keep its tall box whole.
     #[test]
     fn a_tall_box_in_an_absolute_child_of_a_flex_body_is_sliced() {
-        let html = r#"
-            <html><body style="margin: 0; display: flex">
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0; display: flex">
               <div style="width: 50px; height: 50px"></div>
               <div style="position: absolute; top: 0; left: 100px; width: 50px">
                 <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
               </div>
-            </body></html>
-        "#;
-        let mut doc = parse(html, 600.0);
-        let mut geom = PaginationGeometryTable::new();
-        super::append_position_absolute_body_direct_fragments(
-            &mut geom,
-            doc.deref_mut(),
+            </body></html>"#,
             3,
-            600.0,
-            100.0,
-            None,
         );
-        let pages: Vec<u32> = geom[&find_by_id(&doc, "tall").unwrap()]
-            .fragments
-            .iter()
-            .map(|f| f.page_index)
-            .collect();
-        assert_eq!(pages, [0, 1, 2]);
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0, 1, 2]);
+    }
+
+    /// A tall root of an absolute subtree is no item of a flex body either.
+    #[test]
+    fn a_tall_absolute_child_of_a_flex_body_is_sliced() {
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0; display: flex">
+              <div style="width: 50px; height: 50px"></div>
+              <div id="tall" style="position: absolute; top: 0; left: 100px;
+                  contain: size; width: 50px; height: 250px"></div>
+            </body></html>"#,
+            3,
+        );
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0, 1, 2]);
+    }
+
+    /// A tall absolute box nested in a flex row of an absolute subtree is
+    /// no item of that row.
+    #[test]
+    fn a_tall_absolute_box_in_a_flex_row_is_sliced() {
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
+              <div style="position: absolute; top: 0; width: 200px; display: flex">
+                <div style="width: 50px; height: 50px"></div>
+                <div id="tall" style="position: absolute; top: 0; left: 100px;
+                    contain: size; width: 50px; height: 250px"></div>
+              </div>
+            </body></html>"#,
+            1,
+        );
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0, 1, 2]);
+    }
+
+    /// A clip above a nested absolute box still hides what is past it: the
+    /// tall box in the nested box is not sliced past an outer absolute box
+    /// that clips it.
+    #[test]
+    fn a_tall_box_past_a_clip_above_a_nested_absolute_box_is_not_sliced() {
+        let (doc, geom) = absolute_pass(
+            r#"<html><body style="margin: 0">
+              <div style="position: absolute; top: 0; width: 100px;
+                  height: 100px; overflow: hidden">
+                <div style="position: absolute; top: 0; width: 50px">
+                  <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
+                </div>
+              </div>
+            </body></html>"#,
+            1,
+        );
+        assert_eq!(pages_of(&doc, &geom, "tall"), [0]);
     }
 
     #[test]
