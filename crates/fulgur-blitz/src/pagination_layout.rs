@@ -6012,16 +6012,17 @@ pub fn implied_page_count(geometry: &PaginationGeometryTable) -> u32 {
         .unwrap_or(1)
 }
 
-/// The geometry table as text: one line per node and fragment, in tree
-/// order, so two runs of the fragmenter can be compared line by line.
+/// The geometry table as text: one line per node and fragment, nodes in
+/// tree order and each node's fragments in their vector order, so two runs
+/// of the fragmenter can be compared line by line.
 ///
 /// Each line holds the node's path from the root (each step is the tag
 /// name, `#id` when the element has one, and the index in its parent's
 /// children), then the fragment's page, `x`, `y`, `width`, and `height`
-/// rounded to 0.01 px, `repeat` when the geometry is a per-page copy, the
-/// fragment's line range when the node is split at line boundaries, and
-/// the node's `lift_px` when it is not zero. A node with no fragment is
-/// one line ending in `none`.
+/// rounded to 0.01 px, `repeat` when the geometry is a per-page copy, every
+/// entry of the node's `line_boundaries` when it has any, and the node's
+/// `lift_px` when it is not zero. A node with no fragment is one line
+/// with `none` in place of the fragment.
 ///
 /// Anonymous blocks are `::anon`, text nodes `#text`, and generated
 /// boxes `::before` and `::after`; a node outside its parent's DOM
@@ -6039,34 +6040,29 @@ pub fn geometry_text(geometry: &PaginationGeometryTable, doc: &BaseDocument) -> 
             .map(|(_, step)| step.as_str())
             .collect::<Vec<_>>()
             .join("/");
-        if g.fragments.is_empty() {
-            out.push_str(&path);
-            out.push_str(" none\n");
-            continue;
+        let mut node = String::new();
+        if g.is_repeat {
+            node.push_str(" repeat");
         }
-        let mut fragments: Vec<(usize, &Fragment)> = g.fragments.iter().enumerate().collect();
-        fragments.sort_by_key(|(k, f)| (f.page_index, *k));
-        for (k, f) in fragments {
+        if !g.line_boundaries.is_empty() {
+            let lines: Vec<String> = g.line_boundaries.iter().map(usize::to_string).collect();
+            node.push_str(&format!(" lines={}", lines.join(",")));
+        }
+        if g.lift_px != 0.0 {
+            node.push_str(&format!(" lift={}", geometry_number(g.lift_px)));
+        }
+        if g.fragments.is_empty() {
+            out.push_str(&format!("{path} none{node}\n"));
+        }
+        for f in &g.fragments {
             out.push_str(&format!(
-                "{path} page={} x={} y={} w={} h={}",
+                "{path} page={} x={} y={} w={} h={}{node}\n",
                 f.page_index,
                 geometry_number(f.x.to_f32()),
                 geometry_number(f.y.to_f32()),
                 geometry_number(f.width.to_f32()),
                 geometry_number(f.height.to_f32()),
             ));
-            if g.is_repeat {
-                out.push_str(" repeat");
-            }
-            if let (Some(start), Some(end)) =
-                (g.line_boundaries.get(k), g.line_boundaries.get(k + 1))
-            {
-                out.push_str(&format!(" lines={start}..{end}"));
-            }
-            if g.lift_px != 0.0 {
-                out.push_str(&format!(" lift={}", geometry_number(g.lift_px)));
-            }
-            out.push('\n');
         }
     }
     out
@@ -10963,9 +10959,9 @@ h2 { string-set: chapter-title content(text); }
     }
 
     /// `geometry_text` writes one line per node and fragment, in tree order
-    /// and then by page: the path of tag names, `#id`, and child indices,
-    /// the box rounded to 0.01 px, then `repeat`, the fragment's line range,
-    /// and the node's lift.
+    /// and then in the fragments' vector order: the path of tag names, `#id`,
+    /// and child indices, the box rounded to 0.01 px, then `repeat`, every
+    /// line boundary, and the lift.
     #[test]
     fn geometry_text_writes_one_line_per_fragment_in_tree_order() {
         let doc = parse(
@@ -11002,8 +10998,8 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(
             geometry_text(&geom, &doc),
             "html[0]/body[1]/div#a[0] page=0 x=0.00 y=80.00 w=200.00 h=20.00 repeat lift=2.50\n\
-             html[0]/body[1]/div#a[0]/p[0] page=0 x=0.00 y=80.00 w=200.00 h=20.00 lines=1..2\n\
-             html[0]/body[1]/div#a[0]/p[0] page=1 x=0.00 y=0.00 w=200.00 h=20.00 lines=0..1\n"
+             html[0]/body[1]/div#a[0]/p[0] page=1 x=0.00 y=0.00 w=200.00 h=20.00 lines=0,1,2\n\
+             html[0]/body[1]/div#a[0]/p[0] page=0 x=0.00 y=80.00 w=200.00 h=20.00 lines=0,1,2\n"
         );
     }
 
