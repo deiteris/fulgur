@@ -106,9 +106,6 @@
 30 PastFoot b1 4  # one walker
 30 PlacedOnce b1 2  # one walker
 30 PlacedOnce b11 4  # leading extent: lines measured from the line box
-31 PastFoot b0 1  # one walker
-31 PastFoot b1 1  # one walker
-31 PlacedOnce b0 0  # one walker
 33 PastFoot b0 0  # one walker
 33 PastFoot b1 0  # leading extent
 33 PastFoot b3 0  # page cursor
@@ -222,8 +219,6 @@
 54 PlacedOnce b7 3  # one walker
 55 PastFoot b2 0  # one walker
 55 PlacedOnce b2 0  # one walker
-56 PastFoot b0 1  # one walker
-56 PastFoot b2 1  # one walker
 57 PastFoot b11 1  # table walker
 57 PastFoot b5 1  # one walker
 57 PlacedOnce b11 1  # table walker
@@ -285,8 +280,6 @@
 73 PlacedOnce b0 0  # one walker
 73 PlacedOnce b2 0  # table walker
 73 PlacedOnce b5 1  # leading extent: lines measured from the line box
-75 PastFoot b0 1  # one walker
-75 PastFoot b2 1  # one walker
 75 PlacedOnce b0 0  # one walker
 76 PastFoot b0 0  # one walker
 76 PastFoot b3 0  # leading extent
@@ -343,8 +336,6 @@
 93 PlacedOnce b16 2  # one walker
 94 PlacedOnce b1 0  # one walker
 95 Encloses b12 6  # one walker
-95 PastFoot b0 1  # one walker
-95 PastFoot b1 1  # one walker
 95 PastFoot b10 3  # one walker
 95 PastFoot b11 3  # page cursor
 95 PastFoot b12 6  # one walker
@@ -389,14 +380,8 @@
 102 PlacedOnce b5 1  # table walker
 103 PlacedOnce b0 0  # one walker
 105 PlacedOnce b2 0  # one walker
-106 Encloses b10 8  # leading extent: lines measured from the line box
-106 PastFoot b10 8  # leading extent: lines measured from the line box
-106 PastFoot b10 9  # leading extent: lines measured from the line box
-106 PastFoot b12 8  # one walker
-106 PastFoot b13 9  # one walker
 106 PastFoot b3 2  # one walker
 106 PastFoot b3 6  # one walker
-106 PastFoot b3 9  # one walker
 106 PlacedOnce b10 6  # leading extent: lines measured from the line box
 106 PlacedOnce b3 2  # one walker
 106 PlacedOnce b5 2  # page cursor
@@ -483,10 +468,6 @@
 140 PlacedOnce b1 0  # one walker
 140 PlacedOnce b2 0  # leading extent
 140 PlacedOnce b5 0  # leading extent: lines measured from the line box
-143 PastFoot b5 2  # one walker
-143 PastFoot b5 3  # one walker
-143 PastFoot b7 2  # one walker
-143 PastFoot b8 3  # one walker
 143 PlacedOnce b5 0  # one walker
 145 PastFoot b8 2  # one walker
 145 PlacedOnce b8 2  # one walker
@@ -683,39 +664,36 @@
 201 PlacedOnce b0 0  # one walker
 201 PlacedOnce b12 2  # one walker
 201 PlacedOnce b20 4  # leading extent: lines measured from the line box
-202 Encloses b12 3  # one walker
-202 Encloses b12 4  # one walker
-202 Encloses b12 7  # one walker
+202 Encloses b12 5  # one walker
 202 Encloses b12 8  # one walker
-202 Encloses b5 6  # leading extent
+202 Encloses b12 9  # one walker
+202 Encloses b5 7  # leading extent
 202 PastFoot b0 0  # one walker
-202 PastFoot b0 2  # one walker
-202 PastFoot b10 6  # one walker
-202 PastFoot b11 2  # one walker
-202 PastFoot b12 2  # one walker
+202 PastFoot b10 7  # one walker
+202 PastFoot b11 3  # one walker
 202 PastFoot b12 3  # one walker
-202 PastFoot b12 4  # one walker
-202 PastFoot b12 7  # one walker
+202 PastFoot b12 5  # one walker
 202 PastFoot b12 8  # one walker
+202 PastFoot b12 9  # one walker
 202 PastFoot b14 3  # one walker
 202 PastFoot b15 3  # one walker
-202 PastFoot b21 7  # table walker
-202 PastFoot b24 8  # table walker
-202 PastFoot b3 2  # one walker
-202 PastFoot b4 2  # one walker
-202 PastFoot b5 2  # leading extent
-202 PastFoot b5 6  # leading extent
-202 PastFoot b6 2  # leading extent
-202 PastFoot b6 6  # leading extent
-202 PastFoot b7 2  # leading extent
+202 PastFoot b21 8  # table walker
+202 PastFoot b24 9  # table walker
+202 PastFoot b4 3  # one walker
+202 PastFoot b5 3  # leading extent
+202 PastFoot b5 7  # leading extent
+202 PastFoot b6 3  # leading extent
+202 PastFoot b6 7  # leading extent
+202 PastFoot b7 3  # leading extent
 202 PlacedOnce b0 0  # one walker
 202 PlacedOnce b1 0  # edge model
-202 PlacedOnce b11 2  # one walker
-202 PlacedOnce b12 2  # one walker
-202 PlacedOnce b19 4  # table walker
-202 PlacedOnce b26 8  # leading extent: lines measured from the line box
-202 PlacedOnce b4 2  # one walker
-202 PlacedOnce b5 2  # leading extent
+202 PlacedOnce b11 3  # one walker
+202 PlacedOnce b12 3  # one walker
+202 PlacedOnce b16 3  # leading extent: lines measured from the line box
+202 PlacedOnce b19 5  # table walker
+202 PlacedOnce b26 9  # leading extent: lines measured from the line box
+202 PlacedOnce b4 3  # one walker
+202 PlacedOnce b5 3  # leading extent
 204 PastFoot b8 0  # one walker
 204 PlacedOnce b8 0  # one walker
 205 PastFoot b0 1  # one walker
@@ -785,9 +763,6 @@
 237 PlacedOnce b0 0  # one walker
 237 PlacedOnce b6 2  # table walker
 238 PastFoot b10 5  # one walker
-238 PastFoot b10 6  # one walker
-238 PastFoot b12 6  # one walker
-238 PastFoot b14 6  # one walker
 238 PastFoot b5 4  # leading extent
 238 PastFoot b6 4  # leading extent
 238 PastFoot b8 4  # one walker

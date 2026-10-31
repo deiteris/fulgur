@@ -2475,10 +2475,12 @@ fn fragment_repeating_table(
 ///
 /// The root also stacks its children, each below the lowest point placed by
 /// the gap its layout leaves, where a nested walk places a child at its
-/// layout position; and only the root slices a child taller than a page
-/// that it does not enter, enters a multicol container with a
-/// `column-span: all` child, and keeps the gap above a child that nearly
+/// layout position; and only the root enters a multicol container with a
+/// `column-span: all` child and keeps the gap above a child that nearly
 /// fills a page after an authored break.
+///
+/// A child taller than a page that the walk does not enter is sliced, one
+/// fragment a page, where it lies in block flow ([`slices_where_it_is`]).
 ///
 /// Skips out-of-flow and whitespace-text children. Bails at
 /// [`crate::MAX_DOM_DEPTH`] — any nodes below that depth go unrecorded
@@ -3541,26 +3543,40 @@ fn fragment_block_subtree_inner(
         // `<div contain:size height:350vh>` still spans four
         // pages visually (WPT `monolithic-overflow-022-print`),
         // it's only the descendant content that's atomic.
-        if root && !has_transform && child_h > page_height_px + 1.0 {
-            let first_slice_h = (page_height_px - cursor.cursor_y).min(child_h);
+        //
+        // Nor is a box in a table cell or a flex or grid item, or one that
+        // overflows an ancestor clipping it ([`slices_where_it_is`]), or a
+        // first child entered below the page foot, which has no slice there.
+        if !has_transform
+            && child_h > page_height_px + 1.0
+            && child_page_y < page_height_px
+            && slices_where_it_is(doc, child)
+        {
+            // The slices are placed from the child's own place on the page,
+            // and the walk then goes on from the last one, as after an
+            // inline root that split.
+            let entry_page_index = cursor.page_index;
+            let mut slices = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
+            slices.page_has_content = cursor.page_has_content;
+            let first_slice_h = (page_height_px - child_page_y).min(child_h);
             geometry
                 .entry(child_id)
                 .or_default()
                 .fragments
                 .push(Fragment {
-                    page_index: cursor.page_index,
+                    page_index: slices.page_index,
                     x: child_x_in_body.as_px(),
-                    y: cursor.cursor_y.as_px(),
+                    y: slices.cursor_y.as_px(),
                     width: child_w.as_px(),
                     height: first_slice_h.as_px(),
                 });
-            cursor.place(first_slice_h);
+            slices.place(first_slice_h);
             record_subtree_descendants(
                 geometry,
                 doc,
                 child_id,
-                cursor.page_index,
-                cursor.cursor_y,
+                slices.page_index,
+                slices.cursor_y,
                 child_x_in_body,
                 depth + 1,
             );
@@ -3609,7 +3625,7 @@ fn fragment_block_subtree_inner(
                      to a single page (fulgur-ezst)",
                     crate::MAX_PAGES,
                 );
-                cursor.advance();
+                slices.advance();
             } else {
                 // fulgur-2m6w: cap the per-page-strip slicing at
                 // `MAX_PAGES`. `child_h` is attacker-controlled CSS
@@ -3619,21 +3635,21 @@ fn fragment_block_subtree_inner(
                 // `remaining`, looping forever. The `page_index` ceiling is
                 // load-bearing on its own (it stops the loop even when
                 // `remaining` is `+inf`); content past the cap is truncated.
-                while remaining > 0.0 && cursor.page_index < crate::MAX_PAGES {
-                    cursor.advance();
+                while remaining > 0.0 && slices.page_index < crate::MAX_PAGES {
+                    slices.advance();
                     last_slice_h = remaining.min(page_height_px);
                     geometry
                         .entry(child_id)
                         .or_default()
                         .fragments
                         .push(Fragment {
-                            page_index: cursor.page_index,
+                            page_index: slices.page_index,
                             x: child_x_in_body.as_px(),
                             y: 0.0_f32.as_px(),
                             width: child_w.as_px(),
                             height: last_slice_h.as_px(),
                         });
-                    cursor.place(last_slice_h);
+                    slices.place(last_slice_h);
                     remaining -= last_slice_h;
                 }
                 if remaining > 0.0 {
@@ -3644,12 +3660,38 @@ fn fragment_block_subtree_inner(
                         crate::MAX_PAGES,
                     );
                 }
-                cursor.cursor_y = if child_h - first_slice_h > 0.0 {
+                slices.cursor_y = if child_h - first_slice_h > 0.0 {
                     last_slice_h
                 } else {
-                    cursor.cursor_y + first_slice_h
+                    slices.cursor_y + first_slice_h
                 };
             }
+            let (new_page_index, new_cursor_y) = (slices.page_index, slices.cursor_y);
+            cursor.page_has_content = slices.page_has_content;
+            // The parent's fragment reaches the foot of every page the
+            // slices cross, as around an inline root that split.
+            if new_page_index > entry_page_index {
+                if cursor.parent_height(ParentHeight::ToFoot) > 0.0 {
+                    cursor.close_parent_once(geometry, ParentHeight::ToFoot);
+                }
+                cursor.fill_parent_pages(geometry, new_page_index);
+                cursor.page_start_y = 0.0;
+                origin_pending_target_y = Some(new_cursor_y);
+                origin_pending_same_row = allow_same_row_rebase.then_some((
+                    this_top_in_parent,
+                    this_top_in_parent + child_h,
+                    0.0,
+                ));
+                if let Some(ref mut rs) = row_state {
+                    rs.crossed_by_recursion = true;
+                }
+            }
+            cursor.page_index = new_page_index;
+            cursor.cursor_y = if new_page_index == entry_page_index && row_state.is_some() {
+                cursor.cursor_y.max(new_cursor_y)
+            } else {
+                new_cursor_y
+            };
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
@@ -5373,6 +5415,41 @@ fn clips_overflow(node: &blitz_dom::Node) -> bool {
         let display = s.clone_display();
         display.outside() == DisplayOutside::Block || display.inside() != DisplayInside::Flow
     })
+}
+
+/// Whether a box taller than a page that the walker does not enter may be
+/// sliced where it is, below the body: in block flow only. Not in a table
+/// cell or a flex or grid item: the items of a row share its height (a cell
+/// or item stretched past the page by a taller neighbour is one), and a
+/// row is no unit the walker fragments, so one that continued on the next
+/// page would take the walk of the cells or items beside it there, or back
+/// to the row's start. Nor past the bottom of an ancestor that clips its
+/// overflow ([`clips_overflow`]): what is past the clip paints nothing, so
+/// it takes no page.
+fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    if displays(node, DisplayInside::TableCell) {
+        return false;
+    }
+    let mut bottom = node.final_layout.location.y + node.final_layout.size.height;
+    let mut next = node.parent;
+    while let Some(ancestor) = next.and_then(|id| doc.get_node(id)) {
+        if ancestor
+            .element_data()
+            .is_some_and(|el| el.name.local.as_ref() == "body")
+        {
+            return true;
+        }
+        let layout = ancestor.final_layout;
+        if displays(ancestor, DisplayInside::TableCell)
+            || crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
+            || (clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
+        {
+            return false;
+        }
+        bottom += layout.location.y;
+        next = ancestor.parent;
+    }
+    true
 }
 
 /// CSS-px (x, y) of `<body>`'s top-left in its containing block (html).
@@ -12008,6 +12085,36 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(
             after_geom.fragments[0].page_index, 2,
             "break-after: page after slice must push sibling to page 2; geom={geom:?}"
+        );
+    }
+
+    /// A box taller than a page with no children to enter is sliced per
+    /// page at every depth, as at the body level, instead of being placed as
+    /// one fragment past the page foot (WPT `monolithic-overflow-026-print`);
+    /// the block around it has a fragment on each page it spans.
+    #[test]
+    fn a_nested_childless_box_taller_than_a_page_is_sliced() {
+        let html = r#"
+            <html><body style="margin: 0; padding: 0">
+              <div id="outer"><div id="tall" style="height: 250px"></div></div>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let geom = run_pass(doc.deref_mut(), 100.0);
+        let fragments = |geom: &PaginationGeometryTable, id: &str| {
+            geom[&find_by_id(&doc, id).unwrap()]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fragments(&geom, "tall"),
+            [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)]
+        );
+        assert_eq!(
+            fragments(&geom, "outer"),
+            [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)]
         );
     }
 
