@@ -52,7 +52,9 @@ enum Invariant {
     /// Every box is placed, once: a leaf's fragments, one a page on
     /// consecutive pages, add up to its height; a paragraph's line
     /// partition covers its lines once; a container's fragments add up to
-    /// no more than its height; no fragment starts above the page top.
+    /// no more than its height, one before its last free to run on to the
+    /// page foot below its children (css-break-3 §4); no fragment starts
+    /// above the page top.
     PlacedOnce,
     /// In block flow, and between the rows of a table, document order
     /// matches (page, y) order.
@@ -552,18 +554,37 @@ impl Placed<'_> {
         total - self.layout_height[b]
     }
 
+    /// How far `b`'s fragments add up past its layout height, a container
+    /// broken with a child pushed to the next page let run to the page foot
+    /// (css-break-3 §4): a fragment before its last that reaches the foot
+    /// counts down to the lowest of its children's fragments on its page.
+    fn container_excess(&self, b: usize) -> f32 {
+        let frags = &self.fragments[b];
+        let children = enclosed(self.case, b);
+        let total: f32 = frags
+            .iter()
+            .enumerate()
+            .map(|(k, f)| {
+                let (top, height) = (f.y.to_f32(), f.height.to_f32());
+                if k + 1 == frags.len() || top + height < self.page_height - EPS {
+                    return height;
+                }
+                children
+                    .iter()
+                    .flat_map(|&c| &self.fragments[c])
+                    .filter(|cf| cf.page_index == f.page_index)
+                    .map(|cf| (cf.y.to_f32() + cf.height.to_f32()).min(top + height) - top)
+                    .fold(0.0_f32, f32::max)
+            })
+            .sum();
+        total - self.layout_height[b]
+    }
+
     /// The part of the fragmenter expected to fix `b`'s fragments past the
     /// page foot, or adding up past its height, and why.
     fn cause(&self, b: usize) -> (&'static str, &'static str) {
         let info = &self.case.boxes[b];
         let frags = &self.fragments[b];
-        if frags.len() > 1 && info.parent.is_none() {
-            return (
-                fix::PAGE_CURSOR,
-                "a split box's fragment on the page a child crossed takes that \
-                 child's whole height",
-            );
-        }
         if info.kind == Kind::Para && frags.len() > 1 && self.excess(b) > EPS {
             return (
                 fix::LINE_BOX,
@@ -775,7 +796,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 }
             }
             Kind::Block | Kind::Table | Kind::BodyCell | Kind::Flex | Kind::Item
-                if placed.excess(b) > EPS * frags.len().max(1) as f32 =>
+                if placed.container_excess(b) > EPS * frags.len().max(1) as f32 =>
             {
                 let (note, why) = placed.cause(b);
                 push(
@@ -787,7 +808,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         "{} ({:?})'s fragments add up to {} px more than its height: {why}",
                         info.id,
                         info.kind,
-                        placed.excess(b)
+                        placed.container_excess(b)
                     ),
                 );
             }
@@ -887,11 +908,15 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
         // On each page, a parent's fragment encloses its children's.
         for child in enclosed(case, b) {
             for cf in &placed.fragments[child] {
+                // A child running past the foot is reported so already; the
+                // part on its page lies inside a parent fragment that
+                // reaches the foot.
                 let inside = frags.iter().any(|pf| {
+                    let bottom = pf.y.to_f32() + pf.height.to_f32();
                     pf.page_index == cf.page_index
                         && pf.y.to_f32() <= cf.y.to_f32() + EPS
-                        && cf.y.to_f32() + cf.height.to_f32()
-                            <= pf.y.to_f32() + pf.height.to_f32() + EPS
+                        && (cf.y.to_f32() + cf.height.to_f32() <= bottom + EPS
+                            || bottom >= page_height - EPS)
                 });
                 if inside {
                     continue;
