@@ -75,6 +75,11 @@ mod fix {
     pub const LINE_BOX: &str = "leading extent: lines measured from the line box";
     /// A table walker over row groups and rows.
     pub const TABLE_WALKER: &str = "table walker";
+    /// A row of boxes side by side (a flex or grid line, a table row)
+    /// fragmented as one unit, its items sharing its height: an item or
+    /// cell stretched past the page by a taller neighbour is placed, or
+    /// moved, whole.
+    pub const ROWS: &str = "rows side by side";
     /// One model of box edges (margin, border, padding) at a break.
     pub const EDGE_MODEL: &str = "edge model";
     /// No part of the fragmenter is named yet.
@@ -582,7 +587,7 @@ impl Placed<'_> {
                 )
             } else if within(self.case, b, &[Kind::Flex, Kind::Item]) {
                 (
-                    fix::LEADING_EXTENT,
+                    fix::ROWS,
                     "a box taller than a page in a flex item is not sliced",
                 )
             } else {
@@ -600,7 +605,7 @@ impl Placed<'_> {
         if within(self.case, b, &[Kind::Table]) {
             (fix::TABLE_WALKER, "a table box crosses the page foot")
         } else if within(self.case, b, &[Kind::Flex, Kind::Item]) {
-            (fix::LEADING_EXTENT, "a flex row crosses the page foot")
+            (fix::ROWS, "a flex row crosses the page foot")
         } else if info.edged || info.children.iter().any(|&c| self.case.boxes[c].edged) {
             (fix::EDGE_MODEL, "a box's edge crosses the page foot")
         } else {
@@ -896,7 +901,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 } else if within(case, child, &[Kind::Table]) {
                     (fix::TABLE_WALKER, "a table box is outside its parent")
                 } else if within(case, child, &[Kind::Flex, Kind::Item]) {
-                    (fix::LEADING_EXTENT, "a flex box is outside its parent")
+                    (fix::ROWS, "a flex box is outside its parent")
                 } else {
                     (fix::UNEXPLAINED, "a box is outside its parent")
                 };
@@ -932,9 +937,9 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::HeaderAlone,
                 *table,
                 Some(page),
-                fix::LEADING_EXTENT,
+                fix::ROWS,
                 format!(
-                    "{}'s header is alone: its first row places nothing on the page",
+                    "{}'s header is alone: its first row places nothing there, or moves on with a cell stretched past the page",
                     case.boxes[*table].id
                 ),
             );
