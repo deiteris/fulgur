@@ -3590,6 +3590,9 @@ fn fragment_block_subtree_inner(
         // run taller than a page, `avoid` is relaxed (rule 4): the walk
         // breaks where the content reaches the foot.
         let mut enter_for_kept_run = false;
+        // What an inline root's last lines keep below them on their page: the
+        // root's bottom edge and the run after it.
+        let mut inline_kept_after = 0.0_f32;
         if block_flow
             && opportunity != BreakValue::Avoid
             && let Some(line) = line_at[index]
@@ -3606,14 +3609,32 @@ fn fragment_block_subtree_inner(
             );
             let run = extent(flow, child, depth + 1) + kept;
             if kept > 0.0 && child_page_y + run > page_height_px {
-                if matches!(kind, BoxKind::BlockFlow) {
-                    enter_for_kept_run = true;
-                } else if !cursor.at_page_top() && run <= page_height_px + 1.0 {
-                    cursor.close_parent_once(geometry, ParentHeight::Placed);
-                    cursor.advance();
-                    cursor.page_taffy_origin = this_top_in_parent;
-                    child_page_y = 0.0;
-                    cursor.entered_below_content = false;
+                match &kind {
+                    BoxKind::BlockFlow => enter_for_kept_run = true,
+                    // A paragraph keeps only its trailing unit, its last
+                    // `widows` lines, with the run: `avoid` forbids the break
+                    // after it, not those between its lines
+                    // ([`fragment_inline_root`]).
+                    BoxKind::InlineRoot { lines, limits } if lines.len() > 1 => {
+                        let below = (child_h - lines[lines.len() - 1].1).max(0.0) + kept;
+                        let first = lines.len().saturating_sub(limits.widows.max(1));
+                        let trailing = lines[lines.len() - 1].1 - lines[first].0;
+                        if trailing + below <= page_height_px + 1.0 {
+                            inline_kept_after = below;
+                        }
+                    }
+                    BoxKind::Monolithic(_) | BoxKind::InlineRoot { .. } => {
+                        if !cursor.at_page_top() && run <= page_height_px + 1.0 {
+                            cursor.close_parent_once(geometry, ParentHeight::Placed);
+                            cursor.advance();
+                            cursor.page_taffy_origin = this_top_in_parent;
+                            child_page_y = 0.0;
+                            cursor.entered_below_content = false;
+                        }
+                    }
+                    // A table's rows and a flex or grid container's lines are
+                    // the table walker's: no run moves them yet.
+                    BoxKind::Table { .. } | BoxKind::Parallel { .. } => {}
                 }
             }
         }
@@ -3755,6 +3776,7 @@ fn fragment_block_subtree_inner(
                 &mut paragraph,
                 line_metrics,
                 limits,
+                inline_kept_after,
             );
             let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
             cursor.page_has_content = paragraph.page_has_content;
@@ -4490,6 +4512,10 @@ fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Op
 ///   relaxed and the break goes after the lines that fit.
 ///
 /// `limits` are the paragraph's `orphans` and `widows` ([`line_limits`]).
+/// `kept_after` is what its last line keeps below it on its page, its
+/// bottom edge and the boxes an `avoid` after it joins it to: the last line
+/// fits only with that room left, so the paragraph splits before its last
+/// `widows` lines rather than leave them parted from the run.
 ///
 /// Once the next page would be `MAX_PAGES` the walk stops breaking and
 /// the rest of the paragraph accumulates into the final fragment.
@@ -4512,6 +4538,7 @@ fn fragment_inline_root(
     cursor: &mut PageCursor,
     line_metrics: &[(f32, f32)],
     limits: LineLimits,
+    kept_after: f32,
 ) -> usize {
     if line_metrics.is_empty() {
         return 0;
@@ -4536,7 +4563,12 @@ fn fragment_inline_root(
         // which feeds `implied_page_count`, driving per-page allocation and
         // rendering — can grow unbounded with the line count instead of
         // being clamped.
-        if projected_bottom_in_body <= page_height_px || cursor.page_index + 1 >= crate::MAX_PAGES {
+        let room = if i + 1 == total_lines {
+            page_height_px - kept_after
+        } else {
+            page_height_px
+        };
+        if projected_bottom_in_body <= room || cursor.page_index + 1 >= crate::MAX_PAGES {
             i += 1;
             continue;
         }
@@ -6618,6 +6650,7 @@ mod tests {
             &mut cursor,
             lines,
             limits,
+            0.0,
         );
         (cursor.page_index, cursor.cursor_y, emitted)
     }
@@ -11786,6 +11819,32 @@ h2 { string-set: chapter-title content(text); }
         );
         let nested = r#"<section><div style="height: 150px"></div><h2 id="h">H</h2></section><p id="n">N</p>"#;
         assert_eq!(page("h2 { break-after: avoid }", nested), moved, "nested");
+    }
+
+    /// A paragraph that avoids a break after it keeps only its last
+    /// `widows` lines with the block after it (css-break-3 §4.4 forbids the
+    /// break after it, not those between its lines): eight 20 px lines from
+    /// y 100 of a 300 px page, before a 60 px block that does not fit, leave
+    /// six lines there and take two to the next page with the block. The
+    /// paragraph moved whole and left 200 px of the page blank.
+    #[test]
+    fn a_paragraph_avoiding_a_break_after_it_keeps_only_its_last_lines_with_its_successor() {
+        let html = r#"<html><body style="margin: 0; padding: 0; line-height: 20px">
+              <div style="height: 100px"></div>
+              <p id="p" style="margin: 0; break-after: avoid">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8</p>
+              <div id="n" style="height: 60px"></div>
+            </body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 300.0_f32.as_px(), &table);
+        assert_eq!(
+            (placements(&doc, &geom, "p"), placements(&doc, &geom, "n")),
+            (vec![(0, 100.0), (1, 0.0)], vec![(1, 40.0)])
+        );
+        assert_eq!(
+            geom[&find_by_id(&doc, "p").unwrap()].line_boundaries,
+            [0, 6, 8]
+        );
     }
 
     /// No break opportunity lies inside an atomic inline (css-break-3 §4.1):
