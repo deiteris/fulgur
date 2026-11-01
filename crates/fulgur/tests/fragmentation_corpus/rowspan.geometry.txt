@@ -1,9 +1,9 @@
 html[1]/body[1] page=0 x=0.00 y=0.00 w=200.00 h=190.00
 html[1]/body[1]/div[1] page=0 x=0.00 y=0.00 w=200.00 h=50.00
-html[1]/body[1]/table#t[3] page=0 x=0.00 y=50.00 w=120.00 h=70.00
+html[1]/body[1]/table#t[3] page=0 x=0.00 y=50.00 w=120.00 h=40.00
 html[1]/body[1]/table#t[3] page=1 x=0.00 y=0.00 w=120.00 h=80.00
 html[1]/body[1]/table#t[3]/tbody[0]/tr[1]/td#r1a[0] page=0 x=0.00 y=50.00 w=56.00 h=20.00
-html[1]/body[1]/table#t[3]/tbody[0]/tr[1]/td#span[1] page=0 x=56.00 y=50.00 w=64.00 h=70.00
+html[1]/body[1]/table#t[3]/tbody[0]/tr[1]/td#span[1] page=0 x=56.00 y=50.00 w=64.00 h=20.00
 html[1]/body[1]/table#t[3]/tbody[0]/tr[1]/td#span[1]/div[0] page=0 x=56.00 y=50.00 w=64.00 h=70.00
 html[1]/body[1]/table#t[3]/tbody[0]/tr[3]/td#r2a[0] page=0 x=0.00 y=70.00 w=56.00 h=20.00
 html[1]/body[1]/table#t[3]/tbody[0]/tr[5]/td#r3a[0] page=1 x=0.00 y=0.00 w=56.00 h=20.00
