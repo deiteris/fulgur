@@ -17,10 +17,11 @@
 //! its seed, and are laid out in Noto Sans with no system font, so they are
 //! the same on every host. `invariants.known.txt` beside this file is the
 //! reviewed golden of today's violations: one line per seed, invariant,
-//! box, and page, with a note naming the part of the fragmenter expected
-//! to fix it. The test fails on any violation the golden lacks and on any
+//! box, and page, with a note, written by hand, stating its cause where it
+//! was traced. The test fails on any violation the golden lacks and on any
 //! it lists that no longer occurs, naming each.
-//! `FRAGMENT_INVARIANT_UPDATE=1` rewrites the golden and still fails,
+//! `FRAGMENT_INVARIANT_UPDATE=1` rewrites the golden, keeping the note of
+//! each line it keeps and writing each new line with none, and still fails,
 //! listing every violation it added and removed, so no rewrite passes
 //! unread. `FRAGMENT_INVARIANT_CASES=<n>` checks more seeds than the
 //! default (the golden covers the default ones), and
@@ -75,29 +76,6 @@ enum Invariant {
     /// bottom edges there, or the page foot on a page the line continues
     /// past.
     EndsWithLine,
-}
-
-/// The part of the fragmenter expected to fix a violation, as the golden's
-/// note names it.
-mod fix {
-    /// One page cursor: one rule for a parent's fragment on each page.
-    pub const PAGE_CURSOR: &str = "page cursor";
-    /// One measure of a box's leading unbreakable extent, lines included.
-    pub const LEADING_EXTENT: &str = "leading extent";
-    /// Lines measured from the line box (baseline and line height), not
-    /// the shaper's selection box.
-    pub const LINE_BOX: &str = "leading extent: lines measured from the line box";
-    /// A table walker over row groups and rows.
-    pub const TABLE_WALKER: &str = "table walker";
-    /// A row of boxes side by side (a flex or grid line, a table row)
-    /// fragmented as one unit, its items sharing its height: an item or
-    /// cell stretched past the page by a taller neighbour is placed, or
-    /// moved, whole.
-    pub const ROWS: &str = "rows side by side";
-    /// One model of box edges (margin, border, padding) at a break.
-    pub const EDGE_MODEL: &str = "edge model";
-    /// No part of the fragmenter is named yet.
-    pub const UNEXPLAINED: &str = "unexplained";
 }
 
 /// A generated box's `break-before` or `break-after`.
@@ -361,8 +339,6 @@ struct Info {
     in_header: bool,
     /// The paragraph's line count.
     lines: usize,
-    /// The box has a margin, a border, or padding.
-    edged: bool,
     /// The top padding a table cell repeats on each page it continues on.
     repeated_edge: f32,
     /// The rows a table cell spans.
@@ -395,11 +371,6 @@ struct Case {
     boxes: Vec<Info>,
     /// Each table's index, with its header cells and body cells.
     tables: Vec<(usize, Vec<usize>, Vec<usize>)>,
-}
-
-/// Whether `style` gives its box a margin, a border, or padding.
-fn has_edges(style: &BoxStyle) -> bool {
-    style.margin_top > 0 || style.margin_bottom > 0 || style.padding > 0 || style.border > 0
 }
 
 fn style_css(style: &BoxStyle) -> String {
@@ -469,7 +440,6 @@ impl Case {
             children: Vec::new(),
             in_header,
             lines,
-            edged: false,
             repeated_edge: 0.0,
             rowspan: 1,
             margin_bottom: 0.0,
@@ -484,7 +454,6 @@ impl Case {
     /// Record the edges `style` gives the box `b`.
     fn edges(&mut self, b: usize, style: &BoxStyle) {
         let info = &mut self.boxes[b];
-        info.edged = has_edges(style);
         info.margin_bottom = f32::from(style.margin_bottom);
         info.bottom_edge = f32::from(style.padding) + f32::from(style.border);
     }
@@ -594,7 +563,6 @@ impl Case {
                     let _ = write!(out, r#"<tr id="b{r}" style="{row_style}">"#);
                     for (column, cell) in cells.iter().enumerate() {
                         let c = self.add(Kind::BodyCell, Some(r), in_header, 0);
-                        self.boxes[c].edged = *cell_padding > 0;
                         self.boxes[c].repeated_edge = f32::from(*cell_padding);
                         self.boxes[c].bottom_edge = f32::from(*cell_padding);
                         body.push(c);
@@ -673,8 +641,6 @@ struct Violation {
     box_id: String,
     /// The page the violation is on; `None` for a box placed nowhere.
     page: Option<u32>,
-    /// The part of the fragmenter expected to fix it ([`fix`]).
-    note: &'static str,
     /// What broke, for a reader.
     what: String,
 }
@@ -742,26 +708,6 @@ fn table_lines(case: &Case, table: usize) -> Vec<Vec<usize>> {
         spanned = cells.iter().any(|&c| case.boxes[c].rowspan > 1);
     }
     lines
-}
-
-/// Whether `b`, or a box around it, is of one of `kinds`.
-fn within(case: &Case, b: usize, kinds: &[Kind]) -> bool {
-    let mut at = Some(b);
-    while let Some(k) = at {
-        if kinds.contains(&case.boxes[k].kind) {
-            return true;
-        }
-        at = case.boxes[k].parent;
-    }
-    false
-}
-
-/// Whether a paragraph in `b`'s subtree measures its lines past its box.
-fn overmeasured_paragraph_in(placed: &Placed<'_>, b: usize) -> bool {
-    placed.case.boxes[b].children.iter().any(|&c| {
-        (placed.case.boxes[c].kind == Kind::Para && placed.excess(c) > EPS)
-            || overmeasured_paragraph_in(placed, c)
-    })
 }
 
 /// `(page, y)` ordered with a tolerance: whether `a` lies before `b` by
@@ -1022,24 +968,6 @@ impl Placed<'_> {
         (paged - layout).max(0.0)
     }
 
-    /// Why `b`'s fragments add up past its height ([`Self::cause`]): a split
-    /// table cell's by no more than the top padding it repeats on each page
-    /// it continues on, for want of one edge model.
-    fn excess_cause(&self, b: usize) -> (&'static str, &'static str) {
-        let info = &self.case.boxes[b];
-        let continued = self.fragments[b].len().saturating_sub(1) as f32;
-        if info.repeated_edge > 0.0
-            && continued > 0.0
-            && self.container_excess(b) <= info.repeated_edge * continued + EPS
-        {
-            return (
-                fix::EDGE_MODEL,
-                "a split cell repeats its top padding on each page it continues on",
-            );
-        }
-        self.cause(b)
-    }
-
     /// Where `b`'s fragment `k` ends as [`Self::container_excess`] counts
     /// it: a container's fragment before its last that reaches the page
     /// foot ends at the lowest of its children's fragments on its page,
@@ -1077,63 +1005,6 @@ impl Placed<'_> {
             (content + self.case.boxes[b].repeated_edge).min(bottom)
         } else {
             content
-        }
-    }
-
-    /// The part of the fragmenter expected to fix `b`'s fragments past the
-    /// page foot, or adding up past its height, and why.
-    fn cause(&self, b: usize) -> (&'static str, &'static str) {
-        let info = &self.case.boxes[b];
-        let frags = &self.fragments[b];
-        if info.kind == Kind::Para && frags.len() > 1 && self.excess(b) > EPS {
-            return (
-                fix::LINE_BOX,
-                "a split paragraph's lines measure taller than its layout box",
-            );
-        }
-        if frags.len() > 1 && (frags[0].height.to_f32() - self.layout_height[b]).abs() < EPS {
-            return (
-                fix::PAGE_CURSOR,
-                "a split box's first fragment is its whole height",
-            );
-        }
-        if info.kind == Kind::Leaf
-            && frags.len() == 1
-            && self.layout_height[b] > self.page_height + EPS
-        {
-            return if within(self.case, b, &[Kind::Table]) {
-                (
-                    fix::TABLE_WALKER,
-                    "a box taller than a page in a table cell is not sliced",
-                )
-            } else if within(self.case, b, &[Kind::Flex, Kind::Item]) {
-                (
-                    fix::ROWS,
-                    "a box taller than a page in a flex item is not sliced",
-                )
-            } else {
-                (
-                    fix::LEADING_EXTENT,
-                    "a box taller than a page entered below the page foot is not sliced",
-                )
-            };
-        }
-        for child in enclosed(self.case, b) {
-            if !self.past[child].is_disjoint(&self.past[b]) || self.excess(child) > EPS {
-                return self.cause(child);
-            }
-        }
-        if within(self.case, b, &[Kind::Table]) {
-            (fix::TABLE_WALKER, "a table box crosses the page foot")
-        } else if within(self.case, b, &[Kind::Flex, Kind::Item]) {
-            (fix::ROWS, "a flex row crosses the page foot")
-        } else if info.edged || info.children.iter().any(|&c| self.case.boxes[c].edged) {
-            (fix::EDGE_MODEL, "a box's edge crosses the page foot")
-        } else {
-            (
-                fix::PAGE_CURSOR,
-                "a parent's fragment reaches past its content",
-            )
         }
     }
 }
@@ -1178,12 +1049,11 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
         past,
     };
     let mut out = Vec::new();
-    let mut push = |invariant, b: usize, page: Option<u32>, note, what: String| {
+    let mut push = |invariant, b: usize, page: Option<u32>, what: String| {
         out.push(Violation {
             invariant,
             box_id: case.boxes[b].id.clone(),
             page,
-            note,
             what,
         });
     };
@@ -1194,16 +1064,11 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
         // No fragment ends past the page foot, except a monolithic box
         // taller than a page.
         for &page in &placed.past[b] {
-            let (note, why) = placed.cause(b);
             push(
                 Invariant::PastFoot,
                 b,
                 Some(page),
-                note,
-                format!(
-                    "{} ({:?}) ends past the page foot: {why}",
-                    info.id, info.kind
-                ),
+                format!("{} ({:?}) ends past the page foot", info.id, info.kind),
             );
         }
 
@@ -1213,7 +1078,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::PlacedOnce,
                 b,
                 Some(f.page_index),
-                fix::UNEXPLAINED,
                 format!("{} starts above the page top, at {}", info.id, f.y.to_f32()),
             );
         }
@@ -1229,7 +1093,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::PlacedOnce,
                 b,
                 None,
-                fix::UNEXPLAINED,
                 format!("{} ({:?}) is not placed", info.id, info.kind),
             );
         }
@@ -1243,7 +1106,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pair[1]),
-                        fix::UNEXPLAINED,
                         format!("{} is placed twice or out of order: {pages:?}", info.id),
                     );
                 } else if pair[1] > pair[0] + 1 {
@@ -1251,7 +1113,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pair[0] + 1),
-                        fix::UNEXPLAINED,
                         format!("{} skips a page: {pages:?}", info.id),
                     );
                 }
@@ -1265,7 +1126,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pages[0]),
-                        fix::UNEXPLAINED,
                         format!(
                             "{}'s fragments add up to {excess} px more than its height",
                             info.id
@@ -1288,7 +1148,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pages[0]),
-                        fix::UNEXPLAINED,
                         format!(
                             "{} partitions {} lines as {boundaries:?} over {} fragments",
                             info.id,
@@ -1301,14 +1160,16 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             Kind::Block | Kind::Table | Kind::BodyCell | Kind::Flex | Kind::Item
                 if placed.container_excess(b) > EPS * frags.len().max(1) as f32 =>
             {
-                let (note, why) = placed.excess_cause(b);
+                // A cell's top padding, as it repeats on each page the cell
+                // continues on, for whoever reads the case.
+                let repeated = info.repeated_edge * frags.len().saturating_sub(1) as f32;
                 push(
                     Invariant::PlacedOnce,
                     b,
                     Some(pages[0]),
-                    note,
                     format!(
-                        "{} ({:?})'s fragments add up to {} px more than its height: {why}",
+                        "{} ({:?})'s fragments add up to {} px more than its height \
+                         (its top padding on the pages it continues on: {repeated} px)",
                         info.id,
                         info.kind,
                         placed.container_excess(b)
@@ -1343,26 +1204,12 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             let a_end = (last.page_index, last.y.to_f32() + last.height.to_f32());
             let c_start = (first.page_index, first.y.to_f32());
             if before(c_start, a_end) {
-                let (note, why) = if case.boxes[a].kind == Kind::Para && placed.excess(a) > EPS {
-                    (
-                        fix::LINE_BOX,
-                        "the paragraph before it measures its lines past its box",
-                    )
-                } else if overmeasured_paragraph_in(&placed, a) {
-                    (
-                        fix::LINE_BOX,
-                        "a paragraph in the box before it measures its lines past its box",
-                    )
-                } else {
-                    (fix::UNEXPLAINED, "it starts before the box before it ends")
-                };
                 push(
                     Invariant::DocumentOrder,
                     c,
                     Some(first.page_index),
-                    note,
                     format!(
-                        "{} starts at {c_start:?}, before {} ends at {a_end:?}: {why}",
+                        "{} starts at {c_start:?}, before {} ends at {a_end:?}",
                         case.boxes[c].id, case.boxes[a].id
                     ),
                 );
@@ -1400,7 +1247,6 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::DocumentOrder,
                         pair[1],
                         Some(c_start.0),
-                        fix::TABLE_WALKER,
                         format!(
                             "row {} starts at {c_start:?}, before row {} ends at {a_end:?}",
                             case.boxes[pair[1]].id, case.boxes[pair[0]].id
@@ -1430,22 +1276,12 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 if inside {
                     continue;
                 }
-                let (note, why) = if !placed.past[child].is_empty() || placed.excess(child) > EPS {
-                    placed.cause(child)
-                } else if within(case, child, &[Kind::Table]) {
-                    (fix::TABLE_WALKER, "a table box is outside its parent")
-                } else if within(case, child, &[Kind::Flex, Kind::Item]) {
-                    (fix::ROWS, "a flex box is outside its parent")
-                } else {
-                    (fix::UNEXPLAINED, "a box is outside its parent")
-                };
                 push(
                     Invariant::Encloses,
                     child,
                     Some(cf.page_index),
-                    note,
                     format!(
-                        "{} ({:?}) at y {} h {} is outside {} ({:?}): {why}",
+                        "{} ({:?}) at y {} h {} is outside {} ({:?})",
                         case.boxes[child].id,
                         case.boxes[child].kind,
                         cf.y.to_f32(),
@@ -1471,24 +1307,14 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::HeaderAlone,
                 *table,
                 Some(page),
-                fix::ROWS,
-                format!(
-                    "{}'s header is alone: its first row places nothing there, or moves on with a cell stretched past the page",
-                    case.boxes[*table].id
-                ),
+                format!("{}'s header is alone", case.boxes[*table].id),
             );
         }
     }
 
     // A line's item stretched to the line ends with it on each page.
     for (item, page, what) in placed.past_line_end() {
-        push(
-            Invariant::EndsWithLine,
-            item,
-            Some(page),
-            fix::UNEXPLAINED,
-            what,
-        );
+        push(Invariant::EndsWithLine, item, Some(page), what);
     }
     out
 }
@@ -1556,7 +1382,7 @@ fn describe(seed: u64) -> String {
     let found = check(&case, f32::from(page));
     let mut text = format!("seed {seed}, page {page} px\n{}\n", case.html);
     for v in &found {
-        let _ = writeln!(text, "  {} ({}): {}", v.key(), v.note, v.what);
+        let _ = writeln!(text, "  {}: {}", v.key(), v.what);
     }
     let invariants: BTreeSet<Invariant> = found.iter().map(|v| v.invariant).collect();
     for invariant in invariants {
@@ -1569,7 +1395,7 @@ fn describe(seed: u64) -> String {
         );
         for v in check(&case, f32::from(page)) {
             if v.invariant == invariant {
-                let _ = writeln!(text, "  {} ({}): {}", v.key(), v.note, v.what);
+                let _ = writeln!(text, "  {}: {}", v.key(), v.what);
             }
         }
         let (doc, geometry) = layout(&case, f32::from(page));
@@ -1578,8 +1404,8 @@ fn describe(seed: u64) -> String {
     text
 }
 
-/// The golden's lines: `<seed> <invariant> <box> <page>  # <note>`, as
-/// `(seed, key)` with the note.
+/// The golden's lines: `<seed> <invariant> <box> <page>`, then
+/// `  # <note>` when the line has one, as `(seed, key)` with the note.
 fn golden_lines(text: &str) -> BTreeMap<(u64, String), String> {
     text.lines()
         .map(str::trim)
@@ -1603,13 +1429,23 @@ fn golden_text(found: &BTreeMap<(u64, String), String>) -> String {
     let mut text = String::from(
         "# The fragmenter's invariant violations over the default seeds\n\
          # (`invariants.rs`): seed, invariant, box, page (`-` when the box is\n\
-         # placed nowhere), then the part of the fragmenter expected to fix it.\n\
-         # Rewrite with FRAGMENT_INVARIANT_UPDATE=1 and review every line.\n",
+         # placed nowhere), then, where it was traced, its cause, written by\n\
+         # hand. Rewrite with FRAGMENT_INVARIANT_UPDATE=1, which keeps the note\n\
+         # of each line it keeps, and review every line.\n",
     );
     for ((seed, key), note) in found {
-        let _ = writeln!(text, "{seed} {key}  # {note}");
+        let _ = writeln!(text, "{}", golden_line(*seed, key, note));
     }
     text
+}
+
+/// One line of the golden, its note left out when it has none.
+fn golden_line(seed: u64, key: &str, note: &str) -> String {
+    if note.is_empty() {
+        format!("{seed} {key}")
+    } else {
+        format!("{seed} {key}  # {note}")
+    }
 }
 
 /// A 10 px wide fragment on page `page_index`, for the checks' own tests.
@@ -1747,25 +1583,28 @@ fn generated_box_trees_keep_the_fragmenter_invariants() {
         return;
     }
     let cases = env_u64("FRAGMENT_INVARIANT_CASES").unwrap_or(CASES);
-    let mut found = BTreeMap::new();
-    for seed in 0..cases {
-        for v in violations(seed) {
-            found.entry((seed, v.key())).or_insert(v.note.to_string());
-        }
-    }
     let known: BTreeMap<(u64, String), String> = golden_lines(KNOWN)
         .into_iter()
         .filter(|((seed, _), _)| *seed < cases)
         .collect();
+    // Each violation found, with the golden's note of it.
+    let mut found = BTreeMap::new();
+    for seed in 0..cases {
+        for v in violations(seed) {
+            let line = (seed, v.key());
+            let note = known.get(&line).cloned().unwrap_or_default();
+            found.insert(line, note);
+        }
+    }
     let mut report = String::new();
     for ((seed, key), note) in &found {
         if !known.contains_key(&(*seed, key.clone())) {
-            let _ = writeln!(report, "added: {seed} {key}  # {note}");
+            let _ = writeln!(report, "added: {}", golden_line(*seed, key, note));
         }
     }
     for ((seed, key), note) in &known {
         if !found.contains_key(&(*seed, key.clone())) {
-            let _ = writeln!(report, "removed: {seed} {key}  # {note}");
+            let _ = writeln!(report, "removed: {}", golden_line(*seed, key, note));
         }
     }
     if std::env::var_os("FRAGMENT_INVARIANT_UPDATE").is_some() {

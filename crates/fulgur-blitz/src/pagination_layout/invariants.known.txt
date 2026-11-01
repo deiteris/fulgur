@@ -1,90 +1,91 @@
 # The fragmenter's invariant violations over the default seeds
 # (`invariants.rs`): seed, invariant, box, page (`-` when the box is
-# placed nowhere), then the part of the fragmenter expected to fix it.
-# Rewrite with FRAGMENT_INVARIANT_UPDATE=1 and review every line.
-5 Encloses b7 0  # table walker
-5 PlacedOnce b10 4  # edge model
-5 PlacedOnce b13 6  # edge model
-5 PlacedOnce b16 9  # edge model
-5 PlacedOnce b19 12  # edge model
-5 PlacedOnce b22 15  # edge model
-5 PlacedOnce b25 18  # edge model
-5 PlacedOnce b28 22  # edge model
-5 PlacedOnce b7 0  # edge model
-9 PastFoot b4 0  # page cursor
-9 PastFoot b5 0  # page cursor
-29 PastFoot b5 2  # edge model
-30 EndsWithLine b1 1  # unexplained
-30 EndsWithLine b3 1  # unexplained
-43 PlacedOnce b10 3  # edge model
-51 PlacedOnce b15 5  # edge model
-51 PlacedOnce b6 0  # edge model
-51 PlacedOnce b9 2  # edge model
-60 Encloses b11 0  # table walker
-60 Encloses b9 0  # table walker
-60 PlacedOnce b11 0  # edge model
-60 PlacedOnce b19 6  # edge model
-60 PlacedOnce b9 0  # edge model
-65 PlacedOnce b24 4  # edge model
-72 Encloses b11 2  # rows side by side
-73 PlacedOnce b0 0  # page cursor
-73 PlacedOnce b15 4  # page cursor
-73 PlacedOnce b25 5  # edge model
-73 PlacedOnce b7 0  # edge model
-74 PlacedOnce b13 2  # edge model
-84 PastFoot b0 0  # edge model
-87 PastFoot b16 7  # table walker
-87 PlacedOnce b14 7  # table walker
-87 PlacedOnce b20 7  # edge model
-89 Encloses b6 0  # table walker
-89 Encloses b8 0  # table walker
-89 PastFoot b6 0  # table walker
-89 PlacedOnce b0 0  # page cursor
-90 PastFoot b15 6  # table walker
-94 PastFoot b10 6  # leading extent
-94 PastFoot b6 6  # leading extent
-94 PastFoot b9 6  # leading extent
-94 PlacedOnce b4 0  # edge model
-100 PlacedOnce b11 3  # edge model
-105 PlacedOnce b5 3  # edge model
-107 PastFoot b0 0  # edge model
-121 PlacedOnce b15 3  # edge model
-121 PlacedOnce b9 0  # edge model
-123 PlacedOnce b19 4  # edge model
-124 PlacedOnce b13 4  # edge model
-128 PlacedOnce b12 1  # edge model
-130 PlacedOnce b8 1  # edge model
-150 PlacedOnce b15 0  # edge model
-153 PlacedOnce b11 3  # edge model
-153 PlacedOnce b14 7  # edge model
-153 PlacedOnce b4 1  # edge model
-154 PlacedOnce b11 6  # edge model
-154 PlacedOnce b5 1  # edge model
-154 PlacedOnce b8 3  # edge model
-159 PlacedOnce b0 0  # page cursor
-160 PastFoot b16 5  # edge model
-164 PastFoot b14 5  # edge model
-172 PlacedOnce b2 0  # edge model
-174 PastFoot b10 4  # table walker
-174 PastFoot b8 3  # table walker
-174 PlacedOnce b12 4  # edge model
-174 PlacedOnce b15 5  # edge model
-174 PlacedOnce b7 4  # table walker
-177 PlacedOnce b14 0  # edge model
-184 PlacedOnce b6 0  # edge model
-190 EndsWithLine b12 2  # unexplained
-190 EndsWithLine b14 2  # unexplained
-198 PlacedOnce b2 0  # edge model
-201 PlacedOnce b11 4  # edge model
-201 PlacedOnce b2 0  # edge model
-207 PlacedOnce b11 3  # edge model
-207 PlacedOnce b8 1  # edge model
-216 PastFoot b9 1  # table walker
-217 PastFoot b9 5  # edge model
-242 PlacedOnce b23 3  # edge model
-242 PlacedOnce b5 1  # page cursor
-245 PlacedOnce b4 0  # edge model
-249 PlacedOnce b10 0  # edge model
-250 Encloses b16 0  # table walker
-250 Encloses b18 0  # table walker
-250 PlacedOnce b11 0  # page cursor
+# placed nowhere), then, where it was traced, its cause, written by
+# hand. Rewrite with FRAGMENT_INVARIANT_UPDATE=1, which keeps the note
+# of each line it keeps, and review every line.
+5 Encloses b7 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+5 PlacedOnce b10 4  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b13 6  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b16 9  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b19 12  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b22 15  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b25 18  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b28 22  # edge model: a split cell repeats its top padding on each page it continues on
+5 PlacedOnce b7 0  # edge model: a split cell repeats its top padding on each page it continues on
+9 PastFoot b4 0  # floats: a float crossing the page foot is placed whole while the paragraph beside it moves on
+9 PastFoot b5 0  # floats: a float crossing the page foot is placed whole while the paragraph beside it moves on
+29 PastFoot b5 2  # fit tolerance: a box 1 px taller than the room left is placed whole
+30 EndsWithLine b1 1  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
+30 EndsWithLine b3 1  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
+43 PlacedOnce b10 3  # edge model: a split cell repeats its top padding on each page it continues on
+51 PlacedOnce b15 5  # edge model: a split cell repeats its top padding on each page it continues on
+51 PlacedOnce b6 0  # edge model: a split cell repeats its top padding on each page it continues on
+51 PlacedOnce b9 2  # edge model: a split cell repeats its top padding on each page it continues on
+60 Encloses b11 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+60 Encloses b9 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+60 PlacedOnce b11 0  # edge model: a split cell repeats its top padding on each page it continues on
+60 PlacedOnce b19 6  # edge model: a split cell repeats its top padding on each page it continues on
+60 PlacedOnce b9 0  # edge model: a split cell repeats its top padding on each page it continues on
+65 PlacedOnce b24 4  # edge model: a split cell repeats its top padding on each page it continues on
+72 Encloses b11 2  # floats: a block opened by a float leaves an empty fragment on the page the float moves from
+73 PlacedOnce b0 0  # edge model: a split table repeats its top border or padding on each page it continues on
+73 PlacedOnce b15 4  # edge model: a split table repeats its top border or padding on each page it continues on
+73 PlacedOnce b25 5  # edge model: a split cell repeats its top padding on each page it continues on
+73 PlacedOnce b7 0  # edge model: a split cell repeats its top padding on each page it continues on
+74 PlacedOnce b13 2  # edge model: a split cell repeats its top padding on each page it continues on
+84 PastFoot b0 0  # edge model: a parent's fragment keeps the top margin of the child that moves to the next page, past the foot
+87 PastFoot b16 7  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+87 PlacedOnce b14 7  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+87 PlacedOnce b20 7  # edge model: a split cell repeats its top padding on each page it continues on
+89 Encloses b6 0  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+89 Encloses b8 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+89 PastFoot b6 0  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+89 PlacedOnce b0 0  # edge model: a split table repeats its top border or padding on each page it continues on
+90 PastFoot b15 6  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+94 PastFoot b10 6  # fit tolerance: a box 1 px taller than the room left is placed whole
+94 PastFoot b6 6  # fit tolerance: a box 1 px taller than the room left is placed whole
+94 PastFoot b9 6  # fit tolerance: a box 1 px taller than the room left is placed whole
+94 PlacedOnce b4 0  # edge model: a split cell repeats its top padding on each page it continues on
+100 PlacedOnce b11 3  # edge model: a split cell repeats its top padding on each page it continues on
+105 PlacedOnce b5 3  # edge model: a split cell repeats its top padding on each page it continues on
+107 PastFoot b0 0  # fit tolerance: a box 1 px taller than the room left is placed whole
+121 PlacedOnce b15 3  # edge model: a split cell repeats its top padding on each page it continues on
+121 PlacedOnce b9 0  # edge model: a split cell repeats its top padding on each page it continues on
+123 PlacedOnce b19 4  # edge model: a split cell repeats its top padding on each page it continues on
+124 PlacedOnce b13 4  # edge model: a split cell repeats its top padding on each page it continues on
+128 PlacedOnce b12 1  # edge model: a split cell repeats its top padding on each page it continues on
+130 PlacedOnce b8 1  # edge model: a split cell repeats its top padding on each page it continues on
+150 PlacedOnce b15 0  # edge model: a split cell repeats its top padding on each page it continues on
+153 PlacedOnce b11 3  # edge model: a split cell repeats its top padding on each page it continues on
+153 PlacedOnce b14 7  # edge model: a split cell repeats its top padding on each page it continues on
+153 PlacedOnce b4 1  # edge model: a split cell repeats its top padding on each page it continues on
+154 PlacedOnce b11 6  # edge model: a split cell repeats its top padding on each page it continues on
+154 PlacedOnce b5 1  # edge model: a split cell repeats its top padding on each page it continues on
+154 PlacedOnce b8 3  # edge model: a split cell repeats its top padding on each page it continues on
+159 PlacedOnce b0 0  # edge model: a split table repeats its top border or padding on each page it continues on
+160 PastFoot b16 5  # edge model: a parent's fragment keeps its last child's bottom margin at the break, past the foot
+164 PastFoot b14 5  # edge model: a parent's fragment keeps the top margin of the child that moves to the next page, past the foot
+172 PlacedOnce b2 0  # edge model: a split cell repeats its top padding on each page it continues on
+174 PastFoot b10 4  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+174 PastFoot b8 3  # table walker: a caption at the page foot stays there, past it, while its table starts on the next page
+174 PlacedOnce b12 4  # edge model: a split cell repeats its top padding on each page it continues on
+174 PlacedOnce b15 5  # edge model: a split cell repeats its top padding on each page it continues on
+174 PlacedOnce b7 4
+177 PlacedOnce b14 0  # edge model: a split cell repeats its top padding on each page it continues on
+184 PlacedOnce b6 0  # edge model: a split cell repeats its top padding on each page it continues on
+190 EndsWithLine b12 2  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
+190 EndsWithLine b14 2  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
+198 PlacedOnce b2 0  # edge model: a split cell repeats its top padding on each page it continues on
+201 PlacedOnce b11 4  # edge model: a split cell repeats its top padding on each page it continues on
+201 PlacedOnce b2 0  # edge model: a split cell repeats its top padding on each page it continues on
+207 PlacedOnce b11 3  # edge model: a split cell repeats its top padding on each page it continues on
+207 PlacedOnce b8 1  # edge model: a split cell repeats its top padding on each page it continues on
+216 PastFoot b9 1  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+217 PastFoot b9 5  # line measure: a paragraph is placed whole by its lines while its bottom padding runs past the foot
+242 PlacedOnce b23 3  # edge model: a split cell repeats its top padding on each page it continues on
+242 PlacedOnce b5 1  # edge model: a split table repeats its top border or padding on each page it continues on
+245 PlacedOnce b4 0  # edge model: a split cell repeats its top padding on each page it continues on
+249 PlacedOnce b10 0  # edge model: a split cell repeats its top padding on each page it continues on
+250 Encloses b16 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+250 Encloses b18 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
+250 PlacedOnce b11 0  # edge model: a split table repeats its top border or padding on each page it continues on
