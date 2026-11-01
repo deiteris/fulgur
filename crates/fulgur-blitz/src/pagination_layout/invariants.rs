@@ -587,7 +587,7 @@ impl Placed<'_> {
                 body.iter()
                     .map(|&row| self.line_growth(&self.case.boxes[row].children))
                     .sum::<f32>()
-                    + self.repeated_band(&header)
+                    + self.repeated_band(b, &header)
             }
             _ => 0.0,
         };
@@ -597,23 +597,27 @@ impl Placed<'_> {
             .sum::<f32>()
     }
 
-    /// The height of the header rows `header` repeat on the pages after
-    /// their table's first: each page they repeat on carries their band.
-    fn repeated_band(&self, header: &[usize]) -> f32 {
+    /// The height the header rows `header` of the table `table` repeat on
+    /// the pages after its first: each page of the table they are on
+    /// carries their band once. A header placed twice on one page repeats
+    /// on it once.
+    fn repeated_band(&self, table: usize, header: &[usize]) -> f32 {
+        let table_pages: BTreeSet<u32> =
+            self.fragments[table].iter().map(|f| f.page_index).collect();
         header
             .iter()
             .map(|&row| {
                 let cells = &self.case.boxes[row].children;
-                let repeats = cells
+                let pages: BTreeSet<u32> = cells
                     .iter()
-                    .map(|&c| self.fragments[c].len().saturating_sub(1))
-                    .max()
-                    .unwrap_or(0);
+                    .flat_map(|&c| self.fragments[c].iter().map(|f| f.page_index))
+                    .filter(|page| table_pages.contains(page))
+                    .collect();
                 let height = cells
                     .iter()
                     .map(|&c| self.layout_height[c])
                     .fold(0.0_f32, f32::max);
-                repeats as f32 * height
+                pages.len().saturating_sub(1) as f32 * height
             })
             .sum()
     }
@@ -1231,6 +1235,65 @@ fn golden_text(found: &BTreeMap<(u64, String), String>) -> String {
         let _ = writeln!(text, "{seed} {key}  # {note}");
     }
     text
+}
+
+/// A table's repeated header is counted once a page, however many times it
+/// is placed there: a header doubled on the table's second page leaves the
+/// table's excess one band past its repeat, as a placement the checks flag.
+#[test]
+fn a_header_placed_twice_on_one_page_is_counted_once() {
+    let case = Case::new(&[Gen::Table {
+        style: BoxStyle::default(),
+        thead: true,
+        cell_padding: 0,
+        rows: vec![(
+            false,
+            vec![Gen::Leaf {
+                style: BoxStyle::default(),
+                height: 120,
+            }],
+        )],
+    }]);
+    // b0 the table, b1 the header row, b2 its cell, b3 the body row, b4
+    // its cell, b5 the leaf: a 140 px table on 200 px pages.
+    let fragment = |page_index: u32, y: f32, height: f32| Fragment {
+        page_index,
+        x: 0.0_f32.as_px(),
+        y: y.as_px(),
+        width: 10.0_f32.as_px(),
+        height: height.as_px(),
+    };
+    let placed = |header: Vec<Fragment>, table: Vec<Fragment>| {
+        let mut fragments = vec![Vec::new(); case.boxes.len()];
+        fragments[0] = table;
+        fragments[2] = header;
+        fragments[4] = vec![fragment(0, 20.0, 80.0), fragment(1, 20.0, 40.0)];
+        fragments[5] = fragments[4].clone();
+        let layout_height = vec![140.0, 0.0, 20.0, 0.0, 120.0, 120.0];
+        Placed {
+            case: &case,
+            page_height: 200.0,
+            fragments,
+            line_boundaries: vec![Vec::new(); case.boxes.len()],
+            layout_height,
+            past: vec![BTreeSet::new(); case.boxes.len()],
+        }
+        .container_excess(0)
+    };
+    let once = vec![fragment(0, 0.0, 20.0), fragment(1, 0.0, 20.0)];
+    let twice = vec![
+        fragment(0, 0.0, 20.0),
+        fragment(1, 0.0, 20.0),
+        fragment(1, 20.0, 20.0),
+    ];
+    assert!(
+        placed(once, vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 60.0)]).abs() < EPS,
+        "one repeat, one band"
+    );
+    assert!(
+        placed(twice, vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 80.0)]) > EPS,
+        "a doubled header excuses no second band"
+    );
 }
 
 #[test]
