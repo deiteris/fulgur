@@ -26,6 +26,42 @@ use std::sync::Arc;
 
 use crate::MAX_DOM_DEPTH;
 
+/// The source text range of each glyph of `run`, in visual order. A ligature
+/// glyph carries its first character's cluster only; the characters it
+/// absorbs are glyphless continuation clusters beside it (after it in a
+/// left-to-right run, before it in a right-to-left one), so its range is
+/// widened over them and the glyph maps back to all of its text (`fi`, not
+/// `f`).
+fn glyph_text_ranges<B: parley::Brush>(run: &parley::Run<'_, B>) -> Vec<std::ops::Range<usize>> {
+    let rtl = run.is_rtl();
+    let mut ranges = Vec::new();
+    let mut group: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    let mut flush = |group: &mut Vec<(std::ops::Range<usize>, usize)>| {
+        let Some(range) = group
+            .iter()
+            .map(|(range, _)| range.clone())
+            .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
+        else {
+            return;
+        };
+        for (_, glyphs) in group.drain(..) {
+            ranges.extend(std::iter::repeat_n(range.clone(), glyphs));
+        }
+    };
+    for cluster in run.visual_clusters() {
+        let continuation = cluster.is_ligature_continuation();
+        if !rtl && !continuation {
+            flush(&mut group);
+        }
+        group.push((cluster.text_range(), cluster.glyphs().count()));
+        if rtl && !continuation {
+            flush(&mut group);
+        }
+    }
+    flush(&mut group);
+    ranges
+}
+
 mod block;
 mod inline_root;
 mod list_item;
@@ -1004,19 +1040,13 @@ fn shape_paragraph_glyph_runs(
                 }
                 let glyph_start = run_glyph_offset;
 
-                let mut annotated = run
-                    .visual_clusters()
-                    .flat_map(|cluster| {
-                        let r = cluster.text_range();
-                        cluster.glyphs().map(move |g| (r.clone(), g))
-                    })
-                    .skip(glyph_start);
+                let mut ranges = glyph_text_ranges(run).into_iter().skip(glyph_start);
 
                 let mut glyphs = Vec::new();
                 for g in glyph_run.glyphs() {
-                    let (text_range, _) = annotated.next().unwrap_or_else(|| {
+                    let text_range = ranges.next().unwrap_or_else(|| {
                         panic!(
-                            "annotated cluster iterator exhausted before glyph_run.glyphs(); \
+                            "text range iterator exhausted before glyph_run.glyphs(); \
                              run cluster_range={:?}, glyph_start={glyph_start}",
                             run.cluster_range()
                         )

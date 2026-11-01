@@ -214,19 +214,13 @@ pub(super) fn extract_marker_lines(
                 }
                 let glyph_start = run_glyph_offset;
 
-                let mut annotated = run
-                    .visual_clusters()
-                    .flat_map(|cluster| {
-                        let r = cluster.text_range();
-                        cluster.glyphs().map(move |g| (r.clone(), g))
-                    })
-                    .skip(glyph_start);
+                let mut ranges = super::glyph_text_ranges(run).into_iter().skip(glyph_start);
 
                 let mut glyphs = Vec::new();
                 for g in glyph_run.glyphs() {
-                    let (text_range, _) = annotated.next().unwrap_or_else(|| {
+                    let text_range = ranges.next().unwrap_or_else(|| {
                         panic!(
-                            "annotated cluster iterator exhausted before glyph_run.glyphs(); \
+                            "text range iterator exhausted before glyph_run.glyphs(); \
                              run cluster_range={:?}, glyph_start={glyph_start}",
                             run.cluster_range()
                         )

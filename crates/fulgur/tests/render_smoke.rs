@@ -7192,3 +7192,22 @@ fn test_render_non_srgb_color_spaces_smoke() {
         .expect("render non-sRGB colour spaces");
     assert!(!pdf.is_empty());
 }
+
+/// A glyph that shapes several characters (Noto Sans sets `fi` as one
+/// ligature glyph) maps to all of them in the font's ToUnicode CMap, so
+/// extracting the text reads `figure` and not `fgure`.
+#[test]
+fn test_ligature_glyph_maps_to_the_text_of_its_whole_cluster() {
+    let pdf = noto_engine()
+        .render("<html><body><p>figure</p></body></html>")
+        .expect("render");
+
+    let cmap = String::from_utf8_lossy(&pdf);
+    assert!(
+        cmap.contains("<00660069>"),
+        "the ToUnicode CMap has no entry mapping a glyph to `fi`"
+    );
+    if let Some(text) = extract_pdf_text(&pdf) {
+        assert_eq!(text.trim(), "figure");
+    }
+}

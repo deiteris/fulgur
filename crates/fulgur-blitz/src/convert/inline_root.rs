@@ -495,21 +495,15 @@ pub(super) fn extract_paragraph(
                     // Build (text_range, Glyph) pairs scoped to this GlyphRun.
                     // `glyph_run.glyphs()` = run.visual_clusters().flat_map(.glyphs())
                     //   .skip(glyph_start).take(glyph_count).
-                    // We replicate the same window on the annotated cluster sequence
+                    // We replicate the same window on the text range sequence
                     // and advance the offset counter by the number of glyphs consumed.
-                    let mut annotated = run
-                        .visual_clusters()
-                        .flat_map(|cluster| {
-                            let r = cluster.text_range();
-                            cluster.glyphs().map(move |g| (r.clone(), g))
-                        })
-                        .skip(glyph_start);
+                    let mut ranges = super::glyph_text_ranges(run).into_iter().skip(glyph_start);
 
                     let mut glyphs = Vec::new();
                     for g in glyph_run.glyphs() {
-                        let (text_range, _) = annotated.next().unwrap_or_else(|| {
+                        let text_range = ranges.next().unwrap_or_else(|| {
                             panic!(
-                                "annotated cluster iterator exhausted before glyph_run.glyphs(); \
+                                "text range iterator exhausted before glyph_run.glyphs(); \
                                  run cluster_range={:?}, glyph_start={glyph_start}",
                                 run.cluster_range()
                             )
