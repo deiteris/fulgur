@@ -1411,7 +1411,10 @@ mod tests {
             read("-fulgur-header-repeat: SKIP-FIRST"),
             Some(HeaderRepeat::SkipFirst)
         );
-        assert_eq!(read("-fulgur-header-repeat: auto"), Some(HeaderRepeat::Auto));
+        assert_eq!(
+            read("-fulgur-header-repeat: auto"),
+            Some(HeaderRepeat::Auto)
+        );
         assert_eq!(read("-fulgur-header-repeat: skip-last"), None);
     }
 

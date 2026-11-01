@@ -797,16 +797,6 @@ fn would_split_block_subtree(
     false
 }
 
-/// fulgur-a36m (Phase 3.1.5b): true if any descendant of `node_id`
-/// declares `break-before: page` or `break-after: page` in
-/// `column_styles`. Walks the entire DOM subtree, bails at
-/// [`crate::MAX_DOM_DEPTH`].
-///
-/// Detects forced page breaks anywhere below `node_id`, working on
-/// Blitz nodes via the column-style side-table. Used by
-/// `fragment_pagination_root` and `fragment_block_subtree` to decide
-/// whether a body-direct (or nested) child needs to be entered for
-/// break recursion even when it fits the current page strip whole.
 /// True when the header band can be recorded once and cloned onto every
 /// continuation page.
 ///
@@ -822,207 +812,379 @@ fn would_split_block_subtree(
 /// through to [`fragment_block_subtree_inner`], which honours breaks normally.
 /// The table then paginates without a repeated header.
 fn header_band_is_repeatable(
-    doc: &BaseDocument,
+    flow: Flow<'_>,
     header: &RepeatingTableHeader,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
+    page_height_px: f32,
     depth: usize,
 ) -> bool {
-    for &cell_id in &header.header_cell_ids {
+    header.header_cell_ids.iter().all(|&cell_id| {
         // The break may sit on the header cell itself as well as below it.
-        if let Some(props) = column_styles.and_then(|t| t.get(&cell_id))
-            && (matches!(
-                props.break_before,
-                Some(crate::draw_primitives::BreakBefore::Page)
-            ) || matches!(
-                props.break_after,
-                Some(crate::draw_primitives::BreakAfter::Page)
-            ))
-        {
-            return false;
-        }
-        if has_forced_break_below(doc, cell_id, column_styles, depth)
-            || has_page_name_change_below(doc, cell_id, used_page_names, depth)
-        {
-            return false;
-        }
-    }
-    true
+        flow.doc.get_node(cell_id).is_none_or(|cell| {
+            !break_before_of(flow, cell, page_height_px, depth).is_forced()
+                && !break_after_of(flow, cell, page_height_px, depth).is_forced()
+                && !forced_inside(flow, cell, page_height_px, depth)
+        })
+    })
 }
 
-fn has_forced_break_below(
-    doc: &BaseDocument,
-    node_id: usize,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    depth: usize,
-) -> bool {
-    fragmentation_below(doc, node_id, column_styles, depth) == Below::ForcedBreak
+/// The value of a break opportunity as it concerns pages (css-break-3 §3.1,
+/// §4.4): no break asked for, a break avoided, or a forced break, to a page
+/// of a side or to the next page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BreakValue {
+    #[default]
+    Auto,
+    Avoid,
+    Forced(Option<crate::draw_primitives::PageSide>),
 }
 
-/// What in flow below a node makes the fragmenter walk into it even when it
-/// fits the strip, the strongest reason found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Below {
-    Nothing,
-    /// A header row that skips its table's first page
-    /// (`-fulgur-header-repeat: skip-first`), which only the table's own
-    /// fragmentation ([`fragment_repeating_table`]) leaves off that page.
-    SkippedHeaderRow,
-    /// A forced page break.
-    ForcedBreak,
-}
-
-/// What below `node_id` makes the fragmenter walk into it ([`Below`]): a
-/// forced break ends the walk; a skipped header row is remembered while the
-/// walk looks on for a break.
-fn fragmentation_below(
-    doc: &BaseDocument,
-    node_id: usize,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
-    depth: usize,
-) -> Below {
-    if depth >= crate::MAX_DOM_DEPTH {
-        return Below::Nothing;
-    }
-    let Some(node) = doc.get_node(node_id) else {
-        return Below::Nothing;
-    };
-    let mut found = Below::Nothing;
-    for &child_id in &node.children {
-        // A break declared inside an out-of-flow subtree is never honoured —
-        // the fragmenter skips absolute / fixed / floated children entirely —
-        // so it is not evidence that this subtree fragments. Counting it made
-        // `header_band_is_repeatable` decline a perfectly repeatable header
-        // over a declaration with no effect.
-        if doc
-            .get_node(child_id)
-            .is_some_and(crate::blitz_adapter::is_out_of_flow_node)
-        {
-            continue;
-        }
-        if let Some(props) = column_styles.and_then(|t| t.get(&child_id)) {
-            if matches!(
-                props.break_before,
-                Some(crate::draw_primitives::BreakBefore::Page)
-            ) || matches!(
-                props.break_after,
-                Some(crate::draw_primitives::BreakAfter::Page)
-            ) {
-                return Below::ForcedBreak;
+impl BreakValue {
+    /// The `break-before` a box declares itself.
+    fn own_before(props: Option<&crate::column_css::ColumnStyleProps>) -> Self {
+        use crate::draw_primitives::BreakBefore;
+        match props.and_then(|props| props.break_before) {
+            Some(BreakBefore::Page) => {
+                Self::Forced(props.and_then(|props| props.break_before_side))
             }
-            if props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst) {
-                found = Below::SkippedHeaderRow;
-            }
-        }
-        match fragmentation_below(doc, child_id, column_styles, depth + 1) {
-            Below::ForcedBreak => return Below::ForcedBreak,
-            Below::SkippedHeaderRow => found = Below::SkippedHeaderRow,
-            Below::Nothing => {}
+            Some(BreakBefore::Avoid) => Self::Avoid,
+            Some(BreakBefore::Auto) | None => Self::Auto,
         }
     }
-    found
+
+    /// The `break-after` a box declares itself.
+    fn own_after(props: Option<&crate::column_css::ColumnStyleProps>) -> Self {
+        use crate::draw_primitives::BreakAfter;
+        match props.and_then(|props| props.break_after) {
+            Some(BreakAfter::Page) => Self::Forced(props.and_then(|props| props.break_after_side)),
+            Some(BreakAfter::Avoid) => Self::Avoid,
+            Some(BreakAfter::Auto) | None => Self::Auto,
+        }
+    }
+
+    /// The value of the one opportunity that `self` and `later`, which comes
+    /// after it in the flow, both apply to (css-break-3 §3.1): a forced
+    /// break wins, and two make one break, to the side the later asks for,
+    /// else to the earlier's; `avoid` beats `auto`.
+    fn then(self, later: Self) -> Self {
+        match (self, later) {
+            (Self::Forced(side), Self::Forced(later_side)) => Self::Forced(later_side.or(side)),
+            (Self::Forced(_), _) => self,
+            (_, Self::Forced(_)) => later,
+            (Self::Avoid, _) | (_, Self::Avoid) => Self::Avoid,
+            (Self::Auto, Self::Auto) => Self::Auto,
+        }
+    }
+
+    fn is_forced(self) -> bool {
+        matches!(self, Self::Forced(_))
+    }
+
+    /// The page side a forced break asks for.
+    fn side(self) -> Option<crate::draw_primitives::PageSide> {
+        match self {
+            Self::Forced(side) => side,
+            Self::Auto | Self::Avoid => None,
+        }
+    }
 }
 
-/// fulgur-uebl: true if any sibling pair inside `node_id`'s subtree
-/// has different used page-names. Used as a recursion gate so that
-/// `fragment_block_subtree` is entered for subtrees that fit the page
-/// strip but contain implicit page-name forced breaks (CSS Page 3
-/// §5.3). Walking the whole subtree is acceptable here — the
-/// `column_styles` / `used_page_names` tables are sparse, and the bail
-/// at [`crate::MAX_DOM_DEPTH`] matches `has_forced_break_below`.
-fn has_page_name_change_below(
-    doc: &BaseDocument,
-    node_id: usize,
-    used_page_names: Option<&crate::blitz_adapter::UsedPageNameTable>,
-    depth: usize,
-) -> bool {
-    if depth >= crate::MAX_DOM_DEPTH {
-        return false;
-    }
-    let Some(table) = used_page_names else {
-        return false;
-    };
-    let Some(node) = doc.get_node(node_id) else {
-        return false;
-    };
-    // Atomic inline containers (`inline-block`, `inline-flex`, etc.)
-    // are fully opaque: their internal block flow does not paginate
-    // independently from the parent line box. Skip the entire subtree
-    // so the recursion gate doesn't fire on them.
-    if crate::blitz_adapter::is_atomic_inline_container_node(node) {
-        return false;
-    }
-    // Orthogonal-flow nodes (writing-mode different from their own
-    // parent) are also atomic from the outer flow's perspective (CSS
-    // Writing Modes 4 §9). Even when called directly with the
-    // orthogonal node as the target, treat its subtree as opaque so
-    // the recursion gate doesn't trigger a `fragment_block_subtree`
-    // entry that would interact with Taffy's orthogonal-flow sizing
-    // and produce layout drift not present in the whole-emit baseline.
-    if let Some(gp_id) = node.parent
-        && let Some(gp) = doc.get_node(gp_id)
-        && crate::blitz_adapter::is_orthogonal_to_parent(gp, node)
-    {
-        return false;
-    }
-    // Flex / grid containers suppress sibling comparison among their
-    // direct items (CSS Page 3 / CSS Fragmentation 3 — flex / grid
-    // items are not class A break points). But page-name forced breaks
-    // inside an item's own BFC still apply, so we must keep recursing
-    // into each item — only the direct-children comparison is gated.
-    let suppress_direct_compare = crate::blitz_adapter::is_flex_or_grid_container_node(node);
-    let mut prev_used: Option<Option<String>> = None;
-    for &child_id in &node.children {
-        let Some(child) = doc.get_node(child_id) else {
+/// Whether the walk places `child` among its parent's children: neither
+/// white space, nor absolutely positioned or fixed (another pass places
+/// those), nor a running element (placed in a page margin box).
+fn is_flow_child(flow: Flow<'_>, child: &blitz_dom::Node) -> bool {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+    !crate::blitz_adapter::is_whitespace_only_text_node(child)
+        && !child
+            .primary_styles()
+            .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed))
+        && !flow
+            .running_store
+            .is_some_and(|store| store.instance_for_node(child.id).is_some())
+}
+
+/// The children the walk iterates for `node`: its layout children, which
+/// hold the anonymous blocks Stylo wraps around inline-level runs, else its
+/// DOM children.
+fn walk_children_of(node: &blitz_dom::Node) -> Vec<usize> {
+    let layout_children = node.layout_children.borrow();
+    layout_children
+        .as_deref()
+        .filter(|children| !children.is_empty())
+        .map(Vec::from)
+        .unwrap_or_else(|| node.children.clone())
+}
+
+/// Whether the walk never enters `node` for its children nor splits it, at
+/// any room: a childless or replaced box, a transformed box that fits a page
+/// (it paints as one shape, CSS Transforms §6.1), an atomic inline, or a box
+/// in an orthogonal flow (CSS Writing Modes 4 §9).
+fn is_atomic(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px: f32) -> bool {
+    let fits_page = node.final_layout.size.height <= page_height_px + 1.0;
+    let orthogonal = node
+        .parent
+        .and_then(|id| doc.get_node(id))
+        .is_some_and(|parent| crate::blitz_adapter::is_orthogonal_to_parent(parent, node));
+    node.children.is_empty()
+        || (is_transformed(node) && fits_page)
+        || crate::blitz_adapter::is_atomic_inline_container_node(node)
+        || orthogonal
+}
+
+/// Whether `node` is a multicol container the walk does not enter: without a
+/// child that spans its columns, `multicol_layout` fragments it.
+fn is_unspanned_multicol(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
+    crate::blitz_adapter::is_multicol_container(node)
+        && !node.children.iter().any(|&id| {
+            doc.get_node(id)
+                .is_some_and(crate::blitz_adapter::has_column_span_all)
+        })
+}
+
+/// Whether the walk meets the boxes of `node` one by one, with class A
+/// opportunities between them (css-break-3 §4.1): it is neither atomic
+/// ([`is_atomic`]), nor a multicol container it does not enter, nor an
+/// inline root, whose breaks lie between its lines.
+fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px: f32) -> bool {
+    !is_atomic(doc, node, page_height_px)
+        && !is_unspanned_multicol(doc, node)
+        && (is_transformed(node)
+            || node
+                .element_data()
+                .is_none_or(|el| el.inline_layout_data.is_none()))
+}
+
+/// The flow children of a walk over `children` ([`is_flow_child`]), as
+/// indices into `children`, in lines: a child that starts beside the first
+/// box of the line before it, and above its bottom, sits in that line, as
+/// the items of a flex row, a grid row, or the cells of a table row do. No
+/// class A opportunity lies between the boxes of a line (css-break-3 §4.1);
+/// each line takes on its boxes' `break-before` and `break-after`.
+fn flow_lines(flow: Flow<'_>, children: &[usize]) -> Vec<Vec<usize>> {
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut line_box = (0.0_f32, 0.0_f32);
+    for (index, &id) in children.iter().enumerate() {
+        let Some(child) = flow.doc.get_node(id) else {
             continue;
         };
-        // Skip whitespace-only text and out-of-flow children — same
-        // filters as the fragmenter loop, so the predicate matches
-        // exactly what `fragment_block_subtree` would compare.
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
+        if !is_flow_child(flow, child) {
             continue;
         }
-        if child.element_data().is_none() {
-            continue;
-        }
-        // Orthogonal-to-this-node child: fully atomic from this node's
-        // perspective (CSS Writing Modes 4 §9). Skip the entire
-        // subtree — no comparison, no recursion.
-        if crate::blitz_adapter::is_orthogonal_to_parent(node, child) {
-            continue;
-        }
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_out_of_flow {
-                continue;
+        let layout = child.final_layout;
+        let (top, bottom) = (layout.location.y, layout.location.y + layout.size.height);
+        match lines.last_mut() {
+            Some(line) if top < line_box.1 - 0.5 && top <= line_box.0 + 0.5 => {
+                line.push(index);
+                line_box.1 = line_box.1.max(bottom);
+            }
+            _ => {
+                lines.push(vec![index]);
+                line_box = (top, bottom);
             }
         }
-        // Floats are out of normal flow (CSS 2.1 §9.5) — match
-        // `fragment_pagination_root` / `fragment_block_subtree` which
-        // skip them from `prev_used_page` comparisons. Without this,
-        // a float-only page-name change would force recursion through
-        // a subtree the real comparison would treat as unchanged.
-        if crate::blitz_adapter::node_is_floating(child) {
-            continue;
-        }
-        let (child_start, child_end) = table.get(&child_id).cloned().unwrap_or((None, None));
-        if !suppress_direct_compare && prev_used.as_ref().is_some_and(|p| *p != child_start) {
-            return true;
-        }
-        if !suppress_direct_compare {
-            prev_used = Some(child_end);
-        }
-        // Always recurse: even when direct sibling comparison is
-        // suppressed (flex / grid container), descendants in their
-        // own BFC may still trigger an internal page-name break.
-        if has_page_name_change_below(doc, child_id, used_page_names, depth + 1) {
-            return true;
-        }
     }
-    false
+    lines
+}
+
+/// The `break-before` or the `break-after` (`after`) of a line of
+/// `children` ([`flow_lines`]): its boxes' values, combined.
+fn line_break(
+    flow: Flow<'_>,
+    children: &[usize],
+    line: &[usize],
+    after: bool,
+    page_height_px: f32,
+    depth: usize,
+) -> BreakValue {
+    line.iter()
+        .filter_map(|&index| flow.doc.get_node(children[index]))
+        .map(|child| {
+            if after {
+                break_after_of(flow, child, page_height_px, depth)
+            } else {
+                break_before_of(flow, child, page_height_px, depth)
+            }
+        })
+        .fold(BreakValue::Auto, BreakValue::then)
+}
+
+/// The `break-before` of `node` as its parent's walk meets it: its own,
+/// then its first line's ([`flow_lines`]), which a container takes on, as no
+/// class A opportunity parts the two (css-break-3 §3.1).
+fn break_before_of(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> BreakValue {
+    let own = BreakValue::own_before(flow.column_styles.and_then(|styles| styles.get(&node.id)));
+    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
+        return own;
+    }
+    let children = walk_children_of(node);
+    flow_lines(flow, &children).first().map_or(own, |line| {
+        own.then(line_break(
+            flow,
+            &children,
+            line,
+            false,
+            page_height_px,
+            depth + 1,
+        ))
+    })
+}
+
+/// The `break-after` of `node` as its parent's walk meets it: its last
+/// line's, which a container takes on, then its own.
+fn break_after_of(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> BreakValue {
+    let own = BreakValue::own_after(flow.column_styles.and_then(|styles| styles.get(&node.id)));
+    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
+        return own;
+    }
+    let children = walk_children_of(node);
+    flow_lines(flow, &children).last().map_or(own, |line| {
+        line_break(flow, &children, line, true, page_height_px, depth + 1).then(own)
+    })
+}
+
+/// Whether the walk compares no used page names between the children of
+/// `parent` (CSS Page 3 §5.3): the items of a flex or grid container, which
+/// `page` does not apply to, and the children of an atomic inline or of a
+/// box in an orthogonal flow, whose block flow does not paginate on its own.
+fn page_names_suppressed(doc: &BaseDocument, parent: &blitz_dom::Node) -> bool {
+    crate::blitz_adapter::is_flex_or_grid_container_node(parent)
+        || crate::blitz_adapter::is_atomic_inline_container_node(parent)
+        || parent
+            .parent
+            .and_then(|id| doc.get_node(id))
+            .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent))
+}
+
+/// The class A break opportunities of a walk over `children` (css-break-3
+/// §4.1): the value of the one before each line of flow children
+/// ([`flow_lines`]), at the line's first box, in a vector parallel to
+/// `children`. Between two lines it combines the earlier's `break-after`
+/// with the later's `break-before` ([`line_break`], [`BreakValue::then`]),
+/// and a change of used page name between two boxes that are not floats
+/// forces a break (CSS Page 3 §5.3) unless `suppress_page_names`. The first
+/// line's `break-before` and the last line's `break-after` are no
+/// opportunity of this walk: the parent takes them on, and its own parent's
+/// walk applies them. Every other slot holds `Auto`.
+fn opportunities(
+    flow: Flow<'_>,
+    children: &[usize],
+    suppress_page_names: bool,
+    page_height_px: f32,
+    depth: usize,
+) -> Vec<BreakValue> {
+    let mut values = vec![BreakValue::Auto; children.len()];
+    let mut previous_after: Option<BreakValue> = None;
+    let mut previous_page: Option<Option<String>> = None;
+    for line in flow_lines(flow, children) {
+        let mut value = previous_after
+            .map(|after| {
+                after.then(line_break(
+                    flow,
+                    children,
+                    &line,
+                    false,
+                    page_height_px,
+                    depth,
+                ))
+            })
+            .unwrap_or_default();
+        for &index in &line {
+            let id = children[index];
+            if flow
+                .doc
+                .get_node(id)
+                .is_none_or(crate::blitz_adapter::node_is_floating)
+            {
+                continue;
+            }
+            let (start, end) = flow
+                .used_page_names
+                .and_then(|names| names.get(&id).cloned())
+                .unwrap_or((None, None));
+            if !suppress_page_names
+                && index == line[0]
+                && previous_page.as_ref().is_some_and(|page| *page != start)
+            {
+                value = value.then(BreakValue::Forced(None));
+            }
+            previous_page = Some(end);
+        }
+        values[line[0]] = value;
+        previous_after = Some(line_break(
+            flow,
+            children,
+            &line,
+            true,
+            page_height_px,
+            depth,
+        ));
+    }
+    values
+}
+
+/// Whether a forced break opportunity lies inside `node`, between two of the
+/// lines the walk meets in it at any depth ([`opportunities`]), so that the
+/// walk enters it to break there even when it fits the page. The forced
+/// breaks at its edges, its first line's `break-before` and its last line's
+/// `break-after`, are no reason: its parent's walk applies them. No
+/// opportunity lies inside an atomic box or an inline root
+/// ([`has_flow_children`]).
+fn forced_inside(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> bool {
+    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
+        return false;
+    }
+    let children = walk_children_of(node);
+    let suppress = page_names_suppressed(flow.doc, node);
+    opportunities(flow, &children, suppress, page_height_px, depth + 1)
+        .into_iter()
+        .any(BreakValue::is_forced)
+        || children
+            .iter()
+            .filter_map(|&id| flow.doc.get_node(id))
+            .filter(|&child| is_flow_child(flow, child))
+            .any(|child| forced_inside(flow, child, page_height_px, depth + 1))
+}
+
+/// Whether a header row that skips its table's first page
+/// (`-fulgur-header-repeat: skip-first`) lies below `node`: only the table's
+/// own fragmentation ([`fragment_repeating_table`]) leaves it off that page,
+/// so the walk enters a box holding one.
+fn skipped_header_row_below(
+    doc: &BaseDocument,
+    node_id: usize,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    depth: usize,
+) -> bool {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return false;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return false;
+    };
+    node.children.iter().any(|&child_id| {
+        !doc.get_node(child_id)
+            .is_some_and(crate::blitz_adapter::is_out_of_flow_node)
+            && (column_styles
+                .and_then(|styles| styles.get(&child_id))
+                .is_some_and(|props| {
+                    props.header_repeat == Some(crate::column_css::HeaderRepeat::SkipFirst)
+                })
+                || skipped_header_row_below(doc, child_id, column_styles, depth + 1))
+    })
 }
 
 /// Row-level state for grid/flex parallel-sibling co-split (fulgur-ysms).
@@ -1421,11 +1583,6 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
         doc, column_styles, ..
     } = flow;
     let fits_page = node.final_layout.size.height <= page_height_px + 1.0;
-    let transformed = is_transformed(node);
-    let orthogonal = node
-        .parent
-        .and_then(|id| doc.get_node(id))
-        .is_some_and(|parent| crate::blitz_adapter::is_orthogonal_to_parent(parent, node));
     // An atomic inline or a box in an orthogonal flow is monolithic (CSS
     // Writing Modes 4 §9), which the walk did not decide before `classify`:
     // an orthogonal inline root was split between its lines. Neither reaches
@@ -1433,11 +1590,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
     // wrapped in an anonymous block, a flex or grid item blockified), and the
     // engine's style system computes every `writing-mode` as `horizontal-tb`,
     // so no test can build one.
-    if node.children.is_empty()
-        || (transformed && fits_page)
-        || crate::blitz_adapter::is_atomic_inline_container_node(node)
-        || orthogonal
-    {
+    if is_atomic(doc, node, page_height_px) {
         return BoxKind::Monolithic(Whole::Atomic);
     }
     let avoid = !displays(node, DisplayInside::TableRow)
@@ -1482,12 +1635,7 @@ fn structure(flow: Flow<'_>, node: &blitz_dom::Node) -> BoxKind {
             limits: line_limits(doc, column_styles, node.id),
         };
     }
-    if crate::blitz_adapter::is_multicol_container(node)
-        && !node.children.iter().any(|&id| {
-            doc.get_node(id)
-                .is_some_and(crate::blitz_adapter::has_column_span_all)
-        })
-    {
+    if is_unspanned_multicol(doc, node) {
         return BoxKind::Monolithic(Whole::Atomic);
     }
     if displays(node, DisplayInside::Table) {
@@ -1559,8 +1707,8 @@ fn enters(
     if node.children.is_empty() || matches!(kind, BoxKind::Monolithic(Whole::Atomic)) {
         return false;
     }
-    fragmentation_below(flow.doc, node.id, flow.column_styles, 0) != Below::Nothing
-        || has_page_name_change_below(flow.doc, node.id, flow.used_page_names, 0)
+    forced_inside(flow, node, page_height_px, 0)
+        || skipped_header_row_below(flow.doc, node.id, flow.column_styles, 0)
         || (!matches!(kind, BoxKind::Monolithic(Whole::Kept))
             && would_split_block_subtree(flow.doc, node.id, room, page_height_px, 0))
 }
@@ -1654,10 +1802,7 @@ fn leading_of(
         // enters one for a skipped header row, which leaves it unsplit: its
         // unit is still the whole box, as the move of a kept box entered so
         // needs.
-        BoxKind::Monolithic(Whole::Kept)
-            if fragmentation_below(doc, node.id, column_styles, 0) == Below::ForcedBreak
-                || has_page_name_change_below(doc, node.id, flow.used_page_names, 0) =>
-        {
+        BoxKind::Monolithic(Whole::Kept) if forced_inside(flow, node, page_height_px, 0) => {
             let kind = structure(flow, node);
             leading_of(flow, node, &kind, room, page_height_px, depth)
         }
@@ -1779,10 +1924,7 @@ fn table_leading(
     depth: usize,
 ) -> Leading {
     let Flow {
-        doc,
-        column_styles,
-        used_page_names,
-        ..
+        doc, column_styles, ..
     } = flow;
     let row_of = |cell: &blitz_dom::Node| {
         cell.parent
@@ -1794,7 +1936,7 @@ fn table_leading(
         .flatten()
         .filter(|header| {
             header.band_height_px < page_height_px
-                && header_band_is_repeatable(doc, header, column_styles, used_page_names, depth + 1)
+                && header_band_is_repeatable(flow, header, page_height_px, depth + 1)
         });
     if let Some(header) = header {
         let band = header.band_height_px - header.first_page_lift_px;
@@ -2131,14 +2273,11 @@ fn fragment_block_subtree(
     lifted: &mut f32,
 ) -> (u32, f32) {
     let Flow {
-        doc,
-        column_styles,
-        used_page_names,
-        ..
+        doc, column_styles, ..
     } = flow;
     if depth < crate::MAX_DOM_DEPTH
         && let Some(header) = repeating_table_header(doc, parent_id, depth + 1, column_styles)
-        && header_band_is_repeatable(doc, &header, column_styles, used_page_names, depth + 1)
+        && header_band_is_repeatable(flow, &header, page_height_px, depth + 1)
     {
         return fragment_repeating_table(
             geometry,
@@ -2768,8 +2907,8 @@ fn fragment_block_subtree_inner(
     let Flow {
         doc,
         column_styles,
-        used_page_names,
         running_store,
+        ..
     } = flow;
     // The parent's fragment on each page starts at the cursor's
     // `page_start_y`: the walk closes one and starts the next each time it
@@ -2818,15 +2957,7 @@ fn fragment_block_subtree_inner(
     let mut own_lift = 0.0_f32;
     let mut origin_pending_target_y: Option<f32> = None;
     let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
-    // fulgur-uebl: the used page-name of the previous in-flow sibling
-    // (`Some(Some(name))` named, `Some(None)` auto, `None` no previous).
-    // When the next sibling's differs, a forced break is induced before it
-    // (CSS Page 3 §5.3, "Using Named Pages").
-    let mut prev_used_page: Option<Option<String>> = None;
     let mut row_state: Option<RowState> = None;
-    // A child of the root that has a fragment precedes this one: a forced
-    // break before the root's first child is the document's start.
-    let mut emitted_any = false;
     // Outside a flex or grid row (whose `RowState` does the same): the
     // previous in-flow child's layout top and bottom, and the page and
     // `page_has_content` where the children side by side with it started.
@@ -2876,15 +3007,20 @@ fn fragment_block_subtree_inner(
     // `layout_children` without that fix would lose the parent's
     // pre-recursion-page fragment in mo-006/008 (flex/grid + tall
     // monolithic + trailing inline text).
-    let walk_children = children_override.map(Vec::from).unwrap_or_else(|| {
-        let layout_children_borrow = parent.layout_children.borrow();
-        layout_children_borrow
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .map(Vec::from)
-            .unwrap_or_else(|| parent.children.clone())
-    });
-    for &child_id in &walk_children {
+    let walk_children = children_override
+        .map(Vec::from)
+        .unwrap_or_else(|| walk_children_of(parent));
+    // The class A break opportunity before each child: the value of the
+    // previous sibling's `break-after` and this one's `break-before`, and of a
+    // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
+    let opportunities = opportunities(
+        flow,
+        &walk_children,
+        suppress_page_check,
+        page_height_px,
+        depth + 1,
+    );
+    for (&child_id, &opportunity) in walk_children.iter().zip(&opportunities) {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
@@ -2938,7 +3074,6 @@ fn fragment_block_subtree_inner(
                         width: 0.0_f32.as_px(),
                         height: 0.0_f32.as_px(),
                     });
-                emitted_any = true;
             }
             continue;
         }
@@ -2959,32 +3094,6 @@ fn fragment_block_subtree_inner(
         } else {
             parent_w
         };
-
-        // fulgur-a36m: read break-* props for this child once. Both
-        // the zero-height and non-zero paths honour them.
-        let break_props = column_styles
-            .and_then(|t| t.get(&child_id))
-            .cloned()
-            .unwrap_or_default();
-        // fulgur-uebl: detect page-name change against the previous
-        // in-flow sibling and treat it as an implicit forced break.
-        // Compare prev's `end` against this child's `start`. Floats are
-        // out of normal flow (CSS 2.1 §9.5) and skipped here too.
-        let is_float = crate::blitz_adapter::node_is_floating(child);
-        let (used_start, used_end) = used_page_names
-            .and_then(|t| t.get(&child_id).cloned())
-            .unwrap_or((None, None));
-        let page_name_changed = !suppress_page_check
-            && !is_float
-            && prev_used_page.as_ref().is_some_and(|p| *p != used_start);
-        let break_before_page = matches!(
-            break_props.break_before,
-            Some(crate::draw_primitives::BreakBefore::Page)
-        ) || page_name_changed;
-        let break_after_page = matches!(
-            break_props.break_after,
-            Some(crate::draw_primitives::BreakAfter::Page)
-        );
 
         // Compute Taffy parent-relative top early — both the zero-
         // height path below and the non-zero path further down use
@@ -3085,15 +3194,15 @@ fn fragment_block_subtree_inner(
             // after Blitz's intrinsic-size collapse, and its
             // `break-before: page` still takes effect
             // (`tests/pseudo_only_break_before.rs`).
-            if break_before_page && cursor.cursor_y > cursor.page_start_y {
+            if opportunity.is_forced() && !cursor.at_page_top() {
                 cursor.close_parent(geometry, ParentHeight::Placed);
-                cursor.break_to(doc, break_props.break_before_side);
+                cursor.break_to(doc, opportunity.side());
                 // Zero-height break-before: this child IS the first
                 // on the new page — apply origin rebase eagerly.
                 cursor.page_taffy_origin = this_top_in_parent;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
             } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
-                cursor.move_to_side(doc, break_props.break_before_side);
+                cursor.move_to_side(doc, opportunity.side());
             }
             if child.element_data().is_some() {
                 geometry
@@ -3107,21 +3216,6 @@ fn fragment_block_subtree_inner(
                         width: child_w.as_px(),
                         height: 0.0_f32.as_px(),
                     });
-                emitted_any = true;
-            }
-            // fulgur-p3uf (Phase 3.1.5a): honour `break-after: page` for
-            // zero-height elements too (CSS Fragmentation §3, forced breaks
-            // apply regardless of the element's own height).
-            if break_after_page {
-                cursor.close_parent(geometry, ParentHeight::Placed);
-                cursor.break_to(doc, break_props.break_after_side);
-                // Zero-height break-after: NEXT child is the first
-                // on the new page — defer origin rebase.
-                (origin_pending_target_y, origin_pending_same_row) =
-                    (Some(cursor.page_start_y), None);
-            }
-            if !is_float {
-                prev_used_page = Some(used_end.clone());
             }
             continue;
         }
@@ -3148,20 +3242,15 @@ fn fragment_block_subtree_inner(
         // block flow, it matches Taffy's stacked positions exactly.
         let mut child_page_y =
             cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin);
-        // Update the cursor only when the child's bottom advances
-        // past it. For block flow this matches cursor advancing by
-        // `gap + child_h`; for grid parallel siblings the cursor
-        // tracks the row's max bottom (so break-before / overflow
-        // checks see the full row height).
-        cursor.cursor_y = cursor.cursor_y.max(child_page_y);
 
-        // Honour `break-before: page`. Leading collapse: only fires
-        // when some content has already been placed on this page —
-        // gated by `cursor_y > page_start_y` — and, at the root, when a
-        // child precedes this one.
-        if break_before_page && cursor.cursor_y > cursor.page_start_y && (!root || emitted_any) {
+        // A forced break before the child, when content precedes it on the
+        // page: the parent's fragment ends at the last content, the gap above
+        // the child not included. With nothing placed on the page yet, here
+        // or above, a break makes no empty page: a side break only moves on
+        // to its side.
+        if opportunity.is_forced() && !cursor.at_page_top() {
             cursor.close_parent(geometry, ParentHeight::Placed);
-            cursor.break_to(doc, break_props.break_before_side);
+            cursor.break_to(doc, opportunity.side());
             // The breaking child is the first in-flow child on the
             // new page strip. Rebase the Taffy origin to its
             // `this_top_in_parent` so it lands at `page_start_y` (= 0)
@@ -3170,11 +3259,14 @@ fn fragment_block_subtree_inner(
             cursor.page_taffy_origin = this_top_in_parent;
             child_page_y = 0.0;
         } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
-            // Nothing is placed on this page yet, here or above: a side
-            // break only moves on to its side.
-            cursor.move_to_side(doc, break_props.break_before_side);
+            cursor.move_to_side(doc, opportunity.side());
         }
-        emitted_any = true;
+        // Update the cursor only when the child's bottom advances
+        // past it. For block flow this matches cursor advancing by
+        // `gap + child_h`; for grid parallel siblings the cursor
+        // tracks the row's max bottom (so break-before / overflow
+        // checks see the full row height).
+        cursor.cursor_y = cursor.cursor_y.max(child_page_y);
 
         // (Strip-overflow page cut moved below the recursion gate as
         // part of fulgur-7hf5 — see the `if cursor_y > page_start_y
@@ -3421,15 +3513,6 @@ fn fragment_block_subtree_inner(
                 new_cursor_y
             };
             cursor.entered_below_content = false;
-            if !is_float {
-                prev_used_page = Some(used_end.clone());
-            }
-            if break_after_page {
-                cursor.close_parent(geometry, ParentHeight::Placed);
-                cursor.break_to(doc, break_props.break_after_side);
-                (origin_pending_target_y, origin_pending_same_row) =
-                    (Some(cursor.page_start_y), None);
-            }
             if let Some(ref mut rs) = row_state {
                 rs.reach(&cursor);
             }
@@ -3619,16 +3702,6 @@ fn fragment_block_subtree_inner(
                 }
             }
 
-            // Honour `break-after: page` after recursion.
-            if break_after_page {
-                cursor.close_parent(geometry, ParentHeight::Placed);
-                cursor.break_to(doc, break_props.break_after_side);
-                (origin_pending_target_y, origin_pending_same_row) =
-                    (Some(cursor.page_start_y), None);
-            }
-            if !is_float {
-                prev_used_page = Some(used_end.clone());
-            }
             if let Some(ref mut rs) = row_state {
                 rs.reach(&cursor);
             }
@@ -3856,15 +3929,6 @@ fn fragment_block_subtree_inner(
             } else {
                 new_cursor_y
             };
-            if !is_float {
-                prev_used_page = Some(used_end.clone());
-            }
-            if break_after_page {
-                cursor.close_parent(geometry, ParentHeight::Placed);
-                cursor.break_to(doc, break_props.break_after_side);
-                (origin_pending_target_y, origin_pending_same_row) =
-                    (Some(cursor.page_start_y), None);
-            }
             if let Some(ref mut rs) = row_state {
                 rs.reach(&cursor);
             }
@@ -3903,17 +3967,6 @@ fn fragment_block_subtree_inner(
         // the per-row max bottom).
         cursor.cursor_y = cursor.cursor_y.max(child_page_y + child_h);
         cursor.place(child_h);
-
-        // Honour `break-after: page` after the child fragment lands
-        // (and the descendant walk records same-page entries).
-        if break_after_page {
-            cursor.close_parent(geometry, ParentHeight::Placed);
-            cursor.break_to(doc, break_props.break_after_side);
-            (origin_pending_target_y, origin_pending_same_row) = (Some(cursor.page_start_y), None);
-        }
-        if !is_float {
-            prev_used_page = Some(used_end.clone());
-        }
         if let Some(ref mut rs) = row_state {
             rs.reach(&cursor);
         }
@@ -10888,7 +10941,8 @@ h2 { string-set: chapter-title content(text); }
     ///
     /// Fixture: 2-column grid row. Column A (60px) establishes the
     /// row's true bottom. Column B is a short 2-line `<p>` with
-    /// `break-after: page` whose own bottom is well under 60. The
+    /// `break-after: page` whose own bottom is well under 60, and an item
+    /// of a second row follows it, so the break lies inside the grid. The
     /// grid's own parent fragment on page 0 — closed by column B's
     /// `break-after: page` — must span the row's true height (60), not
     /// column B's shorter one.
@@ -10896,9 +10950,10 @@ h2 { string-set: chapter-title content(text); }
     fn grid_row_same_page_split_keeps_row_max_cursor_for_break_after() {
         let html = r#"
             <html><body style="margin: 0; padding: 0; font-size: 12px">
-              <div id="grid" style="display: grid; grid-template-columns: 60px 60px; width: 120px;">
+              <div id="grid" style="display: grid; grid-template-columns: 60px 60px; width: 120px; align-items: start">
                 <div id="col_a" style="height: 60px; width: 60px"></div>
                 <p id="col_b" style="margin:0; padding:0; line-height:10px; width:20px; break-after:page">one two</p>
+                <div style="height: 10px"></div>
               </div>
             </body></html>
         "#;
@@ -11148,7 +11203,7 @@ h2 { string-set: chapter-title content(text); }
     /// pre-fix value (gap≈20, was 26.6 in CSS px after Stylo's pt→px).
     ///
     /// Setup: outer wrapper triggers recursion via
-    /// `has_forced_break_below`. Inside, A (h=100) at y=0 and B
+    /// `forced_inside`. Inside, A (h=100) at y=0 and B
     /// (h=100) at y=120 with `break-before: page`. The `margin-top:
     /// 20px` on B creates a 20px gap that the bug would leak through.
     #[test]
@@ -11188,6 +11243,94 @@ h2 { string-set: chapter-title content(text); }
                  break-before — see Devin Review on PR #285). frag={f:?}",
             );
         }
+    }
+
+    /// The fragments of the element `id`, as (page, y).
+    fn page_ys(
+        doc: &blitz_dom::BaseDocument,
+        geom: &PaginationGeometryTable,
+        id: &str,
+    ) -> Vec<(u32, f32)> {
+        geom[&find_by_id(doc, id).expect(id)]
+            .fragments
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32()))
+            .collect()
+    }
+
+    /// A first child's `break-before` is its container's (css-break-3 §3.1):
+    /// the break goes before the container, which starts the next page,
+    /// with or without a top edge. Without the edge the break was dropped,
+    /// as no content preceded the child in its container; with one, it
+    /// broke inside the container and left its edge alone on the page.
+    #[test]
+    fn a_first_childs_break_before_breaks_before_its_container() {
+        for edge in ["", "padding-top: 10px"] {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0">
+                  <div style="height: 50px"></div>
+                  <div id="c" style="{edge}">
+                    <div id="b" style="break-before: page; height: 20px"></div>
+                  </div>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            let top = if edge.is_empty() { 0.0 } else { 10.0 };
+            assert_eq!(
+                (page_ys(&doc, &geom, "c"), page_ys(&doc, &geom, "b")),
+                (vec![(1, 0.0)], vec![(1, top)]),
+                "{edge}"
+            );
+        }
+    }
+
+    /// A `break-after` and the next box's `break-before`, forced, are one
+    /// break at the one opportunity between them (css-break-3 §3.1), to the
+    /// side the later asks for: after `break-after: left` on page 1 (a left
+    /// page), `break-before: right` takes page 2, at the body level and from
+    /// a container's last child, where each side took a page of its own
+    /// (page 4).
+    #[test]
+    fn adjacent_side_breaks_merge_into_one() {
+        for (open, close) in [("", ""), ("<div>", "</div>")] {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0">
+                  <div style="height: 20px; break-after: page"></div>
+                  {open}<div style="height: 20px; break-after: left"></div>{close}
+                  <div id="r" style="height: 20px; break-before: right"></div>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            assert_eq!(page_ys(&doc, &geom, "r"), [(2, 0.0)], "{open}");
+        }
+    }
+
+    /// No break opportunity lies inside an atomic inline (css-break-3 §4.1):
+    /// a `break-before` in an `inline-block` does not make the walk enter a
+    /// box kept whole around it, which moves whole to the next page when it
+    /// crosses the foot. The walk entered it for the break, so it split
+    /// between its children where it stood.
+    #[test]
+    fn a_break_inside_an_inline_block_does_not_split_its_kept_ancestor() {
+        let html = r#"<html><body style="margin: 0; padding: 0; line-height: 20px">
+              <div style="height: 50px"></div>
+              <div id="k" style="break-inside: avoid">
+                <div style="height: 40px"></div>
+                <span style="display: inline-block; width: 50px">
+                  <span style="display: block; break-before: page">x</span>
+                </span>
+              </div>
+            </body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        assert_eq!(page_ys(&doc, &geom, "k"), [(1, 0.0)]);
     }
 
     /// The body is walked as any block: a flex body's items sit side by side
@@ -12270,15 +12413,14 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
-    // ── has_forced_break_below: recursive return (line 1423) ────────────────────
+    // ── forced_inside: a break between grandchildren ────────────────────────────
 
-    /// `has_forced_break_below` must recurse into grandchildren: when a body-
-    /// direct outer div contains a middle div (no direct break) that in turn
-    /// contains an inner div with `break-after: page`, the recursive call at
-    /// line 1422 must return `true` (triggering line 1423) so the outer div
-    /// enters `fragment_block_subtree` and the break fires.
+    /// `forced_inside` looks through every level: when a body-direct outer
+    /// div contains a middle div (no direct break) whose first child has
+    /// `break-after: page` before a sibling, the outer div is entered and
+    /// the break fires.
     #[test]
-    fn has_forced_break_below_recursive_return_detects_grandchild_break() {
+    fn a_forced_break_between_grandchildren_makes_the_walk_enter_their_ancestor() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 300px">
@@ -12293,15 +12435,14 @@ h2 { string-set: chapter-title content(text); }
         let mut doc = parse(html, 600.0);
         let table = blitz_adapter::extract_column_style_table(&doc, &[]);
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 800.0_f32.as_px(), &table);
-        // The inner div has break-after: page; has_forced_break_below must
-        // recurse through the middle div and detect it, causing the outer
-        // subtree to be split and emitting a page-1 fragment.
+        // The inner div has break-after: page; `forced_inside` must look
+        // through the middle div and find it, causing the outer subtree to
+        // be split and emitting a page-1 fragment.
         assert!(
             geom.values()
                 .flat_map(|g| g.fragments.iter())
                 .any(|f| f.page_index == 1),
-            "has_forced_break_below must recurse into grandchild and detect \
-             break-after: page (line 1423); geom={geom:?}"
+            "forced_inside must find a break between grandchildren; geom={geom:?}"
         );
     }
 
@@ -12336,19 +12477,17 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
-    // ── is_float guard in body-direct normal-height path (lines 1108-1110) ──────
+    // ── a float's page name in body-direct normal-height path ───────────────────
 
-    /// A `float: left` body-direct child must be processed by
-    /// `fragment_pagination_root` with `is_float = true`, causing the
-    /// `if !is_float { prev_used_page = ... }` guard (lines 1108-1110) to
-    /// take its false branch. This exercises the normal-height float path.
+    /// A `float: left` body-direct child's used page name is not compared
+    /// with its siblings' ([`opportunities`] skips floats). This exercises
+    /// the normal-height float path.
     ///
-    /// The float carries `page: float-page` so that, without the guard,
-    /// `prev_used_page` would be set to `Some("float-page")`.  The
-    /// following in-flow sibling has the default (unnamed) page, so without
-    /// the guard `page_name_changed` would fire and push the sibling to
-    /// page 1 — causing `implied_page_count` to become 2.  The guard
-    /// suppresses that forced break, keeping both elements on page 0.
+    /// The float carries `page: float-page`. The following in-flow sibling
+    /// has the default (unnamed) page, so comparing the float's name would
+    /// force a break and push the sibling to page 1 — causing
+    /// `implied_page_count` to become 2. Skipping it keeps both elements on
+    /// page 0.
     #[test]
     fn body_direct_float_child_processed_without_prev_used_page_update() {
         let html = r#"
