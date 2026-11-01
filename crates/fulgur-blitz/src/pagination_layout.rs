@@ -755,28 +755,12 @@ fn would_split_block_subtree(
     // overflow is missed by the preflight, the recursion gate
     // returns false, and the parent falls back to a single
     // oversize fragment.
-    let layout_children_borrow = parent.layout_children.borrow();
-    let walk_children: Vec<usize> = layout_children_borrow
-        .as_deref()
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_vec())
-        .unwrap_or_else(|| parent.children.clone());
-    drop(layout_children_borrow);
-    for &child_id in &walk_children {
+    for child_id in walk_children_of(parent) {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
+        if leaves_the_flow(child) {
             continue;
-        }
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_oof = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_oof {
-                continue;
-            }
         }
         let layout = child.final_layout;
         let h = layout.size.height;
@@ -891,18 +875,28 @@ impl BreakValue {
     }
 }
 
-/// Whether the walk places `child` among its parent's children: neither
-/// white space, nor absolutely positioned or fixed (another pass places
-/// those), nor a running element (placed in a page margin box).
+/// Whether the walk places `child` among its parent's children: it neither
+/// leaves the flow ([`leaves_the_flow`]) nor is a running element
+/// ([`is_running`]).
 fn is_flow_child(flow: Flow<'_>, child: &blitz_dom::Node) -> bool {
+    !leaves_the_flow(child) && !is_running(flow, child)
+}
+
+/// Whether `child` takes no part in its parent's flow: white space, or
+/// absolutely positioned or fixed (another pass places those).
+fn leaves_the_flow(child: &blitz_dom::Node) -> bool {
     use ::style::properties::longhands::position::computed_value::T as Pos;
-    !crate::blitz_adapter::is_whitespace_only_text_node(child)
-        && !child
+    crate::blitz_adapter::is_whitespace_only_text_node(child)
+        || child
             .primary_styles()
             .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed))
-        && !flow
-            .running_store
-            .is_some_and(|store| store.instance_for_node(child.id).is_some())
+}
+
+/// Whether `child` is a `position: running()` element, which takes no room
+/// in the flow: it is placed in a page margin box.
+fn is_running(flow: Flow<'_>, child: &blitz_dom::Node) -> bool {
+    flow.running_store
+        .is_some_and(|store| store.instance_for_node(child.id).is_some())
 }
 
 /// The children the walk iterates for `node`: its layout children, which
@@ -1535,7 +1529,7 @@ fn first_page_lift(flow: Flow<'_>, node: &blitz_dom::Node, depth: usize) -> f32 
     if let Some(header) = repeating_table_header(doc, node.id, depth + 1, column_styles) {
         return header.first_page_lift_px;
     }
-    let lifts = in_flow_children(doc, node)
+    let lifts = in_flow_children(flow, node)
         .into_iter()
         .filter_map(|id| doc.get_node(id))
         .map(|child| first_page_lift(flow, child, depth + 1));
@@ -2361,7 +2355,7 @@ fn structure(flow: Flow<'_>, node: &blitz_dom::Node) -> BoxKind {
         return BoxKind::Table { table };
     }
     if crate::blitz_adapter::is_flex_or_grid_container_node(node) {
-        let items = in_flow_children(doc, node);
+        let items = in_flow_children(flow, node);
         let first_bottom = items
             .first()
             .and_then(|&id| doc.get_node(id))
@@ -2387,21 +2381,17 @@ fn is_transformed(node: &blitz_dom::Node) -> bool {
         .is_some_and(|s| !s.get_box().transform.0.is_empty())
 }
 
-/// The in-flow children of `node` with height, in layout order: the boxes
-/// the walk places one by one.
-fn in_flow_children(doc: &BaseDocument, node: &blitz_dom::Node) -> Vec<usize> {
-    let layout_children = node.layout_children.borrow();
-    let children = layout_children
-        .as_deref()
-        .filter(|children| !children.is_empty())
-        .unwrap_or(&node.children);
-    children
-        .iter()
-        .copied()
+/// The children of `node` that stay in the flow ([`leaves_the_flow`]) with
+/// height that are not floats, in layout order: the boxes that lead it
+/// ([`leading_of`]) and form its first line ([`structure`]). A running
+/// element the layout gives a height is one of them.
+fn in_flow_children(flow: Flow<'_>, node: &blitz_dom::Node) -> Vec<usize> {
+    walk_children_of(node)
+        .into_iter()
         .filter(|&id| {
-            doc.get_node(id).is_some_and(|child| {
-                !crate::blitz_adapter::is_whitespace_only_text_node(child)
-                    && !crate::blitz_adapter::is_out_of_flow_node(child)
+            flow.doc.get_node(id).is_some_and(|child| {
+                !leaves_the_flow(child)
+                    && !crate::blitz_adapter::node_is_floating(child)
                     && child.final_layout.size.height > 0.0
             })
         })
@@ -2591,7 +2581,7 @@ fn leading_of(
             if !enters(flow, node, kind, room, page_height_px) {
                 return whole;
             }
-            let Some(first) = in_flow_children(doc, node)
+            let Some(first) = in_flow_children(flow, node)
                 .first()
                 .and_then(|&id| doc.get_node(id))
             else {
@@ -2718,7 +2708,7 @@ fn table_leading(
             ..inner
         };
     }
-    let Some(row) = in_flow_children(doc, table)
+    let Some(row) = in_flow_children(flow, table)
         .first()
         .and_then(|&id| doc.get_node(id))
         .and_then(row_of)
@@ -3945,9 +3935,7 @@ fn fragment_block_subtree_inner(
     lifted: &mut f32,
     root: bool,
 ) -> (u32, f32) {
-    let Flow {
-        doc, running_store, ..
-    } = flow;
+    let Flow { doc, .. } = flow;
     // The parent's fragment on each page starts at the cursor's
     // `page_start_y`: the walk closes one and starts the next each time it
     // crosses a page boundary. fulgur-kv0r: `page_taffy_origin` is the
@@ -4093,25 +4081,14 @@ fn fragment_block_subtree_inner(
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
-        // Skip pure-whitespace text nodes — same convention as
-        // multicol_layout's `partition_children_into_segments`.
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
-            continue;
-        }
         // CSS 2.1 §10.6.4 / §9.6: out-of-flow elements (`position:
         // absolute` / `position: fixed`) do not contribute to their
         // containing block's normal-flow height, so the fragmenter must not
         // advance cursors for them. Abs/fixed children are handled by
         // separate passes (`append_position_fixed_fragments` and the abs
-        // positioning pipeline in `render`).
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_out_of_flow {
-                continue;
-            }
+        // positioning pipeline in `render`). White space is skipped too.
+        if leaves_the_flow(child) {
+            continue;
         }
         let layout = child.final_layout;
         // fulgur-s67g Phase 2.2: `position: running()` named elements are
@@ -4125,7 +4102,7 @@ fn fragment_block_subtree_inner(
         // layout still gives a height (an inline `position: running()`)
         // gives that room back: what follows it moves up by its height, as
         // the siblings after a lifted table do.
-        if running_store.is_some_and(|s| s.instance_for_node(child_id).is_some()) {
+        if is_running(flow, child) {
             let height = layout.size.height;
             if height.is_finite() && height > 0.0 && !allow_same_row_rebase {
                 cursor.page_taffy_origin += height;
