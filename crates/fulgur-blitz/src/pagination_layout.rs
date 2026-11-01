@@ -493,8 +493,6 @@ impl<'a> PaginationLayoutTree<'a> {
             self.page_height_px,
             0,
             None,
-            0.0,
-            false,
             false,
             &mut false,
             &mut remaining_repeat_budget,
@@ -3411,8 +3409,6 @@ fn fragment_block_box(
         page_height_px,
         depth,
         None,
-        0.0,
-        false,
         entered_below_content,
         page_has_content,
         remaining_repeat_budget,
@@ -3476,8 +3472,6 @@ fn fragment_table_cell(
         page_height_px - content_top,
         depth,
         None,
-        0.0,
-        false,
         entered_below_content,
         page_has_content,
         remaining_repeat_budget,
@@ -3686,8 +3680,6 @@ fn fragment_repeating_table(
             page_height_px,
             depth,
             None,
-            0.0,
-            false,
             entered_below_content,
             page_has_content,
             remaining_repeat_budget,
@@ -3790,9 +3782,7 @@ fn fragment_repeating_table(
         full_band_top,
         body_page_height,
         depth,
-        Some(&header.body_cell_ids),
-        header.body_origin_px,
-        true,
+        Some(header),
         first_table_top > 0.0,
         page_has_content,
         remaining_repeat_budget,
@@ -3988,6 +3978,10 @@ fn fragment_repeating_table(
 /// [`crate::MAX_DOM_DEPTH`] — any nodes below that depth go unrecorded
 /// (matches `record_subtree_descendants`).
 ///
+/// With `header`, the walk places the rows of a table below the header it
+/// repeats ([`fragment_repeating_table`]): it meets the table's body cells
+/// only, from the body's top, and compares no page names between them.
+///
 /// Returns `(final_page_index, final_cursor_y)`: the page and y where
 /// the parent's last child finished. The caller resumes its outer
 /// cursor from these values.
@@ -4002,9 +3996,7 @@ fn fragment_block_subtree_inner(
     cursor_in: f32,
     page_height_px: f32,
     depth: usize,
-    children_override: Option<&[usize]>,
-    initial_taffy_origin: f32,
-    co_split_rows: bool,
+    header: Option<&RepeatingTableHeader>,
     entered_below_content: bool,
     page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
@@ -4028,7 +4020,7 @@ fn fragment_block_subtree_inner(
         page_index: page_in,
         cursor_y: cursor_in,
         page_start_y: cursor_in,
-        page_taffy_origin: initial_taffy_origin,
+        page_taffy_origin: header.map_or(0.0, |header| header.body_origin_px),
         entry_page: page_in,
         entered_below_content,
         page_has_content: *page_has_content,
@@ -4091,7 +4083,7 @@ fn fragment_block_subtree_inner(
         .and_then(|gp_id| doc.get_node(gp_id))
         .is_some_and(|gp| crate::blitz_adapter::is_orthogonal_to_parent(gp, parent));
     let allow_same_row_rebase =
-        co_split_rows || crate::blitz_adapter::is_flex_or_grid_container_node(parent);
+        header.is_some() || crate::blitz_adapter::is_flex_or_grid_container_node(parent);
     let suppress_page_check = allow_same_row_rebase
         || crate::blitz_adapter::is_atomic_inline_container_node(parent)
         || parent_is_orthogonal;
@@ -4118,9 +4110,10 @@ fn fragment_block_subtree_inner(
     // `layout_children` without that fix would lose the parent's
     // pre-recursion-page fragment in mo-006/008 (flex/grid + tall
     // monolithic + trailing inline text).
-    let walk_children = children_override
-        .map(Vec::from)
-        .unwrap_or_else(|| walk_children_of(parent));
+    let walk_children = header.map_or_else(
+        || walk_children_of(parent),
+        |header| header.body_cell_ids.clone(),
+    );
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
     // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
@@ -4152,8 +4145,7 @@ fn fragment_block_subtree_inner(
             line_of[index] = Some(number);
         }
     }
-    let block_flow =
-        children_override.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
+    let block_flow = header.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
     for (index, (&child_id, &opportunity)) in walk_children.iter().zip(&opportunities).enumerate() {
         let Some(child) = doc.get_node(child_id) else {
             continue;
