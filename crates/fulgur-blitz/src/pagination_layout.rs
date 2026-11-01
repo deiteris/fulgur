@@ -1284,6 +1284,96 @@ fn kept_after_box(
     )
 }
 
+/// The top margin of `node` that adjoins its top edge, which a forced break
+/// before it keeps (css-break-3 §5.2): its own `margin-top`, collapsed (CSS
+/// 2.1 §8.3.1) with those of the first in-flow boxes that adjoin it, down
+/// through boxes with no top border or padding that establish no formatting
+/// context of their own, and through empty boxes. The largest positive
+/// margin and the most negative add up. Taffy's `final_layout.margin` is no
+/// measure of it: Blitz folds a floated first child's margin into its
+/// parent's there.
+fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
+    use ::style::values::computed::Length;
+    use ::style::values::generics::length::GenericMargin;
+    let own = |node: &blitz_dom::Node| {
+        let basis = node
+            .layout_parent
+            .get()
+            .or(node.parent)
+            .and_then(|id| doc.get_node(id))
+            .map_or(0.0, |parent| {
+                let layout = parent.final_layout;
+                layout.size.width
+                    - layout.padding.left
+                    - layout.padding.right
+                    - layout.border.left
+                    - layout.border.right
+            });
+        node.primary_styles()
+            .map_or(0.0, |styles| match &styles.get_margin().margin_top {
+                GenericMargin::LengthPercentage(lp) => lp.resolve(Length::new(basis)).px(),
+                _ => 0.0,
+            })
+    };
+    // Whether the margins of `node`'s first child adjoin its own top margin.
+    let opens_to_children = |node: &blitz_dom::Node| {
+        use ::style::values::computed::Overflow;
+        // Unrounded: a hairline edge rounds to zero in the final layout.
+        let layout = node.unrounded_layout;
+        layout.border.top <= 0.0
+            && layout.padding.top <= 0.0
+            && node.primary_styles().is_some_and(|styles| {
+                let display = styles.clone_display();
+                display.inside() == DisplayInside::Flow
+                    && styles.clone_overflow_x() == Overflow::Visible
+                    && styles.clone_overflow_y() == Overflow::Visible
+                    && !styles.get_box().clone_float().is_floating()
+            })
+    };
+    let (mut positive, mut negative) = (0.0_f32, 0.0_f32);
+    let mut add = |margin: f32| {
+        positive = positive.max(margin);
+        negative = negative.min(margin);
+    };
+    let mut current = node;
+    add(own(current));
+    for _ in 0..crate::MAX_DOM_DEPTH {
+        if !opens_to_children(current) {
+            break;
+        }
+        let mut next = None;
+        for id in walk_children_of(current) {
+            let Some(child) = doc.get_node(id) else {
+                continue;
+            };
+            if crate::blitz_adapter::is_whitespace_only_text_node(child)
+                || crate::blitz_adapter::is_out_of_flow_node(child)
+            {
+                continue;
+            }
+            if child.element_data().is_none() {
+                break;
+            }
+            add(own(child));
+            let layout = child.unrounded_layout;
+            let empty = layout.size.height <= 0.0
+                && layout.border.top <= 0.0
+                && layout.padding.top <= 0.0
+                && layout.border.bottom <= 0.0
+                && layout.padding.bottom <= 0.0;
+            if !empty {
+                next = Some(child);
+                break;
+            }
+        }
+        let Some(child) = next else {
+            break;
+        };
+        current = child;
+    }
+    positive + negative
+}
+
 /// Whether a header row that skips its table's first page
 /// (`-fulgur-header-repeat: skip-first`) lies below `node`: only the table's
 /// own fragmentation ([`fragment_repeating_table`]) leaves it off that page,
@@ -3387,13 +3477,14 @@ fn fragment_block_subtree_inner(
         if opportunity.is_forced() && !cursor.at_page_top() {
             cursor.close_parent(geometry, ParentHeight::Placed);
             cursor.break_to(doc, opportunity.side());
-            // The breaking child is the first in-flow child on the
-            // new page strip. Rebase the Taffy origin to its
-            // `this_top_in_parent` so it lands at `page_start_y` (= 0)
-            // — discarding the inter-child gap, matching CSS 3
-            // Fragmentation §3 (margins at forced breaks truncate).
-            cursor.page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
+            // The breaking child is the first in-flow child on the new page
+            // strip. css-break-3 §5.2 truncates the margins before a forced
+            // break and keeps those after it: the child starts its own top
+            // margin below the page top ([`adjoining_top_margin`]), the gap
+            // to the box before it dropped.
+            let margin = adjoining_top_margin(doc, child).max(0.0);
+            cursor.page_taffy_origin = this_top_in_parent - margin;
+            child_page_y = margin;
         } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
             cursor.move_to_side(doc, opportunity.side());
         }
@@ -11382,8 +11473,12 @@ h2 { string-set: chapter-title content(text); }
     /// `forced_inside`. Inside, A (h=100) at y=0 and B
     /// (h=100) at y=120 with `break-before: page`. The `margin-top:
     /// 20px` on B creates a 20px gap that the bug would leak through.
+    ///
+    /// css-break-3 §5.2 truncates the margins before a forced break and
+    /// keeps those after it: B keeps its own 20px top margin on page 1,
+    /// below the page top, where the walker placed it at y=0.
     #[test]
-    fn fragment_block_subtree_break_before_after_gap_places_child_at_y_zero() {
+    fn fragment_block_subtree_break_before_after_gap_keeps_the_childs_top_margin() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div id="outer" style="margin: 0; padding: 0">
@@ -11413,10 +11508,9 @@ h2 { string-set: chapter-title content(text); }
         for f in &b_on_page1 {
             let fy = f.y.to_f32();
             assert!(
-                fy.abs() < 0.5,
-                "B should land at y=0 on the new page (forced break discards \
-                 the inter-child gap), but got y={fy} (gap leaked through \
-                 break-before — see Devin Review on PR #285). frag={f:?}",
+                (fy - 20.0).abs() < 0.5,
+                "B should land at its 20px top margin on the new page (a forced \
+                 break keeps the margin after it), but got y={fy}. frag={f:?}",
             );
         }
     }
@@ -11461,6 +11555,54 @@ h2 { string-set: chapter-title content(text); }
                 "{edge}"
             );
         }
+    }
+
+    /// A forced break keeps the top margin of the box after it (css-break-3
+    /// §5.2), after a `break-before` and after a `break-after`, at the body
+    /// level and nested: the box starts its own 10px margin below the page
+    /// top, the 30px gap to the box before the break dropped; and a margin
+    /// that collapses through the top of the box's first child is the box's
+    /// (15px). The walker placed the box at the page top.
+    #[test]
+    fn a_child_after_a_forced_break_keeps_its_top_margin() {
+        let page_y = |open: &str, close: &str, before: &str, after: &str| {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0">{open}
+                  <div style="height: 40px; margin-bottom: 30px; {after}"></div>
+                  <div id="b" style="height: 20px; margin-top: 10px; {before}"></div>
+                {close}</body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            page_ys(&doc, &geom, "b")
+        };
+        for (open, close) in [("", ""), ("<div>", "</div>")] {
+            assert_eq!(
+                page_y(open, close, "break-before: page", ""),
+                [(1, 10.0)],
+                "before {open}"
+            );
+            assert_eq!(
+                page_y(open, close, "", "break-after: page"),
+                [(1, 10.0)],
+                "after {open}"
+            );
+        }
+        let html = r#"<html><body style="margin: 0; padding: 0">
+              <div style="height: 40px"></div>
+              <section id="s" style="break-before: page">
+                <div id="h" style="height: 20px; margin-top: 15px"></div>
+              </section>
+            </body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        assert_eq!(
+            (page_ys(&doc, &geom, "s"), page_ys(&doc, &geom, "h")),
+            (vec![(1, 15.0)], vec![(1, 15.0)])
+        );
     }
 
     /// A `break-after` and the next box's `break-before`, forced, are one
@@ -11647,11 +11789,12 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(a.len(), 1, "{a:?}");
     }
 
-    /// A forced break truncates the gap above the child after it at the body
-    /// level, as below it, whatever the child's height: one that nearly
-    /// fills the page starts at the page top too.
+    /// A forced break keeps the top margin of the child after it at the body
+    /// level (css-break-3 §5.2), whatever the child's height: one that fills
+    /// the page with its margin starts below the page top too, by its own
+    /// margin, not by the gap to the box before the break.
     #[test]
-    fn a_page_filling_child_after_a_forced_break_starts_at_the_page_top() {
+    fn a_page_filling_child_after_a_forced_break_keeps_its_top_margin() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div style="height: 40px; margin: 0"></div>
@@ -11673,8 +11816,8 @@ h2 { string-set: chapter-title content(text); }
             "expected only the second child on page 1, geom={geom:?}"
         );
         assert!(
-            second_on_page1[0].y.to_f32().abs() < 0.5,
-            "the gap above a child after a forced break is truncated; geom={geom:?}"
+            (second_on_page1[0].y.to_f32() - 10.0).abs() < 0.5,
+            "a child after a forced break keeps its top margin; geom={geom:?}"
         );
     }
 
