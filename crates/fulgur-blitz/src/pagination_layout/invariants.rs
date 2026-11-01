@@ -73,8 +73,9 @@ enum Invariant {
     /// A fragment of an item of a line (a flex or grid line's item, a
     /// table row's cell), stretched to the line, ends no lower than the
     /// line ends on its page: the lowest end of its items' content and
-    /// bottom edges there, or the page foot on a page the line continues
-    /// past.
+    /// bottom edges there, or the page foot on a page where the line breaks
+    /// inside content (a box in an item goes on to a later page, or an
+    /// item's content and bottom edge reach the foot).
     EndsWithLine,
 }
 
@@ -749,10 +750,30 @@ impl Placed<'_> {
                 else {
                     continue;
                 };
+                // The line breaks inside content on this page when a box in
+                // one of its items goes on to a later page, or an item's
+                // content and bottom edge reach the foot: only then may its
+                // fragments run on to the foot.
+                let breaks_inside = page < last_page
+                    && line.iter().any(|&c| {
+                        let frags = &self.fragments[c];
+                        let edge = if frags.last().is_some_and(|f| f.page_index == page) {
+                            0.0
+                        } else {
+                            self.case.boxes[c].bottom_edge
+                        };
+                        self.content_end(c, page)
+                            .is_some_and(|end| end + edge >= self.page_height - EPS)
+                            || enclosed(self.case, c).iter().any(|&child| {
+                                let frags = &self.fragments[child];
+                                frags.iter().any(|f| f.page_index == page)
+                                    && frags.iter().any(|f| f.page_index > page)
+                            })
+                    });
                 for &c in &line {
                     for f in self.fragments[c].iter().filter(|f| f.page_index == page) {
                         let bottom = f.y.to_f32() + f.height.to_f32();
-                        let to_foot = page < last_page && bottom >= self.page_height - EPS;
+                        let to_foot = breaks_inside && bottom >= self.page_height - EPS;
                         if bottom > end + EPS && bottom <= self.page_height + EPS && !to_foot {
                             let info = &self.case.boxes[c];
                             out.push((
@@ -784,51 +805,86 @@ impl Placed<'_> {
             .collect()
     }
 
-    /// Where the item `c`'s content ends on `page` with its bottom edge,
-    /// if it has a fragment there: below its children's fragments there,
-    /// as [`Self::counted_bottom`] counts them, and on a child's last page
-    /// below its margin box ([`Self::trailing`]); below its top edge where
-    /// it holds none.
+    /// Where the item `c`'s content ends on `page`, if it has a fragment
+    /// there: below its children's there ([`Self::children_end`]), or
+    /// below the top edge it repeats where it holds none, and on its last
+    /// page below its bottom edge.
     fn content_end(&self, c: usize, page: u32) -> Option<f32> {
         let info = &self.case.boxes[c];
-        let top = self.fragments[c]
+        let frags = &self.fragments[c];
+        let top = frags
             .iter()
             .filter(|f| f.page_index == page)
             .map(|f| f.y.to_f32())
             .reduce(f32::min)?;
-        let content = enclosed(self.case, c)
-            .iter()
-            .flat_map(|&child| {
-                let frags = &self.fragments[child];
+        let content = self
+            .children_end(c, page)
+            .map_or(top + info.repeated_edge, |end| {
+                end.max(top + info.repeated_edge)
+            });
+        let last = frags.last().is_some_and(|f| f.page_index == page);
+        Some(content + if last { info.bottom_edge } else { 0.0 })
+    }
+
+    /// Where the content of `b`'s fragment `k` ends: its fragment's end as
+    /// [`Self::counted_bottom`] counts it, a paragraph's padding and border
+    /// added, which its fragments, measured by its lines, leave out (its
+    /// top edge on its first fragment, its bottom edge on its last), and a
+    /// container's lowest child on its page below it, with the container's
+    /// bottom edge on its last fragment; a float in a block that is no
+    /// formatting context root may hang below the block's edge.
+    fn content_bottom(&self, b: usize, k: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        let frags = &self.fragments[b];
+        let own = self.counted_bottom(b, k);
+        let last = k + 1 == frags.len();
+        if info.kind == Kind::Para {
+            let top = if k == 0 { info.bottom_edge } else { 0.0 };
+            let bottom = if last { info.bottom_edge } else { 0.0 };
+            return own + top + bottom;
+        }
+        let page = frags[k].page_index;
+        let edge = if last { info.bottom_edge } else { 0.0 };
+        let in_flow = self
+            .children_end_where(b, page, |c| self.case.boxes[c].kind != Kind::Float)
+            .map_or(own, |end| own.max(end + edge));
+        self.children_end_where(b, page, |c| self.case.boxes[c].kind == Kind::Float)
+            .map_or(in_flow, |end| in_flow.max(end))
+    }
+
+    /// The lowest end on `page` of the content of `b`'s children
+    /// ([`Self::content_bottom`]), each on its last page with the bottom
+    /// margin that stays inside `b`: `b`'s last in-flow child's margin
+    /// collapses through a block with no bottom edge, and is counted where
+    /// that margin stops ([`Self::margin_through`]).
+    fn children_end(&self, b: usize, page: u32) -> Option<f32> {
+        self.children_end_where(b, page, |_| true)
+    }
+
+    /// [`Self::children_end`] over the children `keep` keeps.
+    fn children_end_where(&self, b: usize, page: u32, keep: impl Fn(usize) -> bool) -> Option<f32> {
+        let info = &self.case.boxes[b];
+        let collapses = info.kind == Kind::Block && info.bottom_edge == 0.0;
+        enclosed(self.case, b)
+            .into_iter()
+            .filter(|&c| keep(c))
+            .flat_map(|c| {
+                let frags = &self.fragments[c];
                 frags
                     .iter()
                     .enumerate()
                     .filter(move |(_, f)| f.page_index == page)
-                    .map(move |(k, _)| {
-                        let trailing = if k + 1 == frags.len() {
-                            self.trailing(child)
-                        } else {
-                            0.0
-                        };
-                        self.counted_bottom(child, k) + trailing
-                    })
+                    .map(move |(k, _)| (c, k, k + 1 == frags.len()))
             })
-            .fold(top + info.repeated_edge, f32::max);
-        Some(content + info.bottom_edge)
-    }
-
-    /// How far below the end of its last fragment `b`'s margin box ends:
-    /// its bottom margin ([`Self::margin_through`]), and a paragraph's
-    /// padding and border, top and bottom, which its fragments, measured by
-    /// its lines, leave out.
-    fn trailing(&self, b: usize) -> f32 {
-        let info = &self.case.boxes[b];
-        let edges = if info.kind == Kind::Para {
-            2.0 * info.bottom_edge
-        } else {
-            0.0
-        };
-        edges + self.margin_through(b)
+            .map(|(c, k, last)| {
+                let margin = if last && !collapses {
+                    self.margin_through(c)
+                } else {
+                    0.0
+                };
+                self.content_bottom(c, k) + margin
+            })
+            .reduce(f32::max)
     }
 
     /// `b`'s bottom margin, collapsed with its last in-flow child's when it
@@ -1518,6 +1574,204 @@ fn an_item_stretched_past_its_line_s_end_is_flagged() {
         [(3, 1)],
         "past the line's end on its last page"
     );
+}
+
+/// The items of `case` that [`Placed::past_line_end`] flags on pages
+/// `page_height` px tall with `fragments`, as `(box, page)`.
+fn flagged_items(
+    case: &Case,
+    page_height: f32,
+    fragments: Vec<Vec<Fragment>>,
+) -> Vec<(usize, u32)> {
+    Placed {
+        case,
+        page_height,
+        fragments,
+        line_boundaries: vec![Vec::new(); case.boxes.len()],
+        layout_height: vec![0.0; case.boxes.len()],
+        past: vec![BTreeSet::new(); case.boxes.len()],
+    }
+    .past_line_end()
+    .into_iter()
+    .map(|(item, page, _)| (item, page))
+    .collect()
+}
+
+/// A leaf of `height` px with `style`.
+fn styled_leaf(style: BoxStyle, height: u16) -> Gen {
+    Gen::Leaf { style, height }
+}
+
+/// A paragraph of `lines` 20 px lines with `style` and no line counts.
+fn para(style: BoxStyle, lines: u8) -> Gen {
+    Gen::Para {
+        style,
+        lines,
+        line_height: 20,
+        counts: None,
+    }
+}
+
+/// A flex row of `items`.
+fn flex_row(items: Vec<Gen>) -> Gen {
+    Gen::Flex {
+        style: BoxStyle::default(),
+        grid: false,
+        items,
+    }
+}
+
+/// An item emptied of its content, its fragment stretched to the foot of
+/// a page its line continues past, is flagged when no content of the line
+/// crosses that page's break: a flex row of a 40 px leaf beside a 60 px leaf
+/// moved whole to the next page on 100 px pages.
+#[test]
+fn an_empty_item_fragment_stretched_to_the_foot_is_flagged() {
+    let case = Case::new(&[flex_row(vec![
+        styled_leaf(BoxStyle::default(), 40),
+        styled_leaf(BoxStyle::default(), 60),
+    ])]);
+    // b0 the row, b1 and b3 its items, b2 and b4 their leaves.
+    let mut fragments = vec![Vec::new(); case.boxes.len()];
+    fragments[1] = vec![fragment(0, 0.0, 40.0)];
+    fragments[2] = vec![fragment(0, 0.0, 40.0)];
+    fragments[3] = vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 60.0)];
+    fragments[4] = vec![fragment(1, 0.0, 60.0)];
+    assert_eq!(flagged_items(&case, 100.0, fragments), [(3, 0)]);
+}
+
+/// The row below a cell spanning it is one line with the spanning cell's
+/// row: its cell may run on to the foot of a page while the spanning cell's
+/// content crosses that page's break, and not once the spanning cell ends
+/// above it. A table of a spanning cell and a 50 px cell over one cell, on
+/// 100 px pages.
+#[test]
+fn a_cell_below_a_spanning_cell_breaks_with_the_spanning_cell() {
+    let leaf = |height| styled_leaf(BoxStyle::default(), height);
+    let case = Case::new(&[Gen::Table {
+        style: BoxStyle::default(),
+        head: Head::None,
+        caption: false,
+        counts: None,
+        row_counts: None,
+        cell_padding: 0,
+        rows: vec![(false, vec![leaf(130), leaf(50)]), (false, vec![leaf(30)])],
+        span: Some(0),
+    }]);
+    // b0 the table, b1 the first row, b2 the spanning cell and b3 its leaf,
+    // b4 and b5 the cell beside it, b6 the second row, b7 and b8 its cell.
+    let flagged = |spanning: Vec<Fragment>| {
+        let mut fragments = vec![Vec::new(); case.boxes.len()];
+        fragments[2] = spanning.clone();
+        fragments[3] = spanning;
+        fragments[4] = vec![fragment(0, 0.0, 50.0)];
+        fragments[5] = vec![fragment(0, 0.0, 50.0)];
+        fragments[7] = vec![fragment(0, 50.0, 50.0), fragment(1, 0.0, 30.0)];
+        fragments[8] = vec![fragment(1, 0.0, 30.0)];
+        flagged_items(&case, 100.0, fragments)
+    };
+    let none: [(usize, u32); 0] = [];
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 30.0)]),
+        none,
+        "the spanning cell crosses the break"
+    );
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 60.0)]),
+        [(7, 0)],
+        "the spanning cell ends above the break"
+    );
+}
+
+/// A bottom margin collapses through the blocks with no bottom edge that
+/// end with it, and counts once: an item holding two nested blocks that end
+/// with a leaf of a 17 px bottom margin ends with its line 17 px below the
+/// leaf, beside a 5 px leaf, on 100 px pages.
+#[test]
+fn a_bottom_margin_collapsing_through_its_blocks_counts_once() {
+    let margined = BoxStyle {
+        margin_bottom: 17,
+        ..BoxStyle::default()
+    };
+    let case = Case::new(&[flex_row(vec![
+        styled_leaf(BoxStyle::default(), 5),
+        Gen::Block {
+            style: BoxStyle::default(),
+            children: vec![Gen::Block {
+                style: BoxStyle::default(),
+                children: vec![styled_leaf(margined, 50)],
+            }],
+        },
+    ])]);
+    // b0 the row, b1 an item and b2 its leaf, b3 the other item, b4 and b5
+    // the blocks in it, b6 the leaf.
+    let flagged = |item_end: f32| {
+        let mut fragments = vec![Vec::new(); case.boxes.len()];
+        fragments[1] = vec![fragment(0, 0.0, item_end)];
+        fragments[2] = vec![fragment(0, 0.0, 5.0)];
+        fragments[3] = vec![fragment(0, 0.0, item_end)];
+        for frags in &mut fragments[4..=6] {
+            *frags = vec![fragment(0, 0.0, 50.0)];
+        }
+        flagged_items(&case, 100.0, fragments)
+    };
+    let none: [(usize, u32); 0] = [];
+    assert_eq!(flagged(67.0), none, "to the margin's end");
+    assert_eq!(flagged(85.0), [(1, 0), (3, 0)], "past it");
+}
+
+/// A paragraph's fragments, measured by its lines, leave out its padding
+/// and border, at any depth: an item holding a block that ends with a split
+/// paragraph padded 12 px, with a 17 px bottom margin, ends with its line
+/// 12 + 17 px below the paragraph's last line, on 150 px pages.
+#[test]
+fn a_nested_paragraph_s_padding_counts_in_its_line() {
+    let padded = BoxStyle {
+        padding: 12,
+        margin_bottom: 17,
+        ..BoxStyle::default()
+    };
+    let case = Case::new(&[flex_row(vec![
+        styled_leaf(BoxStyle::default(), 5),
+        Gen::Block {
+            style: BoxStyle::default(),
+            children: vec![para(padded, 9)],
+        },
+    ])]);
+    // b0 the row, b1 an item and b2 its leaf, b3 the other item, b4 the
+    // block, b5 the paragraph: 4 lines on page 0, 5 on page 1.
+    let mut fragments = vec![Vec::new(); case.boxes.len()];
+    fragments[1] = vec![fragment(0, 0.0, 150.0), fragment(1, 0.0, 129.0)];
+    fragments[2] = vec![fragment(0, 0.0, 5.0)];
+    fragments[3] = fragments[1].clone();
+    fragments[4] = vec![fragment(0, 0.0, 80.0), fragment(1, 0.0, 100.0)];
+    fragments[5] = fragments[4].clone();
+    let none: [(usize, u32); 0] = [];
+    assert_eq!(flagged_items(&case, 150.0, fragments), none);
+}
+
+/// A split paragraph's top padding and border lie on its first page only:
+/// on its last page its line ends below its last line by its bottom edge
+/// alone. A flex row of a 5 px leaf beside a paragraph padded 10 px, 3 of
+/// its lines on the second of 100 px pages, the items 5 px past that.
+#[test]
+fn a_split_paragraph_s_top_edge_stays_on_its_first_page() {
+    let padded = BoxStyle {
+        padding: 10,
+        ..BoxStyle::default()
+    };
+    let case = Case::new(&[flex_row(vec![
+        styled_leaf(BoxStyle::default(), 5),
+        para(padded, 7),
+    ])]);
+    // b0 the row, b1 an item and b2 its leaf, b3 the other item, b4 the
+    // paragraph: 4 lines below its top edge on page 0, 3 on page 1.
+    let mut fragments = vec![Vec::new(); case.boxes.len()];
+    fragments[1] = vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 75.0)];
+    fragments[2] = vec![fragment(0, 0.0, 5.0)];
+    fragments[3] = fragments[1].clone();
+    fragments[4] = vec![fragment(0, 0.0, 80.0), fragment(1, 0.0, 60.0)];
+    assert_eq!(flagged_items(&case, 100.0, fragments), [(1, 1), (3, 1)]);
 }
 
 /// A table's repeated header is counted once a page, however many times it
