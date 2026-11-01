@@ -472,13 +472,13 @@ impl<'a> PaginationLayoutTree<'a> {
                 height: body_layout.size.height.as_px(),
             });
 
-        let breaks = BreakCache::default();
+        let pass = Pass::default();
         let flow = Flow {
             doc: self.doc,
             column_styles: self.column_styles,
             used_page_names: self.used_page_names.as_ref(),
             running_store: self.running_store,
-            breaks: &breaks,
+            pass: &pass,
             forced_before: None,
         };
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
@@ -1032,18 +1032,20 @@ fn line_break(
             BreakValue::own_before(props)
         }
     };
+    let at_edge = flow
+        .pass
+        .row_group(flow.doc, row)
+        .is_some_and(|(group, index)| {
+            if after {
+                index + 1 == group.rows.len()
+            } else {
+                index == 0
+            }
+        });
     let group = row
         .parent
         .and_then(|id| flow.doc.get_node(id))
-        .filter(|group| {
-            let mut rows = group
-                .children
-                .iter()
-                .filter_map(|&id| flow.doc.get_node(id))
-                .filter(|&node| displays(node, DisplayInside::TableRow));
-            let edge = if after { rows.last() } else { rows.next() };
-            edge.is_some_and(|edge| edge.id == row.id) && !displays(group, DisplayInside::Table)
-        });
+        .filter(|group| at_edge && !displays(group, DisplayInside::Table));
     let group = group.map_or(BreakValue::Auto, own);
     if after {
         boxes.then(own(row)).then(group)
@@ -1088,7 +1090,7 @@ fn break_before_of(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    BreakCache::get(&flow.breaks.before, node, page_height_px, || {
+    BreakCache::get(&flow.pass.breaks.before, node, page_height_px, || {
         break_before_uncached(flow, node, page_height_px, depth)
     })
 }
@@ -1127,7 +1129,7 @@ fn break_after_of(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    BreakCache::get(&flow.breaks.after, node, page_height_px, || {
+    BreakCache::get(&flow.pass.breaks.after, node, page_height_px, || {
         break_after_uncached(flow, node, page_height_px, depth)
     })
 }
@@ -1224,7 +1226,7 @@ fn opportunities(
             .doc
             .get_node(children[line[0]])
             .and_then(|cell| table_row_of(flow.doc, cell))
-            .is_some_and(|row| spanned_from_above(flow.doc, row));
+            .is_some_and(|row| spanned_from_above(flow, row));
         values[line[0]] = if spanned { BreakValue::Auto } else { value };
         previous_after = Some(line_break(
             flow,
@@ -1251,7 +1253,7 @@ fn forced_inside(
     page_height_px: f32,
     depth: usize,
 ) -> bool {
-    BreakCache::get(&flow.breaks.forced, node, page_height_px, || {
+    BreakCache::get(&flow.pass.breaks.forced, node, page_height_px, || {
         forced_inside_uncached(flow, node, page_height_px, depth)
     })
 }
@@ -1766,16 +1768,14 @@ fn line_moves_on(
     page_height_px: f32,
     depth: usize,
 ) -> bool {
-    let Flow {
-        doc, column_styles, ..
-    } = flow;
+    let Flow { doc, .. } = flow;
     let Some(&first) = items.first() else {
         return false;
     };
     let room = page_height_px - line_y;
     if let Some(row) = table_row_of(doc, first) {
-        let movable = kept_table_row_bottom(doc, column_styles, first, page_height_px).is_some()
-            || !spanned_from_above(doc, row);
+        let movable = kept_table_row_bottom(flow, first, page_height_px).is_some()
+            || !spanned_from_above(flow, row);
         if !movable || line_y <= 0.0 {
             return false;
         }
@@ -2290,11 +2290,13 @@ impl PageCursor {
 /// at a page foot apart from its rows; a cell of a spanned row that spans
 /// further takes its own rows along too.
 fn kept_table_row_bottom(
-    doc: &BaseDocument,
-    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    flow: Flow<'_>,
     cell: &blitz_dom::Node,
     page_height_px: f32,
 ) -> Option<f32> {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
     let row = doc.get_node(cell.parent?)?;
     if !displays(row, DisplayInside::TableRow) {
         return None;
@@ -2307,14 +2309,15 @@ fn kept_table_row_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    let (rows, index) = group_rows(doc, row)?;
-    let end = span_end(doc, &rows, index);
+    let (group, index) = flow.pass.row_group(doc, row)?;
+    let end = group.reach[index];
     if end == index && !avoid {
         return None;
     }
-    let (top, bottom) = rows[index..=end]
+    let (top, bottom) = group.rows[index..=end]
         .iter()
-        .flat_map(|&row| row_cells(doc, row))
+        .filter_map(|&id| doc.get_node(id))
+        .flat_map(|row| row_cells(doc, row))
         .map(|node| {
             let layout = node.final_layout;
             (layout.location.y, layout.location.y + layout.size.height)
@@ -2366,9 +2369,7 @@ enum Whole {
 /// What `node` is to the fragmenter on pages `page_height_px` tall
 /// ([`BoxKind`]).
 fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxKind {
-    let Flow {
-        doc, column_styles, ..
-    } = flow;
+    let Flow { doc, .. } = flow;
     // An atomic inline or a box in an orthogonal flow is monolithic (CSS
     // Writing Modes 4 §9), which the walk did not decide before `classify`:
     // an orthogonal inline root was split between its lines. Neither reaches
@@ -2387,7 +2388,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
             )
         });
     if (avoid && extent(flow, node, 0) <= page_height_px + 1.0)
-        || kept_table_row_bottom(doc, column_styles, node, page_height_px).is_some()
+        || kept_table_row_bottom(flow, node, page_height_px).is_some()
     {
         return BoxKind::Monolithic(Whole::Kept);
     }
@@ -2580,9 +2581,7 @@ fn leading_of(
     page_height_px: f32,
     depth: usize,
 ) -> Leading {
-    let Flow {
-        doc, column_styles, ..
-    } = flow;
+    let Flow { doc, .. } = flow;
     let height = extent(flow, node, depth);
     let whole = Leading::whole(height, room);
     if depth >= crate::MAX_DOM_DEPTH {
@@ -2618,13 +2617,10 @@ fn leading_of(
         BoxKind::Parallel { tracks, top } => {
             let row = displays(node, DisplayInside::TableRow);
             if row
-                && let Some(bottom) =
-                    tracks
-                        .first()
-                        .and_then(|&id| doc.get_node(id))
-                        .and_then(|cell| {
-                            kept_table_row_bottom(doc, column_styles, cell, page_height_px)
-                        })
+                && let Some(bottom) = tracks
+                    .first()
+                    .and_then(|&id| doc.get_node(id))
+                    .and_then(|cell| kept_table_row_bottom(flow, cell, page_height_px))
             {
                 return Leading::whole(bottom - top, room).relaxed();
             }
@@ -2876,22 +2872,11 @@ fn slices_at_a_page_top(node: &blitz_dom::Node) -> bool {
 }
 
 /// Whether a cell of an earlier row of `row`'s group spans down to it
-/// ([`span_end`], from the group's first row on): the rows a cell spans
-/// have no break opportunity between them, so none of them but the first
-/// moves alone ([`line_moves_on`]).
-fn spanned_from_above(doc: &BaseDocument, row: &blitz_dom::Node) -> bool {
-    let Some((rows, index)) = group_rows(doc, row) else {
-        return false;
-    };
-    let mut start = 0;
-    while start < index {
-        let end = span_end(doc, &rows, start);
-        if index <= end {
-            return true;
-        }
-        start = end + 1;
-    }
-    false
+/// ([`RowGroup::spanned`]).
+fn spanned_from_above(flow: Flow<'_>, row: &blitz_dom::Node) -> bool {
+    flow.pass
+        .row_group(flow.doc, row)
+        .is_some_and(|(group, index)| group.spanned[index])
 }
 
 /// Whether `node`'s display has the inner type `inside`.
@@ -3121,10 +3106,86 @@ struct Flow<'a> {
     column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
     used_page_names: Option<&'a crate::blitz_adapter::UsedPageNameTable>,
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
-    breaks: &'a BreakCache,
+    pass: &'a Pass,
     /// The first cell of a table row before which the walk takes a forced
     /// break, for its table's row `widows` ([`fragment_table_rows`]).
     forced_before: Option<usize>,
+}
+
+/// What a pass computes once and every walk of it reads: the break values
+/// of its boxes, and the rows of its tables' row groups.
+#[derive(Default)]
+struct Pass {
+    breaks: BreakCache,
+    /// The rows of each row group asked about, by the group's node.
+    rows: std::cell::RefCell<BTreeMap<usize, std::rc::Rc<RowGroup>>>,
+}
+
+impl Pass {
+    /// The row group the table row `row` belongs to, and its index in it,
+    /// read once a group ([`group_rows`]).
+    fn row_group(
+        &self,
+        doc: &BaseDocument,
+        row: &blitz_dom::Node,
+    ) -> Option<(std::rc::Rc<RowGroup>, usize)> {
+        let group_id = row.parent?;
+        let cached = self.rows.borrow().get(&group_id).cloned();
+        let group = match cached {
+            Some(group) => group,
+            None => {
+                let (rows, _) = group_rows(doc, row)?;
+                let group = std::rc::Rc::new(RowGroup::new(doc, &rows));
+                self.rows.borrow_mut().insert(group_id, group.clone());
+                group
+            }
+        };
+        let index = *group.index.get(&row.id)?;
+        Some((group, index))
+    }
+}
+
+/// The rows of one row group, as its table's walk and break queries ask
+/// about them row by row ([`Pass::row_group`]).
+struct RowGroup {
+    rows: Vec<usize>,
+    /// Each row's index in `rows`, by its node.
+    index: BTreeMap<usize, usize>,
+    /// The last row the cells from each row reach by `rowspan`
+    /// ([`span_end`]).
+    reach: Vec<usize>,
+    /// Whether a cell of an earlier row spans down to each row (a span
+    /// from the group's first row on, [`span_end`]): the rows a cell spans
+    /// have no break opportunity between them, so none of them but the
+    /// first moves alone ([`line_moves_on`]).
+    spanned: Vec<bool>,
+}
+
+impl RowGroup {
+    fn new(doc: &BaseDocument, rows: &[&blitz_dom::Node]) -> Self {
+        let reach: Vec<usize> = (0..rows.len())
+            .map(|from| span_end(doc, rows, from))
+            .collect();
+        let mut spanned = vec![false; rows.len()];
+        let mut start = 0;
+        while start < rows.len() {
+            let end = reach[start];
+            for flag in &mut spanned[start + 1..=end] {
+                *flag = true;
+            }
+            start = end + 1;
+        }
+        Self {
+            rows: rows.iter().map(|row| row.id).collect(),
+            index: rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id, index))
+                .collect(),
+            reach,
+            spanned,
+        }
+    }
 }
 
 /// The break values of the boxes a pass has asked about, by node and page
@@ -7453,7 +7514,7 @@ mod tests {
                 column_styles: None,
                 used_page_names: None,
                 running_store: None,
-                breaks: &BreakCache::default(),
+                pass: &Pass::default(),
                 forced_before: None,
             },
             parent_id,
@@ -7534,7 +7595,7 @@ mod tests {
                 column_styles: None,
                 used_page_names: None,
                 running_store: None,
-                breaks: &BreakCache::default(),
+                pass: &Pass::default(),
                 forced_before: None,
             },
             table_id,
@@ -14674,10 +14735,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|from| super::span_end(&doc, &rows, from))
             .collect();
         assert_eq!(ends, [1, 1, 2, 5, 5, 5, 7, 7]);
-        let spanned: Vec<bool> = rows
-            .iter()
-            .map(|row| super::spanned_from_above(&doc, row))
-            .collect();
+        let spanned = super::RowGroup::new(&doc, &rows).spanned;
         assert_eq!(
             spanned,
             [false, true, false, false, true, true, false, true]
