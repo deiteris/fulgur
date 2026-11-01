@@ -14,6 +14,8 @@
 9 PastFoot b4 0  # page cursor
 9 PastFoot b5 0  # page cursor
 29 PastFoot b5 2  # edge model
+30 EndsWithLine b1 1  # unexplained
+30 EndsWithLine b3 1  # unexplained
 43 PlacedOnce b10 3  # edge model
 51 PlacedOnce b15 5  # edge model
 51 PlacedOnce b6 0  # edge model
@@ -70,6 +72,8 @@
 174 PlacedOnce b7 4  # table walker
 177 PlacedOnce b14 0  # edge model
 184 PlacedOnce b6 0  # edge model
+190 EndsWithLine b12 2  # unexplained
+190 EndsWithLine b14 2  # unexplained
 198 PlacedOnce b2 0  # edge model
 201 PlacedOnce b11 4  # edge model
 201 PlacedOnce b2 0  # edge model

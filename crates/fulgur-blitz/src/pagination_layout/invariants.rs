@@ -11,7 +11,7 @@
 //! rows, and `break-before` and `break-after` of `page`, `left`, `right`,
 //! or `avoid`. Pages are 100 to 400 px tall. Each case is laid out with its
 //! break styles, its captions moved out of their tables as the engine moves
-//! them, and checked against five invariants ([`Invariant`]).
+//! them, and checked against six invariants ([`Invariant`]).
 //!
 //! The cases are drawn from fixed seeds, one per case, so a failure names
 //! its seed, and are laid out in Noto Sans with no system font, so they are
@@ -69,6 +69,12 @@ enum Invariant {
     Encloses,
     /// No repeated header sits on a page without a body row.
     HeaderAlone,
+    /// A fragment of an item of a line (a flex or grid line's item, a
+    /// table row's cell), stretched to the line, ends no lower than the
+    /// line ends on its page: the lowest end of its items' content and
+    /// bottom edges there, or the page foot on a page the line continues
+    /// past.
+    EndsWithLine,
 }
 
 /// The part of the fragmenter expected to fix a violation, as the golden's
@@ -361,6 +367,10 @@ struct Info {
     repeated_edge: f32,
     /// The rows a table cell spans.
     rowspan: usize,
+    /// The bottom margin.
+    margin_bottom: f32,
+    /// The bottom padding and border.
+    bottom_edge: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -462,6 +472,8 @@ impl Case {
             edged: false,
             repeated_edge: 0.0,
             rowspan: 1,
+            margin_bottom: 0.0,
+            bottom_edge: 0.0,
         });
         if let Some(parent) = parent {
             self.boxes[parent].children.push(index);
@@ -469,11 +481,19 @@ impl Case {
         index
     }
 
+    /// Record the edges `style` gives the box `b`.
+    fn edges(&mut self, b: usize, style: &BoxStyle) {
+        let info = &mut self.boxes[b];
+        info.edged = has_edges(style);
+        info.margin_bottom = f32::from(style.margin_bottom);
+        info.bottom_edge = f32::from(style.padding) + f32::from(style.border);
+    }
+
     fn emit(&mut self, node: &Gen, parent: Option<usize>, in_header: bool, out: &mut String) {
         match node {
             Gen::Leaf { style, height } => {
                 let b = self.add(Kind::Leaf, parent, in_header, 0);
-                self.boxes[b].edged = has_edges(style);
+                self.edges(b, style);
                 let _ = write!(
                     out,
                     r#"<div id="b{b}" style="{}height: {height}px"></div>"#,
@@ -502,7 +522,7 @@ impl Case {
                 counts,
             } => {
                 let b = self.add(Kind::Para, parent, in_header, usize::from(*lines));
-                self.boxes[b].edged = has_edges(style);
+                self.edges(b, style);
                 let text = (1..=*lines)
                     .map(|n| n.to_string())
                     .collect::<Vec<_>>()
@@ -516,7 +536,7 @@ impl Case {
             }
             Gen::Block { style, children } => {
                 let b = self.add(Kind::Block, parent, in_header, 0);
-                self.boxes[b].edged = has_edges(style);
+                self.edges(b, style);
                 let _ = write!(out, r#"<div id="b{b}" style="{}">"#, style_css(style));
                 for child in children {
                     self.emit(child, Some(b), in_header, out);
@@ -534,7 +554,7 @@ impl Case {
                 span,
             } => {
                 let t = self.add(Kind::Table, parent, in_header, 0);
-                self.boxes[t].edged = has_edges(style);
+                self.edges(t, style);
                 let _ = write!(
                     out,
                     r#"<table id="b{t}" style="{}{}{}">"#,
@@ -576,6 +596,7 @@ impl Case {
                         let c = self.add(Kind::BodyCell, Some(r), in_header, 0);
                         self.boxes[c].edged = *cell_padding > 0;
                         self.boxes[c].repeated_edge = f32::from(*cell_padding);
+                        self.boxes[c].bottom_edge = f32::from(*cell_padding);
                         body.push(c);
                         let rowspan = if *span == Some(row) && column == 0 {
                             self.boxes[c].rowspan = 2;
@@ -599,7 +620,7 @@ impl Case {
             }
             Gen::Flex { style, grid, items } => {
                 let f = self.add(Kind::Flex, parent, in_header, 0);
-                self.boxes[f].edged = has_edges(style);
+                self.edges(f, style);
                 let (display, item_style) = if *grid {
                     ("display: grid; grid-template-columns: 1fr 1fr", "")
                 } else {
@@ -761,6 +782,126 @@ struct Placed<'a> {
 }
 
 impl Placed<'_> {
+    /// Each fragment of a line's item that ends past its line's end on its
+    /// page ([`Invariant::EndsWithLine`]): the item, the page, and what broke.
+    /// A fragment past the page foot is left to [`Invariant::PastFoot`].
+    fn past_line_end(&self) -> Vec<(usize, u32, String)> {
+        let mut out = Vec::new();
+        for line in self.lines() {
+            let pages: BTreeSet<u32> = line
+                .iter()
+                .flat_map(|&c| self.fragments[c].iter().map(|f| f.page_index))
+                .collect();
+            let Some(&last_page) = pages.last() else {
+                continue;
+            };
+            for &page in &pages {
+                let Some(end) = line
+                    .iter()
+                    .filter_map(|&c| self.content_end(c, page))
+                    .reduce(f32::max)
+                else {
+                    continue;
+                };
+                for &c in &line {
+                    for f in self.fragments[c].iter().filter(|f| f.page_index == page) {
+                        let bottom = f.y.to_f32() + f.height.to_f32();
+                        let to_foot = page < last_page && bottom >= self.page_height - EPS;
+                        if bottom > end + EPS && bottom <= self.page_height + EPS && !to_foot {
+                            let info = &self.case.boxes[c];
+                            out.push((
+                                c,
+                                page,
+                                format!(
+                                    "{} ({:?}) ends at {bottom}, past its line's end at {end}",
+                                    info.id, info.kind
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The lines of boxes side by side: each flex or grid container's
+    /// items, and each table's body lines ([`table_lines`]).
+    fn lines(&self) -> Vec<Vec<usize>> {
+        let case = self.case;
+        (0..case.boxes.len())
+            .flat_map(|b| match case.boxes[b].kind {
+                Kind::Flex => vec![case.boxes[b].children.clone()],
+                Kind::Table => table_lines(case, b),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Where the item `c`'s content ends on `page` with its bottom edge,
+    /// if it has a fragment there: below its children's fragments there,
+    /// as [`Self::counted_bottom`] counts them, and on a child's last page
+    /// below its margin box ([`Self::trailing`]); below its top edge where
+    /// it holds none.
+    fn content_end(&self, c: usize, page: u32) -> Option<f32> {
+        let info = &self.case.boxes[c];
+        let top = self.fragments[c]
+            .iter()
+            .filter(|f| f.page_index == page)
+            .map(|f| f.y.to_f32())
+            .reduce(f32::min)?;
+        let content = enclosed(self.case, c)
+            .iter()
+            .flat_map(|&child| {
+                let frags = &self.fragments[child];
+                frags
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, f)| f.page_index == page)
+                    .map(move |(k, _)| {
+                        let trailing = if k + 1 == frags.len() {
+                            self.trailing(child)
+                        } else {
+                            0.0
+                        };
+                        self.counted_bottom(child, k) + trailing
+                    })
+            })
+            .fold(top + info.repeated_edge, f32::max);
+        Some(content + info.bottom_edge)
+    }
+
+    /// How far below the end of its last fragment `b`'s margin box ends:
+    /// its bottom margin ([`Self::margin_through`]), and a paragraph's
+    /// padding and border, top and bottom, which its fragments, measured by
+    /// its lines, leave out.
+    fn trailing(&self, b: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        let edges = if info.kind == Kind::Para {
+            2.0 * info.bottom_edge
+        } else {
+            0.0
+        };
+        edges + self.margin_through(b)
+    }
+
+    /// `b`'s bottom margin, collapsed with its last in-flow child's when it
+    /// is a block with no bottom padding or border.
+    fn margin_through(&self, b: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        let last = info
+            .children
+            .iter()
+            .rev()
+            .find(|&&c| self.case.boxes[c].kind != Kind::Float);
+        match last {
+            Some(&c) if info.kind == Kind::Block && info.bottom_edge == 0.0 => {
+                info.margin_bottom.max(self.margin_through(c))
+            }
+            _ => info.margin_bottom,
+        }
+    }
+
     /// How far `b`'s fragments add up past its layout height.
     fn excess(&self, b: usize) -> f32 {
         let total: f32 = self.fragments[b].iter().map(|f| f.height.to_f32()).sum();
@@ -1338,6 +1479,17 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             );
         }
     }
+
+    // A line's item stretched to the line ends with it on each page.
+    for (item, page, what) in placed.past_line_end() {
+        push(
+            Invariant::EndsWithLine,
+            item,
+            Some(page),
+            fix::UNEXPLAINED,
+            what,
+        );
+    }
     out
 }
 
@@ -1460,6 +1612,78 @@ fn golden_text(found: &BTreeMap<(u64, String), String>) -> String {
     text
 }
 
+/// A 10 px wide fragment on page `page_index`, for the checks' own tests.
+fn fragment(page_index: u32, y: f32, height: f32) -> Fragment {
+    Fragment {
+        page_index,
+        x: 0.0_f32.as_px(),
+        y: y.as_px(),
+        width: 10.0_f32.as_px(),
+        height: height.as_px(),
+    }
+}
+
+/// An item stretched past its line's end on its page is flagged, on a page
+/// the line continues past as on its last, and one stretched to the line's
+/// end, or to the foot of a page the line continues past, is not: a flex
+/// row of a 150 px leaf, broken 10 px above the foot of a 100 px page, beside
+/// a 30 px one.
+#[test]
+fn an_item_stretched_past_its_line_s_end_is_flagged() {
+    let leaf = |height| Gen::Leaf {
+        style: BoxStyle::default(),
+        height,
+    };
+    let case = Case::new(&[Gen::Flex {
+        style: BoxStyle::default(),
+        grid: false,
+        items: vec![leaf(150), leaf(30)],
+    }]);
+    // b0 the flex row, b1 and b3 its items, b2 and b4 their leaves.
+    let flagged = |short_item: Vec<Fragment>| {
+        let mut fragments = vec![Vec::new(); case.boxes.len()];
+        fragments[0] = vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 60.0)];
+        fragments[1] = vec![fragment(0, 0.0, 90.0), fragment(1, 0.0, 60.0)];
+        fragments[2] = fragments[1].clone();
+        fragments[3] = short_item;
+        fragments[4] = vec![fragment(0, 0.0, 30.0)];
+        Placed {
+            case: &case,
+            page_height: 100.0,
+            fragments,
+            line_boundaries: vec![Vec::new(); case.boxes.len()],
+            layout_height: vec![150.0, 150.0, 150.0, 150.0, 30.0],
+            past: vec![BTreeSet::new(); case.boxes.len()],
+        }
+        .past_line_end()
+        .into_iter()
+        .map(|(item, page, _)| (item, page))
+        .collect::<Vec<_>>()
+    };
+    let none: [(usize, u32); 0] = [];
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 90.0)]),
+        none,
+        "to the line's end"
+    );
+    assert_eq!(flagged(vec![fragment(0, 0.0, 100.0)]), none, "to the foot");
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 90.0), fragment(1, 0.0, 60.0)]),
+        none,
+        "on to the line's end on its last page"
+    );
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 95.0)]),
+        [(3, 0)],
+        "past the line's end on a page it continues past"
+    );
+    assert_eq!(
+        flagged(vec![fragment(0, 0.0, 90.0), fragment(1, 0.0, 70.0)]),
+        [(3, 1)],
+        "past the line's end on its last page"
+    );
+}
+
 /// A table's repeated header is counted once a page, however many times it
 /// is placed there: a header doubled on the table's second page leaves the
 /// table's excess one band past its repeat, as a placement the checks flag.
@@ -1483,13 +1707,6 @@ fn a_header_placed_twice_on_one_page_is_counted_once() {
     }]);
     // b0 the table, b1 the header row, b2 its cell, b3 the body row, b4
     // its cell, b5 the leaf: a 140 px table on 200 px pages.
-    let fragment = |page_index: u32, y: f32, height: f32| Fragment {
-        page_index,
-        x: 0.0_f32.as_px(),
-        y: y.as_px(),
-        width: 10.0_f32.as_px(),
-        height: height.as_px(),
-    };
     let placed = |header: Vec<Fragment>, table: Vec<Fragment>| {
         let mut fragments = vec![Vec::new(); case.boxes.len()];
         fragments[0] = table;
