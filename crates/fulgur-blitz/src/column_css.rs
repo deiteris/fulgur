@@ -125,6 +125,19 @@ pub enum HeaderRepeat {
     SkipFirst,
 }
 
+/// `margin-break` (CSS Fragmentation 4 §5.2): whether the box's block-axis
+/// margins are truncated where they adjoin a fragmentation break. `auto`, the
+/// initial value, truncates them at an unforced break and keeps the margin
+/// after a forced one; `keep` truncates none; `discard` truncates them at
+/// every break. The property is not inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarginBreak {
+    #[default]
+    Auto,
+    Keep,
+    Discard,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -189,6 +202,9 @@ pub struct ColumnStyleProps {
     pub orphans: Option<LineCount>,
     /// `widows`, as [`Self::orphans`].
     pub widows: Option<LineCount>,
+    /// `margin-break` as declared on the element ([`MarginBreak`]); `None`
+    /// when it declares none, which is `auto`.
+    pub margin_break: Option<MarginBreak>,
     /// `-fulgur-table-orphans: <integer>`, read on a table: the rows that
     /// start on the page where it first breaks, at least
     /// (`pagination_layout::table_line_limits`). Not inherited.
@@ -234,6 +250,9 @@ impl ColumnStyleProps {
         if other.widows.is_some() {
             self.widows = other.widows;
         }
+        if other.margin_break.is_some() {
+            self.margin_break = other.margin_break;
+        }
         if other.table_orphans.is_some() {
             self.table_orphans = other.table_orphans;
         }
@@ -253,6 +272,7 @@ impl ColumnStyleProps {
             && self.header_repeat.is_none()
             && self.orphans.is_none()
             && self.widows.is_none()
+            && self.margin_break.is_none()
             && self.table_orphans.is_none()
             && self.table_widows.is_none()
     }
@@ -593,6 +613,20 @@ fn parse_header_repeat_value<'i>(
     }
 }
 
+/// Parse the value side of `margin-break: auto | keep | discard`; any other
+/// value drops the declaration.
+fn parse_margin_break_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<MarginBreak, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "auto" => Ok(MarginBreak::Auto),
+        "keep" => Ok(MarginBreak::Keep),
+        "discard" => Ok(MarginBreak::Discard),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// Parse the value side of `orphans` or `widows`: a positive `<integer>`,
 /// `initial` (2), or a keyword that takes the parent's value. Zero, a
 /// negative or fractional number, and any other value drop the declaration.
@@ -820,6 +854,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("widows") {
             if let Ok(v) = input.parse_entirely(parse_line_count_value) {
                 self.props.widows = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("margin-break") {
+            if let Ok(v) = input.parse_entirely(parse_margin_break_value) {
+                self.props.margin_break = Some(v);
             }
         } else if name.eq_ignore_ascii_case("-fulgur-table-orphans") {
             if let Ok(LineCount::Lines(v)) = input.parse_entirely(parse_line_count_value) {
@@ -1390,6 +1428,18 @@ mod tests {
         assert_eq!(read("-fulgur-break-border: none"), Some(BreakBorder::None));
         assert_eq!(read("-fulgur-break-border: auto"), Some(BreakBorder::Auto));
         assert_eq!(read("-fulgur-break-border: slice"), None);
+    }
+
+    #[test]
+    fn parse_margin_break_reads_auto_keep_and_discard_and_drops_other_values() {
+        let read = |css: &str| parse_declaration_block(css).margin_break;
+        assert_eq!(read("margin-break: auto"), Some(MarginBreak::Auto));
+        assert_eq!(read("margin-break: KEEP"), Some(MarginBreak::Keep));
+        assert_eq!(read("margin-break: discard"), Some(MarginBreak::Discard));
+        assert_eq!(read("margin-break: keep keep"), None);
+        assert_eq!(read("margin-break: truncate"), None);
+        let rules = parse_stylesheet("* { margin-break: keep }");
+        assert_eq!(rules[0].props.margin_break, Some(MarginBreak::Keep));
     }
 
     #[test]
