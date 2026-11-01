@@ -1286,11 +1286,13 @@ fn kept_after_box(
 
 /// The top margin of `node` that adjoins its top edge, which a forced break
 /// before it keeps (css-break-3 §5.2): its own `margin-top`, collapsed (CSS
-/// 2.1 §8.3.1) with those of the first in-flow boxes that adjoin it, down
-/// through boxes with no top border or padding that establish no formatting
-/// context of their own, and through empty boxes. The largest positive
-/// margin and the most negative add up. Taffy's `final_layout.margin` is no
-/// measure of it: Blitz folds a floated first child's margin into its
+/// 2.1 §8.3.1) with those of the first in-flow boxes whose margins the
+/// layout collapsed through its top, down through empty boxes: a first child
+/// the layout placed at its parent's content edge (unrounded, as a hairline
+/// edge rounds to zero) gave the parent its margin; one placed below it keeps
+/// its margin inside. The largest positive margin and the most negative add
+/// up, each read from the computed style. Taffy's `final_layout.margin` is
+/// no measure of it: Blitz folds a floated first child's margin into its
 /// parent's there.
 fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
     use ::style::values::computed::Length;
@@ -1315,21 +1317,6 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
                 _ => 0.0,
             })
     };
-    // Whether the margins of `node`'s first child adjoin its own top margin.
-    let opens_to_children = |node: &blitz_dom::Node| {
-        use ::style::values::computed::Overflow;
-        // Unrounded: a hairline edge rounds to zero in the final layout.
-        let layout = node.unrounded_layout;
-        layout.border.top <= 0.0
-            && layout.padding.top <= 0.0
-            && node.primary_styles().is_some_and(|styles| {
-                let display = styles.clone_display();
-                display.inside() == DisplayInside::Flow
-                    && styles.clone_overflow_x() == Overflow::Visible
-                    && styles.clone_overflow_y() == Overflow::Visible
-                    && !styles.get_box().clone_float().is_floating()
-            })
-    };
     let (mut positive, mut negative) = (0.0_f32, 0.0_f32);
     let mut add = |margin: f32| {
         positive = positive.max(margin);
@@ -1338,9 +1325,7 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
     let mut current = node;
     add(own(current));
     for _ in 0..crate::MAX_DOM_DEPTH {
-        if !opens_to_children(current) {
-            break;
-        }
+        let edge = current.unrounded_layout.border.top + current.unrounded_layout.padding.top;
         let mut next = None;
         for id in walk_children_of(current) {
             let Some(child) = doc.get_node(id) else {
@@ -1351,7 +1336,7 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
             {
                 continue;
             }
-            if child.element_data().is_none() {
+            if child.element_data().is_none() || child.unrounded_layout.location.y > edge + 0.01 {
                 break;
             }
             add(own(child));
@@ -11683,19 +11668,33 @@ h2 { string-set: chapter-title content(text); }
                 "after {open}"
             );
         }
-        let html = r#"<html><body style="margin: 0; padding: 0">
-              <div style="height: 40px"></div>
-              <section id="s" style="break-before: page">
-                <div id="h" style="height: 20px; margin-top: 15px"></div>
-              </section>
-            </body></html>"#;
-        let mut doc = parse(html, 600.0);
-        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
-        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-        assert_eq!(
-            (placements(&doc, &geom, "s"), placements(&doc, &geom, "h")),
-            (vec![(1, 15.0)], vec![(1, 15.0)])
-        );
+        // The layout decides whether the first child's margin collapses
+        // through the section's top: it does in a `flow-root` too, which
+        // Blitz lays out as block flow, and does not below a hairline of
+        // padding, where the margin stays inside.
+        for (section, expected) in [
+            ("", (vec![(1, 15.0)], vec![(1, 15.0)])),
+            ("display: flow-root", (vec![(1, 15.0)], vec![(1, 15.0)])),
+            ("padding-top: 0.01pt", (vec![(1, 0.0)], vec![(1, 15.0)])),
+        ] {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0">
+                  <div style="height: 40px"></div>
+                  <section id="s" style="break-before: page; {section}">
+                    <div id="h" style="height: 20px; margin-top: 15px"></div>
+                  </section>
+                </body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            assert_eq!(
+                (placements(&doc, &geom, "s"), placements(&doc, &geom, "h")),
+                expected,
+                "{section}"
+            );
+        }
     }
 
     /// A `break-after` and the next box's `break-before`, forced, are one
