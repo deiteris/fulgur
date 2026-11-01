@@ -4609,6 +4609,7 @@ fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Op
 ///   ending on a partial page leave room for a following sibling).
 /// - `line_boundaries` records the first line of each fragment and ends
 ///   with the total line count.
+#[allow(clippy::too_many_arguments)]
 fn fragment_inline_root(
     geometry: &mut PaginationGeometryTable,
     child_id: usize,
