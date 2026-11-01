@@ -1106,9 +1106,9 @@ fn break_props<'a>(
     styles.get(&node.id)
 }
 
-/// The breaks of a box as its parent's walk meets it, and the class A
-/// opportunities of a walk over its children: computed together, once a
-/// pass and page height ([`box_breaks`]), as each reads its children's.
+/// The breaks of a box as its parent's walk meets it, computed together
+/// once a pass and page height ([`box_breaks`]), as each reads its
+/// children's.
 struct BoxBreaks {
     /// Its own `break-before`, then its first line's ([`flow_lines`]),
     /// which a container takes on, as no class A opportunity parts the two
@@ -1119,15 +1119,39 @@ struct BoxBreaks {
     after: BreakValue,
     /// A forced break opportunity lies inside it ([`forced_inside`]).
     forced_inside: bool,
-    /// The opportunities of a walk over its children ([`walk_children_of`],
-    /// [`opportunities`]), with page names compared unless
-    /// [`page_names_suppressed`]. `None` for a box whose children the walk
-    /// does not meet one by one ([`has_flow_children`]).
-    opportunities: Option<Vec<BreakValue>>,
 }
 
-/// The breaks of `node` on pages `page_height_px` tall ([`BoxBreaks`]),
-/// computed on first ask and kept for the pass.
+/// A walk over the children of a box ([`walk_children_of`]): its lines
+/// ([`flow_lines`]) and the class A opportunities before them
+/// ([`opportunities`], page names compared unless
+/// [`page_names_suppressed`]), computed once a pass and page height
+/// ([`walk_breaks`]).
+struct WalkBreaks {
+    children: Vec<usize>,
+    lines: Vec<Vec<usize>>,
+    /// The line of each child in a line, by the child's node.
+    line_of: BTreeMap<usize, usize>,
+    values: Vec<BreakValue>,
+}
+
+/// The value `map` holds for `key`, computed by `compute` on first ask and
+/// kept for the pass; nothing is kept when `compute` gives none. No borrow
+/// of `map` is held while `compute` runs, which may ask `map` in turn.
+fn memo<K: Ord, V>(
+    map: &std::cell::RefCell<BTreeMap<K, std::rc::Rc<V>>>,
+    key: K,
+    compute: impl FnOnce() -> Option<V>,
+) -> Option<std::rc::Rc<V>> {
+    let cached = map.borrow().get(&key).cloned();
+    if cached.is_some() {
+        return cached;
+    }
+    let value = std::rc::Rc::new(compute()?);
+    map.borrow_mut().insert(key, value.clone());
+    Some(value)
+}
+
+/// The breaks of `node` on pages `page_height_px` tall ([`BoxBreaks`]).
 fn box_breaks(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
@@ -1135,12 +1159,10 @@ fn box_breaks(
     depth: usize,
 ) -> std::rc::Rc<BoxBreaks> {
     let key = (node.id, page_height_px.to_bits());
-    if let Some(breaks) = flow.pass.breaks.borrow().get(&key).cloned() {
-        return breaks;
-    }
-    let breaks = std::rc::Rc::new(compute_box_breaks(flow, node, page_height_px, depth));
-    flow.pass.breaks.borrow_mut().insert(key, breaks.clone());
-    breaks
+    memo(&flow.pass.breaks, key, || {
+        Some(compute_box_breaks(flow, node, page_height_px, depth))
+    })
+    .expect("a box's breaks are always computed")
 }
 
 /// [`box_breaks`], computed.
@@ -1157,20 +1179,17 @@ fn compute_box_breaks(
             before: own_before,
             after: own_after,
             forced_inside: false,
-            opportunities: None,
         };
     }
-    let children = walk_children_of(node);
-    let lines = flow_lines(flow, node, &children);
+    let walk = walk_breaks(flow, node, page_height_px, depth);
     let edge = |line: Option<&Vec<usize>>, after: bool| {
-        line.map(|line| line_break(flow, &children, line, after, page_height_px, depth + 1))
+        line.map(|line| line_break(flow, &walk.children, line, after, page_height_px, depth + 1))
     };
-    let before = edge(lines.first(), false).map_or(own_before, |first| own_before.then(first));
-    let after = edge(lines.last(), true).map_or(own_after, |last| last.then(own_after));
-    let suppress = page_names_suppressed(flow.doc, node);
-    let values = opportunities(flow, node, &children, suppress, page_height_px, depth + 1);
-    let forced_inside = values.iter().copied().any(BreakValue::is_forced)
-        || children
+    let before = edge(walk.lines.first(), false).map_or(own_before, |first| own_before.then(first));
+    let after = edge(walk.lines.last(), true).map_or(own_after, |last| last.then(own_after));
+    let forced_inside = walk.values.iter().copied().any(BreakValue::is_forced)
+        || walk
+            .children
             .iter()
             .filter_map(|&id| flow.doc.get_node(id))
             .filter(|&child| is_flow_child(flow, child))
@@ -1179,8 +1198,37 @@ fn compute_box_breaks(
         before,
         after,
         forced_inside,
-        opportunities: Some(values),
     }
+}
+
+/// The walk over the children of `parent` on pages `page_height_px` tall
+/// ([`WalkBreaks`]), its opportunities read at `depth` below the walk's.
+fn walk_breaks(
+    flow: Flow<'_>,
+    parent: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> std::rc::Rc<WalkBreaks> {
+    let key = (parent.id, page_height_px.to_bits());
+    memo(&flow.pass.walks, key, || {
+        let children = walk_children_of(parent);
+        let lines = flow_lines(flow, parent, &children);
+        let suppress = page_names_suppressed(flow.doc, parent);
+        let values = opportunities(flow, &children, &lines, suppress, page_height_px, depth + 1);
+        let line_of = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(number, line)| line.iter().map(move |&index| (index, number)))
+            .map(|(index, number)| (children[index], number))
+            .collect();
+        Some(WalkBreaks {
+            children,
+            lines,
+            line_of,
+            values,
+        })
+    })
+    .expect("a walk's breaks are always computed")
 }
 
 /// The `break-before` of `node` as its parent's walk meets it
@@ -1203,24 +1251,6 @@ fn break_after_of(
     depth: usize,
 ) -> BreakValue {
     box_breaks(flow, node, page_height_px, depth).after
-}
-
-/// The opportunities of a walk over the children of `parent`
-/// ([`BoxBreaks::opportunities`]), at `depth` below the walk's.
-fn walk_opportunities(
-    flow: Flow<'_>,
-    parent: &blitz_dom::Node,
-    page_height_px: f32,
-    depth: usize,
-) -> Vec<BreakValue> {
-    box_breaks(flow, parent, page_height_px, depth)
-        .opportunities
-        .clone()
-        .unwrap_or_else(|| {
-            let children = walk_children_of(parent);
-            let suppress = page_names_suppressed(flow.doc, parent);
-            opportunities(flow, parent, &children, suppress, page_height_px, depth + 1)
-        })
 }
 
 /// Whether the walk compares no used page names between the children of
@@ -1248,8 +1278,8 @@ fn page_names_suppressed(doc: &BaseDocument, parent: &blitz_dom::Node) -> bool {
 /// walk applies them. Every other slot holds `Auto`.
 fn opportunities(
     flow: Flow<'_>,
-    parent: &blitz_dom::Node,
     children: &[usize],
+    lines: &[Vec<usize>],
     suppress_page_names: bool,
     page_height_px: f32,
     depth: usize,
@@ -1257,20 +1287,20 @@ fn opportunities(
     let mut values = vec![BreakValue::Auto; children.len()];
     let mut previous_after: Option<BreakValue> = None;
     let mut previous_page: Option<Option<String>> = None;
-    for line in flow_lines(flow, parent, children) {
+    for line in lines.iter().map(Vec::as_slice) {
         let mut value = previous_after
             .map(|after| {
                 after.then(line_break(
                     flow,
                     children,
-                    &line,
+                    line,
                     false,
                     page_height_px,
                     depth,
                 ))
             })
             .unwrap_or_default();
-        for &index in &line {
+        for &index in line {
             let id = children[index];
             if flow
                 .doc
@@ -1301,7 +1331,7 @@ fn opportunities(
         previous_after = Some(line_break(
             flow,
             children,
-            &line,
+            line,
             true,
             page_height_px,
             depth,
@@ -1433,21 +1463,16 @@ fn kept_after_box(
     if !is_block_flow(flow, parent) {
         return 0.0;
     }
-    let children = walk_children_of(parent);
-    let lines = flow_lines(flow, parent, &children);
-    let Some(line) = lines
-        .iter()
-        .position(|line| line.iter().any(|&index| children[index] == node.id))
-    else {
+    let walk = walk_breaks(flow, parent, page_height_px, depth);
+    let Some(&line) = walk.line_of.get(&node.id) else {
         return 0.0;
     };
-    let values = walk_opportunities(flow, parent, page_height_px, depth);
     kept_after_line(
         flow,
         parent,
-        &children,
-        &lines,
-        &values,
+        &walk.children,
+        &walk.lines,
+        &walk.values,
         line,
         page_height_px,
         depth + 1,
@@ -3146,12 +3171,16 @@ struct Flow<'a> {
     forced_before: Option<usize>,
 }
 
-/// What a pass computes once and every walk of it reads: the breaks of its
-/// boxes ([`box_breaks`]), and the rows of its tables' row groups.
+/// What a pass computes once and its walks read: the breaks of its boxes
+/// ([`box_breaks`]) and of the walks over their children ([`walk_breaks`]),
+/// and the rows of its tables' row groups.
 #[derive(Default)]
 struct Pass {
     /// The breaks of each box asked about, by node and page height.
     breaks: std::cell::RefCell<BTreeMap<(usize, u32), std::rc::Rc<BoxBreaks>>>,
+    /// The walk over each box's children asked about, by node and page
+    /// height.
+    walks: std::cell::RefCell<BTreeMap<(usize, u32), std::rc::Rc<WalkBreaks>>>,
     /// The rows of each row group asked about, by the group's node.
     rows: std::cell::RefCell<BTreeMap<usize, std::rc::Rc<RowGroup>>>,
 }
@@ -3164,17 +3193,9 @@ impl Pass {
         doc: &BaseDocument,
         row: &blitz_dom::Node,
     ) -> Option<(std::rc::Rc<RowGroup>, usize)> {
-        let group_id = row.parent?;
-        let cached = self.rows.borrow().get(&group_id).cloned();
-        let group = match cached {
-            Some(group) => group,
-            None => {
-                let (rows, _) = group_rows(doc, row)?;
-                let group = std::rc::Rc::new(RowGroup::new(doc, &rows));
-                self.rows.borrow_mut().insert(group_id, group.clone());
-                group
-            }
-        };
+        let group = memo(&self.rows, row.parent?, || {
+            group_rows(doc, row).map(|(rows, _)| RowGroup::new(doc, &rows))
+        })?;
         let index = *group.index.get(&row.id)?;
         Some((group, index))
     }
@@ -4184,17 +4205,24 @@ fn fragment_block_subtree_inner(
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
     // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
-    let mut opportunities = if header.is_some() {
-        opportunities(
+    // The lines of the children, by the index of each line's first child,
+    // and whether the walk meets them in block flow, where `avoid` between
+    // two lines keeps them together ([`kept_after_line`]); a table's rows and
+    // a flex or grid container's lines are another walk's.
+    let (lines, mut opportunities) = if header.is_some() {
+        let lines = flow_lines(flow, parent, &walk_children);
+        let values = opportunities(
             flow,
-            parent,
             &walk_children,
+            &lines,
             suppress_page_check,
             page_height_px,
             depth + 1,
-        )
+        );
+        (lines, values)
     } else {
-        walk_opportunities(flow, parent, page_height_px, depth)
+        let walk = walk_breaks(flow, parent, page_height_px, depth);
+        (walk.lines.clone(), walk.values.clone())
     };
     if let Some(index) = flow
         .forced_before
@@ -4202,11 +4230,6 @@ fn fragment_block_subtree_inner(
     {
         opportunities[index] = opportunities[index].then(BreakValue::Forced(None));
     }
-    // The lines of the children, by the index of each line's first child,
-    // and whether the walk meets them in block flow, where `avoid` between
-    // two lines keeps them together ([`kept_after_line`]); a table's rows and
-    // a flex or grid container's lines are another walk's.
-    let lines = flow_lines(flow, parent, &walk_children);
     let mut line_at = vec![None; walk_children.len()];
     // The line each flow child belongs to.
     let mut line_of = vec![None; walk_children.len()];
