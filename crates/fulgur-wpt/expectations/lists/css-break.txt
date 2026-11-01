@@ -20,9 +20,9 @@ FAIL  css/css-break/block-001-wm-vlr-print.html  # page 1 diff: 430/138240 pixel
 FAIL  css/css-break/block-001-wm-vrl-print.html  # page 1 diff: 430/138240 pixels exceed tol (max_ch=255)
 FAIL  css/css-break/block-002-wm-vlr-print.html  # page count mismatch: test=2 ref=3
 FAIL  css/css-break/block-002-wm-vrl-print.html  # page count mismatch: test=2 ref=3
-FAIL  css/css-break/block-in-inline-015-print.html  # page count mismatch: test=1 ref=4
+PASS  css/css-break/block-in-inline-015-print.html
 FAIL  css/css-break/break-inside-avoid-multicol-001-print.html  # page 1 diff: 36864/138240 pixels exceed tol (max_ch=255)
-FAIL  css/css-break/break-nested-float-in-table-001-print.html  # page count mismatch: test=1 ref=3
+PASS  css/css-break/break-nested-float-in-table-001-print.html
 FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-063-print.html  # page 2 diff: 11234/138240 pixels exceed tol (max_ch=255)
 FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-064-print.html  # page count mismatch: test=3 ref=4
 FAIL  css/css-break/flexbox/multi-line-row-flex-fragmentation-075-print.html  # page 2 diff: 36815/138240 pixels exceed tol (max_ch=255)
@@ -40,13 +40,13 @@ FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-060-print.html
 PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-065-print.html
 PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-066-print.html
 PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-068a-print.html
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068b-print.html  # page 1 diff: 720/138240 pixels exceed tol (max_ch=255)
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-068b-print.html
 FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068c-print.html  # page 1 diff: 18954/138240 pixels exceed tol (max_ch=255)
 FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-068d-print.html  # page 1 diff: 19046/138240 pixels exceed tol (max_ch=255)
 PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-069a-print.html
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069b-print.html  # page 1 diff: 18452/138240 pixels exceed tol (max_ch=255)
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069c-print.html  # page 1 diff: 703/138240 pixels exceed tol (max_ch=255)
-FAIL  css/css-break/flexbox/single-line-column-flex-fragmentation-069d-print.html  # page 1 diff: 17268/138240 pixels exceed tol (max_ch=255)
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-069b-print.html
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-069c-print.html
+PASS  css/css-break/flexbox/single-line-column-flex-fragmentation-069d-print.html
 FAIL  css/css-break/flexbox/single-line-row-flex-fragmentation-042-print.html  # page 2 diff: 2105/138240 pixels exceed tol (max_ch=255)
 PASS  css/css-break/flexbox/single-line-row-flex-fragmentation-045-print.html
 PASS  css/css-break/flexbox/single-line-row-flex-fragmentation-046-print.html
