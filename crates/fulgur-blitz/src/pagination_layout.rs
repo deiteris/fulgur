@@ -1060,6 +1060,33 @@ fn line_break(
     }
 }
 
+/// The style whose `break-before`, `break-after`, and `break-inside` the
+/// walk reads for `node`: for the box the caption pass wraps around a table
+/// and its caption ([`crate::blitz_adapter::captioned_table_of`]), the
+/// table's, as that box stands for the table wrapper box, which holds the
+/// caption in the flow: a table kept whole moves with its caption, or
+/// splits under it when the two do not fit a page together, and a forced
+/// break before the table goes before its caption. None for the table in
+/// that box, whose breaks are the box's; else its own.
+fn break_props<'a>(
+    flow: Flow<'a>,
+    node: &blitz_dom::Node,
+) -> Option<&'a crate::column_css::ColumnStyleProps> {
+    let styles = flow.column_styles?;
+    if let Some(table) = crate::blitz_adapter::captioned_table_of(flow.doc, node) {
+        return styles.get(&table);
+    }
+    let wrapped = node
+        .parent
+        .and_then(|id| flow.doc.get_node(id))
+        .and_then(|parent| crate::blitz_adapter::captioned_table_of(flow.doc, parent))
+        == Some(node.id);
+    if wrapped {
+        return None;
+    }
+    styles.get(&node.id)
+}
+
 /// The `break-before` of `node` as its parent's walk meets it: its own,
 /// then its first line's ([`flow_lines`]), which a container takes on, as no
 /// class A opportunity parts the two (css-break-3 §3.1).
@@ -1081,7 +1108,7 @@ fn break_before_uncached(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    let own = BreakValue::own_before(flow.column_styles.and_then(|styles| styles.get(&node.id)));
+    let own = BreakValue::own_before(break_props(flow, node));
     if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
         return own;
     }
@@ -1120,7 +1147,7 @@ fn break_after_uncached(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    let own = BreakValue::own_after(flow.column_styles.and_then(|styles| styles.get(&node.id)));
+    let own = BreakValue::own_after(break_props(flow, node));
     if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
         return own;
     }
@@ -2268,14 +2295,12 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
         return BoxKind::Monolithic(Whole::Atomic);
     }
     let avoid = !displays(node, DisplayInside::TableRow)
-        && column_styles
-            .and_then(|styles| styles.get(&node.id))
-            .is_some_and(|props| {
-                matches!(
-                    props.break_inside,
-                    Some(crate::draw_primitives::BreakInside::Avoid)
-                )
-            });
+        && break_props(flow, node).is_some_and(|props| {
+            matches!(
+                props.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        });
     if (avoid && extent(flow, node, 0) <= page_height_px + 1.0)
         || kept_table_row_bottom(doc, column_styles, node, page_height_px).is_some()
     {
@@ -8381,6 +8406,58 @@ mod tests {
             table(r#" style="break-before: page""#, "", h, 1)
         );
         assert_eq!(at(&forced, ["c", "h"]), [vec![(1, 0.0)], vec![(1, 20.0)]]);
+    }
+
+    /// The walk reads a captioned table's break properties for the box
+    /// around the table and its caption, which stands for the table wrapper
+    /// box: the side table keeps them on the table, none on that box, and a
+    /// table kept whole still moves with its caption, a forced break before
+    /// it still goes before the caption
+    /// (`a_table_kept_whole_moves_with_its_caption`).
+    #[test]
+    fn a_caption_moves_with_a_table_kept_whole_without_moved_properties() {
+        use crate::blitz_adapter::DomPass as _;
+        let html = |style: &str| {
+            format!(
+                r#"<!doctype html><html><head><style>
+                html, body {{ margin: 0; padding: 0; }}
+                table {{ margin: 0; border-spacing: 0; width: 100px; }}
+                th, td {{ box-sizing: border-box; height: 20px; padding: 0; }}
+                caption {{ height: 20px; padding: 0; }}
+                </style></head><body><div style="height: 100px"></div>
+                <table id="t" style="{style}"><caption id="c">C</caption><thead><tr><th id="h">H</th></tr></thead>
+                <tbody>{}</tbody></table></body></html>"#,
+                (1..=5)
+                    .map(|n| format!(r#"<tr><td id="b{n}">{n}</td></tr>"#))
+                    .collect::<String>()
+            )
+        };
+        for (style, at) in [
+            ("break-inside: avoid", [(1, 0.0), (1, 20.0)]),
+            ("break-before: page", [(1, 0.0), (1, 20.0)]),
+        ] {
+            let mut doc = blitz_adapter::parse(&html(style), 200.0, &[]);
+            blitz_adapter::CaptionRestructurePass
+                .apply(&mut doc, &blitz_adapter::PassContext { font_data: &[] });
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let table = find_by_id(&doc, "t").unwrap();
+            let wrapper = doc.get_node(table).and_then(|node| node.parent).unwrap();
+            let breaks = |id: usize| {
+                styles.get(&id).map_or((false, false), |props| {
+                    (props.break_inside.is_some(), props.break_before.is_some())
+                })
+            };
+            assert_eq!(breaks(wrapper), (false, false), "{style}");
+            assert_ne!(breaks(table), (false, false), "{style}");
+            let geometry =
+                super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &styles);
+            assert_eq!(
+                ["c", "h"].map(|id| placements(&doc, &geometry, id)[0]),
+                at,
+                "{style}"
+            );
+        }
     }
 
     /// A `skip-first` row below a header row that prints is placed on the

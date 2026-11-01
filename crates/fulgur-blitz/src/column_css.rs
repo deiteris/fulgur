@@ -1197,33 +1197,6 @@ pub(crate) fn build_column_style_table(
     table
 }
 
-/// Move the break properties of the table `table_id` onto `wrapper_id`, the
-/// box the caption pass wraps around the table and its caption. That box
-/// stands for the table wrapper box, which holds the caption in the flow: a
-/// table kept whole moves with its caption, or splits under it when the two
-/// do not fit a page together, and a forced break before the table goes
-/// before its caption. A copy would keep the table whole apart from its
-/// caption, and break between them.
-fn move_breaks_to_wrapper(table: &mut ColumnStyleTable, table_id: usize, wrapper_id: usize) {
-    let Some(props) = table.get_mut(&table_id) else {
-        return;
-    };
-    let moved = ColumnStyleProps {
-        break_inside: props.break_inside.take(),
-        break_before: props.break_before.take(),
-        break_before_side: props.break_before_side.take(),
-        break_after: props.break_after.take(),
-        break_after_side: props.break_after_side.take(),
-        ..ColumnStyleProps::default()
-    };
-    if props.is_empty() {
-        table.remove(&table_id);
-    }
-    if !moved.is_empty() {
-        table.entry(wrapper_id).or_default().merge(moved);
-    }
-}
-
 /// Recurse into `node_id`, folding matching rules into `table`.
 ///
 /// Returns whether the visited node is an element, so the caller's child loop
@@ -1288,10 +1261,6 @@ fn walk(
         ) {
             prev_child_element_id = Some(child_id);
         }
-    }
-
-    if is_element && let Some(table_id) = crate::blitz_adapter::captioned_table_of(doc, node) {
-        move_breaks_to_wrapper(table, table_id, node_id);
     }
 
     is_element
