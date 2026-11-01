@@ -1374,6 +1374,39 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
     positive + negative
 }
 
+/// The height `node` takes on the page it starts on, which every fit the
+/// walk measures reads: its layout height, less the header rows below it
+/// that skip their table's first page ([`first_page_lift`]).
+fn extent(flow: Flow<'_>, node: &blitz_dom::Node, depth: usize) -> f32 {
+    node.final_layout.size.height - first_page_lift(flow, node, depth)
+}
+
+/// The height of the header rows below `node` that skip their table's
+/// first page (`-fulgur-header-repeat: skip-first`), which
+/// [`fragment_repeating_table`] leaves off that page and the boxes after
+/// them lift into: a table's own, else its children's, added in block flow
+/// and the largest of boxes side by side.
+fn first_page_lift(flow: Flow<'_>, node: &blitz_dom::Node, depth: usize) -> f32 {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
+    if depth >= crate::MAX_DOM_DEPTH || !skipped_header_row_below(doc, node.id, column_styles, 0) {
+        return 0.0;
+    }
+    if let Some(header) = repeating_table_header(doc, node.id, depth + 1, column_styles) {
+        return header.first_page_lift_px;
+    }
+    let lifts = in_flow_children(doc, node)
+        .into_iter()
+        .filter_map(|id| doc.get_node(id))
+        .map(|child| first_page_lift(flow, child, depth + 1));
+    if crate::blitz_adapter::is_flex_or_grid_container_node(node) {
+        lifts.fold(0.0, f32::max)
+    } else {
+        lifts.sum()
+    }
+}
+
 /// Whether a header row that skips its table's first page
 /// (`-fulgur-header-repeat: skip-first`) lies below `node`: only the table's
 /// own fragmentation ([`fragment_repeating_table`]) leaves it off that page,
@@ -1797,7 +1830,6 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
     let Flow {
         doc, column_styles, ..
     } = flow;
-    let fits_page = node.final_layout.size.height <= page_height_px + 1.0;
     // An atomic inline or a box in an orthogonal flow is monolithic (CSS
     // Writing Modes 4 §9), which the walk did not decide before `classify`:
     // an orthogonal inline root was split between its lines. Neither reaches
@@ -1817,7 +1849,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
                     Some(crate::draw_primitives::BreakInside::Avoid)
                 )
             });
-    if (avoid && fits_page)
+    if (avoid && extent(flow, node, 0) <= page_height_px + 1.0)
         || kept_table_row_bottom(doc, column_styles, node, page_height_px).is_some()
     {
         return BoxKind::Monolithic(Whole::Kept);
@@ -2002,7 +2034,7 @@ fn leading_of(
     let Flow {
         doc, column_styles, ..
     } = flow;
-    let height = node.final_layout.size.height;
+    let height = extent(flow, node, depth);
     let whole = Leading::whole(height, room);
     if depth >= crate::MAX_DOM_DEPTH {
         return whole;
@@ -3535,7 +3567,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            let run = child_h + kept;
+            let run = extent(flow, child, depth + 1) + kept;
             if kept > 0.0 && child_page_y + run > page_height_px {
                 if matches!(kind, BoxKind::BlockFlow) {
                     enter_for_kept_run = true;
@@ -7331,6 +7363,23 @@ mod tests {
                 .map(|f| (f.page_index, f.y.to_f32()))
                 .collect()
         })
+    }
+
+    /// The rows that skip a table's first page take no room there: a block
+    /// kept whole around a one-page table with such a row stays where it
+    /// fits once the row is left off (`extent`). Its layout height still
+    /// counted the row, 40 + 60 px on an 80 px page, so it moved to the next
+    /// page for nothing.
+    #[test]
+    fn a_kept_block_around_a_one_page_skip_first_table_stays_when_it_fits_after_the_lift() {
+        let table = header_table("", NOTE_THEN_H, 1);
+        let (doc, geometry) = header_pass(
+            &format!(
+                r#"<div class="s" style="height: 40px"></div><div id="k" style="break-inside: avoid">{table}</div>"#
+            ),
+            80.0,
+        );
+        assert_eq!(placements(&doc, &geometry, "k"), [(0, 40.0)]);
     }
 
     /// A header row with `-fulgur-header-repeat: skip-first` is left off the
@@ -11515,19 +11564,6 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
-    /// The fragments of the element `id`, as (page, y).
-    fn page_ys(
-        doc: &blitz_dom::BaseDocument,
-        geom: &PaginationGeometryTable,
-        id: &str,
-    ) -> Vec<(u32, f32)> {
-        geom[&find_by_id(doc, id).expect(id)]
-            .fragments
-            .iter()
-            .map(|f| (f.page_index, f.y.to_f32()))
-            .collect()
-    }
-
     /// A first child's `break-before` is its container's (css-break-3 §3.1):
     /// the break goes before the container, which starts the next page,
     /// with or without a top edge. Without the edge the break was dropped,
@@ -11550,7 +11586,7 @@ h2 { string-set: chapter-title content(text); }
                 super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
             let top = if edge.is_empty() { 0.0 } else { 10.0 };
             assert_eq!(
-                (page_ys(&doc, &geom, "c"), page_ys(&doc, &geom, "b")),
+                (placements(&doc, &geom, "c"), placements(&doc, &geom, "b")),
                 (vec![(1, 0.0)], vec![(1, top)]),
                 "{edge}"
             );
@@ -11576,7 +11612,7 @@ h2 { string-set: chapter-title content(text); }
             let table = blitz_adapter::extract_column_style_table(&doc, &[]);
             let geom =
                 super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-            page_ys(&doc, &geom, "b")
+            placements(&doc, &geom, "b")
         };
         for (open, close) in [("", ""), ("<div>", "</div>")] {
             assert_eq!(
@@ -11600,7 +11636,7 @@ h2 { string-set: chapter-title content(text); }
         let table = blitz_adapter::extract_column_style_table(&doc, &[]);
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
         assert_eq!(
-            (page_ys(&doc, &geom, "s"), page_ys(&doc, &geom, "h")),
+            (placements(&doc, &geom, "s"), placements(&doc, &geom, "h")),
             (vec![(1, 15.0)], vec![(1, 15.0)])
         );
     }
@@ -11625,7 +11661,7 @@ h2 { string-set: chapter-title content(text); }
             let table = blitz_adapter::extract_column_style_table(&doc, &[]);
             let geom =
                 super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-            assert_eq!(page_ys(&doc, &geom, "r"), [(2, 0.0)], "{open}");
+            assert_eq!(placements(&doc, &geom, "r"), [(2, 0.0)], "{open}");
         }
     }
 
@@ -11649,7 +11685,7 @@ h2 { string-set: chapter-title content(text); }
             let table = blitz_adapter::extract_column_style_table(&doc, &[]);
             let geom =
                 super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
-            ["h", "n"].map(|id| page_ys(&doc, &geom, id))
+            ["h", "n"].map(|id| placements(&doc, &geom, id))
         };
         let moved = [vec![(1, 0.0)], vec![(1, 20.0)]];
         for style in ["break-after: avoid", "page-break-after: avoid"] {
@@ -11698,7 +11734,7 @@ h2 { string-set: chapter-title content(text); }
         let mut doc = parse(html, 600.0);
         let table = blitz_adapter::extract_column_style_table(&doc, &[]);
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-        assert_eq!(page_ys(&doc, &geom, "k"), [(1, 0.0)]);
+        assert_eq!(placements(&doc, &geom, "k"), [(1, 0.0)]);
     }
 
     /// The body is walked as any block: a flex body's items sit side by side
