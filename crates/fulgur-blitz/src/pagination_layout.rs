@@ -1009,7 +1009,8 @@ fn line_break(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    line.iter()
+    let boxes = line
+        .iter()
         .filter_map(|&index| flow.doc.get_node(children[index]))
         .map(|child| {
             if after {
@@ -1018,7 +1019,44 @@ fn line_break(
                 break_before_of(flow, child, page_height_px, depth)
             }
         })
-        .fold(BreakValue::Auto, BreakValue::then)
+        .fold(BreakValue::Auto, BreakValue::then);
+    // A table row's line takes on the row's own value, and its group's at
+    // the group's first or last row: they have no box of their own in the
+    // layout, and no opportunity parts them from their cells (css-break-3
+    // §3.1).
+    let Some(row) = line
+        .first()
+        .and_then(|&index| flow.doc.get_node(children[index]))
+        .and_then(|cell| table_row_of(flow.doc, cell))
+    else {
+        return boxes;
+    };
+    let own = |node: &blitz_dom::Node| {
+        let props = flow.column_styles.and_then(|styles| styles.get(&node.id));
+        if after {
+            BreakValue::own_after(props)
+        } else {
+            BreakValue::own_before(props)
+        }
+    };
+    let group = row
+        .parent
+        .and_then(|id| flow.doc.get_node(id))
+        .filter(|group| {
+            let mut rows = group
+                .children
+                .iter()
+                .filter_map(|&id| flow.doc.get_node(id))
+                .filter(|&node| displays(node, DisplayInside::TableRow));
+            let edge = if after { rows.last() } else { rows.next() };
+            edge.is_some_and(|edge| edge.id == row.id) && !displays(group, DisplayInside::Table)
+        });
+    let group = group.map_or(BreakValue::Auto, own);
+    if after {
+        boxes.then(own(row)).then(group)
+    } else {
+        group.then(own(row)).then(boxes)
+    }
 }
 
 /// The `break-before` of `node` as its parent's walk meets it: its own,
@@ -1161,7 +1199,13 @@ fn opportunities(
             }
             previous_page = Some(end);
         }
-        values[line[0]] = value;
+        // No opportunity lies between the rows a cell spans.
+        let spanned = flow
+            .doc
+            .get_node(children[line[0]])
+            .and_then(|cell| table_row_of(flow.doc, cell))
+            .is_some_and(|row| spanned_from_above(flow.doc, row));
+        values[line[0]] = if spanned { BreakValue::Auto } else { value };
         previous_after = Some(line_break(
             flow,
             children,
@@ -1260,14 +1304,23 @@ fn kept_after_line(
     if values[next_line[0]] != BreakValue::Avoid {
         return 0.0;
     }
-    let Some(next) = doc.get_node(children[next_line[0]]) else {
+    let next: Vec<&blitz_dom::Node> = next_line
+        .iter()
+        .filter_map(|&index| doc.get_node(children[index]))
+        .collect();
+    let Some(&first) = next.first() else {
         return 0.0;
     };
-    let layout = next.final_layout;
-    let gap = (layout.location.y - bottom).max(0.0);
-    let lead = leading_extent(flow, next, page_height_px, page_height_px, depth + 1);
-    let kept = if lead.extent >= layout.size.height - 0.5 {
-        layout.size.height
+    let top = next
+        .iter()
+        .map(|node| node.final_layout.location.y)
+        .fold(f32::INFINITY, f32::min);
+    let height = line_bottom(&next) - top;
+    let gap = (top - bottom).max(0.0);
+    let lead = line_leading(flow, &next, top, page_height_px, page_height_px, depth + 1)
+        .unwrap_or_else(|| leading_extent(flow, first, page_height_px, page_height_px, depth + 1));
+    let kept = if lead.extent >= height - 0.5 {
+        height
             + kept_after_line(
                 flow,
                 parent,
@@ -1603,6 +1656,34 @@ fn line_bottom(items: &[&blitz_dom::Node]) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// The leading unit of the line of boxes side by side `items`, whose
+/// layout top is `top`, with `room` px left below it ([`leading_extent`]):
+/// a table row's, else, for more than one box, their shortest
+/// ([`tracks_leading`]), the line placing content when it fits the room
+/// whole. `None` for a line of one box that is no cell.
+fn line_leading(
+    flow: Flow<'_>,
+    items: &[&blitz_dom::Node],
+    top: f32,
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+) -> Option<Leading> {
+    let &first = items.first()?;
+    if let Some(row) = table_row_of(flow.doc, first) {
+        return Some(leading_extent(flow, row, room, page_height_px, 0));
+    }
+    if items.len() < 2 {
+        return None;
+    }
+    let ids: Vec<usize> = items.iter().map(|item| item.id).collect();
+    let lead = tracks_leading(flow, &ids, top, room, page_height_px, depth)?;
+    Some(Leading {
+        places: lead.places || line_bottom(items) - top <= room,
+        ..lead
+    })
+}
+
 /// Whether the line of `items`, whose layout top is `top`, moves whole to
 /// the next page before its first box, starting `line_y` down a page of
 /// `page_height_px` ([`LineState`]).
@@ -1657,9 +1738,8 @@ fn line_moves_on(
     let Some(lead) = tracks_leading(flow, &ids, top, room, page_height_px, depth) else {
         return false;
     };
-    let height = line_bottom(items) - top;
     let lead = Leading {
-        places: lead.places || height <= room,
+        places: lead.places || line_bottom(items) - top <= room,
         ..lead
     };
     let monolithic_overflow = !at_page_top
@@ -3939,16 +4019,43 @@ fn fragment_block_subtree_inner(
             let line_y = child_page_y - (this_top_in_parent - top);
             let after_content = line_y > cursor.page_start_y
                 || (cursor.entered_below_content && cursor.page_index == page_in);
-            if line_moves_on(
-                flow,
-                &items,
-                top,
-                line_y,
-                after_content,
-                cursor.at_page_top(),
-                page_height_px,
-                depth + 1,
-            ) {
+            // A line followed by an `avoid` moves to the next page with the
+            // run the opportunity joins it to ([`kept_after_line`]) when the
+            // run does not fit the rest of the page but fits a page, as a
+            // box placed whole that starts a run in block flow does. A line
+            // inside a run (an `avoid` before it) follows the run's first.
+            let height = line_bottom(&items) - top;
+            let kept = if opportunity == BreakValue::Avoid {
+                0.0
+            } else {
+                kept_after_line(
+                    flow,
+                    parent,
+                    &walk_children,
+                    &lines,
+                    &opportunities,
+                    number,
+                    page_height_px,
+                    depth + 1,
+                )
+            };
+            let run_moves = kept > 0.0
+                && after_content
+                && !cursor.at_page_top()
+                && line_y + height + kept > page_height_px
+                && height + kept <= page_height_px + 1.0;
+            if run_moves
+                || line_moves_on(
+                    flow,
+                    &items,
+                    top,
+                    line_y,
+                    after_content,
+                    cursor.at_page_top(),
+                    page_height_px,
+                    depth + 1,
+                )
+            {
                 // A table's first row leaves nothing of the table behind.
                 if !displays(parent, DisplayInside::Table) || cursor.cursor_y > cursor.page_start_y
                 {
@@ -4000,9 +4107,10 @@ fn fragment_block_subtree_inner(
         // rule 1). When the run does not fit the rest of the page, the break
         // goes at the last opportunity before it that is not `avoid`: a box
         // the walk places whole that starts the run moves to the next page
-        // when the run fits one, and a block container is entered, so that
-        // the break goes inside it, before the last of its boxes that starts
-        // the run there. A box inside a run (an `avoid` before it) follows
+        // when the run fits one, and a block container, a table, or a flex
+        // or grid container is entered, so that the break goes inside it,
+        // before the last of its boxes or lines that starts the run there.
+        // A box inside a run (an `avoid` before it) follows
         // the run's first box. With nothing placed on the page above, or a
         // run taller than a page, `avoid` is relaxed (rule 4): the walk
         // breaks where the content reaches the foot.
@@ -4027,7 +4135,9 @@ fn fragment_block_subtree_inner(
             let run = extent(flow, child, depth + 1) + kept;
             if kept > 0.0 && child_page_y + run > page_height_px {
                 match &kind {
-                    BoxKind::BlockFlow => enter_for_kept_run = true,
+                    BoxKind::BlockFlow | BoxKind::Table { .. } | BoxKind::Parallel { .. } => {
+                        enter_for_kept_run = true;
+                    }
                     // A paragraph keeps only its trailing unit, its last
                     // `widows` lines, with the run: `avoid` forbids the break
                     // after it, not those between its lines
@@ -4049,9 +4159,6 @@ fn fragment_block_subtree_inner(
                             cursor.entered_below_content = false;
                         }
                     }
-                    // A table's rows and a flex or grid container's lines are
-                    // the table walker's: no run moves them yet.
-                    BoxKind::Table { .. } | BoxKind::Parallel { .. } => {}
                 }
             }
         }
@@ -8232,6 +8339,113 @@ mod tests {
         assert_eq!(
             fragments_of(&doc, &geometry, "row"),
             [(0, 0.0, 194.0), (1, 0.0, 116.0)]
+        );
+    }
+
+    /// `body` laid out with its break styles on 100 px pages, its table
+    /// cells 20 px tall.
+    fn row_break_pass(body: &str) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              td {{ box-sizing: border-box; height: 20px; padding: 0; }}
+              .s {{ height: 50px; }}
+            </style></head><body>{body}</body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    /// A table row's own `break-before` and `break-after`, and its row
+    /// group's at its first or last row, are the opportunity between it and
+    /// the row next to it: the row has no box of its own in the layout,
+    /// whose cells the walk meets.
+    #[test]
+    fn a_rows_and_its_groups_breaks_are_the_opportunities_between_rows() {
+        let at = |body: &str| {
+            let (doc, geometry) = row_break_pass(body);
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id))
+        };
+        let rows = |b: &str, c: &str| {
+            format!(
+                r#"<table><tbody><tr><td id="a">a</td></tr><tr{b}><td id="b">b</td></tr>
+                <tr{c}><td id="c">c</td></tr></tbody></table>"#
+            )
+        };
+        assert_eq!(
+            at(&rows(r#" style="break-before: page""#, "")),
+            [vec![(0, 0.0)], vec![(1, 0.0)], vec![(1, 20.0)]]
+        );
+        assert_eq!(
+            at(&rows(r#" style="break-after: page""#, "")),
+            [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]]
+        );
+        let groups = r#"<table><tbody><tr><td id="a">a</td></tr><tr><td id="b">b</td></tr></tbody>
+            <tbody style="break-before: page"><tr><td id="c">c</td></tr></tbody></table>"#;
+        assert_eq!(
+            at(groups),
+            [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]]
+        );
+    }
+
+    /// A row with `break-after: avoid` before a row that does not fit the
+    /// rest of the page moves to the next page with it, as the boxes of a
+    /// run in block flow do; so does a flex line before the line it avoids
+    /// breaking from.
+    #[test]
+    fn a_row_or_a_flex_line_moves_with_the_line_it_avoids_breaking_from() {
+        let rows = r#"<div class="s"></div><table><tbody><tr><td id="a">a</td></tr>
+            <tr style="break-after: avoid"><td id="b">b</td></tr><tr><td id="c">c</td></tr>
+            </tbody></table>"#;
+        let (doc, geometry) = row_break_pass(rows);
+        assert_eq!(
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
+            [vec![(0, 50.0)], vec![(1, 0.0)], vec![(1, 20.0)]]
+        );
+
+        let lines = r#"<div class="s"></div><div style="display: flex; flex-wrap: wrap">
+            <div id="a" style="width: 100%; height: 20px"></div>
+            <div id="b" style="width: 100%; height: 20px; break-after: avoid"></div>
+            <div id="c" style="width: 100%; height: 20px"></div></div>"#;
+        let (doc, geometry) = row_break_pass(lines);
+        assert_eq!(
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
+            [vec![(0, 50.0)], vec![(1, 0.0)], vec![(1, 20.0)]]
+        );
+    }
+
+    /// A table's last row moves to the next page with the block after the
+    /// table that it avoids breaking from, which does not fit the rest of
+    /// the page: the walk enters the table for the run, as it enters a
+    /// block, and breaks before the row.
+    #[test]
+    fn a_tables_last_row_moves_with_the_block_it_avoids_breaking_from() {
+        let body = r#"<div class="s"></div><table><tbody><tr><td id="a">a</td></tr>
+            <tr><td id="b">b</td></tr></tbody></table>
+            <div id="c" style="height: 20px; break-before: avoid"></div>"#;
+        let (doc, geometry) = row_break_pass(body);
+        assert_eq!(
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
+            [vec![(0, 50.0)], vec![(1, 0.0)], vec![(1, 20.0)]]
+        );
+    }
+
+    /// No opportunity lies between the rows a cell spans: a forced break
+    /// before the second of them is not taken.
+    #[test]
+    fn a_forced_break_between_the_rows_a_cell_spans_is_not_taken() {
+        let body = r#"<table><tbody><tr><td id="a">a</td><td rowspan="2">s</td></tr>
+            <tr style="break-before: page"><td id="b">b</td></tr>
+            <tr style="break-before: page"><td id="c">c</td></tr></tbody></table>"#;
+        let (doc, geometry) = row_break_pass(body);
+        assert_eq!(
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
+            [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]]
         );
     }
 
