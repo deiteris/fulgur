@@ -1,11 +1,17 @@
 //! Invariants of the fragmenter over generated box trees.
 //!
 //! A proptest strategy generates trees of up to 30 boxes: blocks with
-//! margins, padding, and borders; paragraphs of 1 to 12 lines; tables of 1
-//! to 8 rows of 1 to 3 cells, with or without a `thead`; flex rows of two
-//! items; images; `break-inside: avoid` and forced breaks on random boxes.
-//! Pages are 100 to 400 px tall. Each case is laid out with its break
-//! styles and checked against five invariants ([`Invariant`]).
+//! margins, padding, and borders; paragraphs of 1 to 12 lines, with their
+//! own `orphans` and `widows` or inherited ones; tables of 1 to 8 rows of 1
+//! to 3 cells, with or without a `thead`, a header row that skips the first
+//! page (`-fulgur-header-repeat: skip-first`), a caption, a cell spanning
+//! two rows, `orphans` and `widows`, and row counts
+//! (`-fulgur-table-orphans`, `-fulgur-table-widows`); flex and grid rows of
+//! two items; floats; images; `break-inside: avoid` on random boxes and
+//! rows, and `break-before` and `break-after` of `page`, `left`, `right`,
+//! or `avoid`. Pages are 100 to 400 px tall. Each case is laid out with its
+//! break styles, its captions moved out of their tables as the engine moves
+//! them, and checked against five invariants ([`Invariant`]).
 //!
 //! The cases are drawn from fixed seeds, one per case, so a failure names
 //! its seed, and are laid out in Noto Sans with no system font, so they are
@@ -88,6 +94,40 @@ mod fix {
     pub const UNEXPLAINED: &str = "unexplained";
 }
 
+/// A generated box's `break-before` or `break-after`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Break {
+    #[default]
+    Auto,
+    Page,
+    Left,
+    Right,
+    Avoid,
+}
+
+impl Break {
+    /// The CSS keyword, or `None` for `auto`, which is left unwritten.
+    fn keyword(self) -> Option<&'static str> {
+        match self {
+            Break::Auto => None,
+            Break::Page => Some("page"),
+            Break::Left => Some("left"),
+            Break::Right => Some("right"),
+            Break::Avoid => Some("avoid"),
+        }
+    }
+}
+
+fn break_value() -> impl Strategy<Value = Break> {
+    prop_oneof![
+        88 => Just(Break::Auto),
+        5 => Just(Break::Page),
+        1 => Just(Break::Left),
+        1 => Just(Break::Right),
+        5 => Just(Break::Avoid),
+    ]
+}
+
 /// The style of a generated box.
 #[derive(Clone, Debug, Default)]
 struct BoxStyle {
@@ -96,7 +136,35 @@ struct BoxStyle {
     padding: u8,
     border: u8,
     avoid: bool,
-    break_before: bool,
+    break_before: Break,
+    break_after: Break,
+}
+
+/// `orphans` and `widows`, or nothing, so that they are inherited.
+type LineCounts = Option<(u8, u8)>;
+
+/// A table's header rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Head {
+    /// No `thead`.
+    None,
+    /// A `thead` of one row, repeated on every page.
+    Plain,
+    /// A `thead` of a row that skips the table's first page
+    /// (`-fulgur-header-repeat: skip-first`) above a row repeated on every
+    /// page.
+    SkipFirst,
+}
+
+impl Head {
+    /// The header rows.
+    fn rows(self) -> usize {
+        match self {
+            Head::None => 0,
+            Head::Plain => 1,
+            Head::SkipFirst => 2,
+        }
+    }
 }
 
 /// A generated box.
@@ -106,75 +174,103 @@ enum Gen {
     Leaf { style: BoxStyle, height: u16 },
     /// A replaced box (`img`) of a fixed height.
     Image { height: u16 },
+    /// A floated block of a fixed height, 40% of its container wide.
+    Float { left: bool, height: u16 },
     /// A paragraph of `lines` lines of `line_height` px.
     Para {
         style: BoxStyle,
         lines: u8,
         line_height: u8,
-        orphans: u8,
-        widows: u8,
+        counts: LineCounts,
     },
     /// A block holding other boxes.
     Block { style: BoxStyle, children: Vec<Gen> },
-    /// A table; each row's cells hold one box each.
+    /// A table; each row's cells hold one box each. With `span`, the first
+    /// cell of that row spans it and the next, which has one cell fewer.
     Table {
         style: BoxStyle,
-        thead: bool,
+        head: Head,
+        caption: bool,
+        counts: LineCounts,
+        row_counts: LineCounts,
         cell_padding: u8,
         rows: Vec<(bool, Vec<Gen>)>,
+        span: Option<usize>,
     },
-    /// A flex row of two items, each holding one box.
-    Flex { style: BoxStyle, items: Vec<Gen> },
+    /// A flex row, or a grid of two columns, of two items, each holding one
+    /// box.
+    Flex {
+        style: BoxStyle,
+        grid: bool,
+        items: Vec<Gen>,
+    },
 }
 
-fn style() -> impl Strategy<Value = BoxStyle> {
+fn style() -> BoxedStrategy<BoxStyle> {
     (
         prop_oneof![4 => Just(0u8), 1 => 1u8..=20],
         prop_oneof![4 => Just(0u8), 1 => 1u8..=20],
         prop_oneof![4 => Just(0u8), 1 => 1u8..=12],
         prop_oneof![4 => Just(0u8), 1 => 1u8..=4],
         proptest::bool::weighted(0.2),
-        proptest::bool::weighted(0.08),
+        break_value(),
+        break_value(),
     )
         .prop_map(
-            |(margin_top, margin_bottom, padding, border, avoid, break_before)| BoxStyle {
-                margin_top,
-                margin_bottom,
-                padding,
-                border,
-                avoid,
-                break_before,
+            |(margin_top, margin_bottom, padding, border, avoid, break_before, break_after)| {
+                BoxStyle {
+                    margin_top,
+                    margin_bottom,
+                    padding,
+                    border,
+                    avoid,
+                    break_before,
+                    break_after,
+                }
             },
         )
+        .boxed()
+}
+
+/// `orphans` and `widows` of 1 to 4, or nothing.
+fn line_counts(probability: f64) -> impl Strategy<Value = LineCounts> {
+    proptest::option::weighted(probability, (1u8..=4, 1u8..=4))
 }
 
 /// A box with no box children.
-fn leaf() -> impl Strategy<Value = Gen> {
+fn leaf() -> BoxedStrategy<Gen> {
     prop_oneof![
         4 => (style(), 5u16..=160).prop_map(|(style, height)| Gen::Leaf { style, height }),
         1 => (5u16..=120).prop_map(|height| Gen::Image { height }),
-        4 => (style(), 1u8..=12, prop_oneof![Just(20u8), 16u8..=30], 1u8..=4, 1u8..=4).prop_map(
-            |(style, lines, line_height, orphans, widows)| Gen::Para {
+        1 => (any::<bool>(), 5u16..=160).prop_map(|(left, height)| Gen::Float { left, height }),
+        4 => (style(), 1u8..=12, prop_oneof![Just(20u8), 16u8..=30], line_counts(0.7)).prop_map(
+            |(style, lines, line_height, counts)| Gen::Para {
                 style,
                 lines,
                 line_height,
-                orphans,
-                widows,
+                counts,
             }
         ),
     ]
+    .boxed()
 }
 
-/// The boxes of `nodes`, rows and cells included.
+/// The boxes of `nodes`, rows, cells, and captions included.
 fn box_count(nodes: &[Gen]) -> usize {
     nodes
         .iter()
         .map(|node| match node {
-            Gen::Leaf { .. } | Gen::Image { .. } | Gen::Para { .. } => 1,
+            Gen::Leaf { .. } | Gen::Image { .. } | Gen::Float { .. } | Gen::Para { .. } => 1,
             Gen::Block { children, .. } => 1 + box_count(children),
-            Gen::Table { thead, rows, .. } => {
-                let header = if *thead { 1 + rows[0].1.len() } else { 0 };
-                1 + header
+            Gen::Table {
+                head,
+                caption,
+                rows,
+                ..
+            } => {
+                let header = head.rows() * (1 + rows[0].1.len());
+                1 + usize::from(*caption)
+                    + header
                     + rows
                         .iter()
                         .map(|(_, cells)| 1 + cells.len() + box_count(cells))
@@ -190,35 +286,58 @@ fn tree() -> impl Strategy<Value = Vec<Gen>> {
     let node = leaf().prop_recursive(3, 16, 4, |inner| {
         prop_oneof![
             3 => (style(), prop::collection::vec(inner.clone(), 1..=4))
-                .prop_map(|(style, children)| Gen::Block { style, children }),
+                .prop_map(|(style, children)| Gen::Block { style, children })
+                .boxed(),
             2 => (
                 style(),
-                any::<bool>(),
+                prop_oneof![2 => Just(Head::None), 1 => Just(Head::Plain), 1 => Just(Head::SkipFirst)],
+                proptest::bool::weighted(0.25),
+                line_counts(0.2),
+                line_counts(0.2),
                 prop_oneof![Just(0u8), Just(10u8)],
                 prop::collection::vec(
                     (proptest::bool::weighted(0.2), prop::collection::vec(leaf(), 1..=3)),
                     1..=8
                 ),
+                proptest::option::weighted(0.3, any::<prop::sample::Index>()),
             )
-                .prop_map(|(style, thead, cell_padding, rows)| {
-                    // Every row of a table has as many cells as its first.
-                    let columns = rows[0].1.len();
-                    let rows = rows
-                        .into_iter()
-                        .map(|(avoid, mut cells)| {
-                            cells.resize(columns, Gen::Image { height: 20 });
-                            (avoid, cells)
-                        })
-                        .collect();
-                    Gen::Table {
-                        style,
-                        thead,
-                        cell_padding,
-                        rows,
+                .prop_map(
+                    |(style, head, caption, counts, row_counts, cell_padding, rows, span)| {
+                        // Every row of a table has as many cells as its
+                        // first, but the row below a spanning cell, which
+                        // has one fewer; a span needs a second column and a
+                        // row below.
+                        let columns = rows[0].1.len();
+                        let span = span
+                            .filter(|_| columns > 1 && rows.len() > 1)
+                            .map(|row| row.index(rows.len() - 1));
+                        let rows = rows
+                            .into_iter()
+                            .enumerate()
+                            .map(|(row, (avoid, mut cells))| {
+                                cells.resize(columns, Gen::Image { height: 20 });
+                                if span.is_some_and(|span| span + 1 == row) {
+                                    cells.remove(0);
+                                }
+                                (avoid, cells)
+                            })
+                            .collect();
+                        Gen::Table {
+                            style,
+                            head,
+                            caption,
+                            counts,
+                            row_counts,
+                            cell_padding,
+                            rows,
+                            span,
+                        }
                     }
-                }),
-            1 => (style(), prop::collection::vec(inner, 2..=2))
-                .prop_map(|(style, items)| Gen::Flex { style, items }),
+                )
+                .boxed(),
+            1 => (style(), any::<bool>(), prop::collection::vec(inner, 2..=2))
+                .prop_map(|(style, grid, items)| Gen::Flex { style, grid, items })
+                .boxed(),
         ]
     });
     prop::collection::vec(node, 1..=5)
@@ -240,12 +359,16 @@ struct Info {
     edged: bool,
     /// The top padding a table cell repeats on each page it continues on.
     repeated_edge: f32,
+    /// The rows a table cell spans.
+    rowspan: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Leaf,
     Image,
+    Float,
+    Caption,
     Para,
     Block,
     Table,
@@ -287,10 +410,21 @@ fn style_css(style: &BoxStyle) -> String {
     if style.avoid {
         css.push_str("break-inside: avoid; ");
     }
-    if style.break_before {
-        css.push_str("break-before: page; ");
+    if let Some(value) = style.break_before.keyword() {
+        let _ = write!(css, "break-before: {value}; ");
+    }
+    if let Some(value) = style.break_after.keyword() {
+        let _ = write!(css, "break-after: {value}; ");
     }
     css
+}
+
+/// `counts` as `orphans` and `widows` under the property names `prefix`
+/// gives them.
+fn counts_css(prefix: &str, counts: LineCounts) -> String {
+    counts.map_or_else(String::new, |(orphans, widows)| {
+        format!("{prefix}orphans: {orphans}; {prefix}widows: {widows}; ")
+    })
 }
 
 impl Case {
@@ -310,6 +444,7 @@ impl Case {
              p {{ margin: 0; }} \
              table {{ border-spacing: 0; margin: 0; }} \
              th {{ padding: 0; height: 20px; box-sizing: border-box; }} \
+             caption {{ padding: 0; }} \
              </style></head><body>{body}</body></html>"
         );
         case
@@ -326,6 +461,7 @@ impl Case {
             lines,
             edged: false,
             repeated_edge: 0.0,
+            rowspan: 1,
         });
         if let Some(parent) = parent {
             self.boxes[parent].children.push(index);
@@ -351,12 +487,19 @@ impl Case {
                     r#"<img id="b{b}" style="display: block; width: 10px; height: {height}px">"#
                 );
             }
+            Gen::Float { left, height } => {
+                let b = self.add(Kind::Float, parent, in_header, 0);
+                let side = if *left { "left" } else { "right" };
+                let _ = write!(
+                    out,
+                    r#"<div id="b{b}" style="float: {side}; width: 40%; height: {height}px"></div>"#
+                );
+            }
             Gen::Para {
                 style,
                 lines,
                 line_height,
-                orphans,
-                widows,
+                counts,
             } => {
                 let b = self.add(Kind::Para, parent, in_header, usize::from(*lines));
                 self.boxes[b].edged = has_edges(style);
@@ -366,8 +509,9 @@ impl Case {
                     .join("<br>");
                 let _ = write!(
                     out,
-                    r#"<p id="b{b}" style="{}line-height: {line_height}px; orphans: {orphans}; widows: {widows}">{text}</p>"#,
-                    style_css(style)
+                    r#"<p id="b{b}" style="{}{}line-height: {line_height}px">{text}</p>"#,
+                    style_css(style),
+                    counts_css("", *counts)
                 );
             }
             Gen::Block { style, children } => {
@@ -381,58 +525,94 @@ impl Case {
             }
             Gen::Table {
                 style,
-                thead,
+                head,
+                caption,
+                counts,
+                row_counts,
                 cell_padding,
                 rows,
+                span,
             } => {
                 let t = self.add(Kind::Table, parent, in_header, 0);
                 self.boxes[t].edged = has_edges(style);
-                let _ = write!(out, r#"<table id="b{t}" style="{}">"#, style_css(style));
+                let _ = write!(
+                    out,
+                    r#"<table id="b{t}" style="{}{}{}">"#,
+                    style_css(style),
+                    counts_css("", *counts),
+                    counts_css("-fulgur-table-", *row_counts)
+                );
+                if *caption {
+                    let c = self.add(Kind::Caption, Some(t), in_header, 0);
+                    let _ = write!(out, r#"<caption id="b{c}">C</caption>"#);
+                }
                 let mut header = Vec::new();
                 let mut body = Vec::new();
-                if *thead {
-                    let r = self.add(Kind::Row, Some(t), true, 0);
-                    let _ = write!(out, r#"<thead><tr id="b{r}">"#);
-                    for _ in &rows[0].1 {
-                        let c = self.add(Kind::Cell, Some(r), true, 0);
-                        header.push(c);
-                        let _ = write!(out, r#"<th id="b{c}">H</th>"#);
+                if *head != Head::None {
+                    out.push_str("<thead>");
+                    for row in 0..head.rows() {
+                        let r = self.add(Kind::Row, Some(t), true, 0);
+                        let row_style = if *head == Head::SkipFirst && row == 0 {
+                            "-fulgur-header-repeat: skip-first"
+                        } else {
+                            ""
+                        };
+                        let _ = write!(out, r#"<tr id="b{r}" style="{row_style}">"#);
+                        for _ in &rows[0].1 {
+                            let c = self.add(Kind::Cell, Some(r), true, 0);
+                            header.push(c);
+                            let _ = write!(out, r#"<th id="b{c}">H</th>"#);
+                        }
+                        out.push_str("</tr>");
                     }
-                    out.push_str("</tr></thead>");
+                    out.push_str("</thead>");
                 }
                 out.push_str("<tbody>");
-                for (avoid, cells) in rows {
+                for (row, (avoid, cells)) in rows.iter().enumerate() {
                     let r = self.add(Kind::Row, Some(t), in_header, 0);
                     let row_style = if *avoid { "break-inside: avoid" } else { "" };
                     let _ = write!(out, r#"<tr id="b{r}" style="{row_style}">"#);
-                    for cell in cells {
+                    for (column, cell) in cells.iter().enumerate() {
                         let c = self.add(Kind::BodyCell, Some(r), in_header, 0);
                         self.boxes[c].edged = *cell_padding > 0;
                         self.boxes[c].repeated_edge = f32::from(*cell_padding);
                         body.push(c);
-                        let _ =
-                            write!(out, r#"<td id="b{c}" style="padding: {cell_padding}px 0">"#);
+                        let rowspan = if *span == Some(row) && column == 0 {
+                            self.boxes[c].rowspan = 2;
+                            r#" rowspan="2""#
+                        } else {
+                            ""
+                        };
+                        let _ = write!(
+                            out,
+                            r#"<td id="b{c}"{rowspan} style="padding: {cell_padding}px 0">"#
+                        );
                         self.emit(cell, Some(c), in_header, out);
                         out.push_str("</td>");
                     }
                     out.push_str("</tr>");
                 }
                 out.push_str("</tbody></table>");
-                if *thead {
+                if *head != Head::None {
                     self.tables.push((t, header, body));
                 }
             }
-            Gen::Flex { style, items } => {
+            Gen::Flex { style, grid, items } => {
                 let f = self.add(Kind::Flex, parent, in_header, 0);
                 self.boxes[f].edged = has_edges(style);
+                let (display, item_style) = if *grid {
+                    ("display: grid; grid-template-columns: 1fr 1fr", "")
+                } else {
+                    ("display: flex", "flex: 1 1 0")
+                };
                 let _ = write!(
                     out,
-                    r#"<div id="b{f}" style="display: flex; {}">"#,
+                    r#"<div id="b{f}" style="{display}; {}">"#,
                     style_css(style)
                 );
                 for item in items {
                     let i = self.add(Kind::Item, Some(f), in_header, 0);
-                    let _ = write!(out, r#"<div id="b{i}" style="flex: 1 1 0">"#);
+                    let _ = write!(out, r#"<div id="b{i}" style="{item_style}">"#);
                     self.emit(item, Some(i), in_header, out);
                     out.push_str("</div>");
                 }
@@ -487,12 +667,16 @@ impl Violation {
 }
 
 /// `case` laid out with its break styles on pages `page_height` px tall,
-/// in Noto Sans and no system font, so the lines are the same on every host.
+/// in Noto Sans and no system font, so the lines are the same on every host,
+/// its captions moved out of their tables as the engine moves them.
 fn layout(case: &Case, page_height: f32) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+    use blitz_adapter::DomPass as _;
     let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
     let (mut doc, _, _) = blitz_adapter::parse_html_with_local_resources(
         &case.html, PAGE_WIDTH, 10000, &fonts, false, None,
     );
+    blitz_adapter::CaptionRestructurePass
+        .apply(&mut doc, &blitz_adapter::PassContext { font_data: &[] });
     blitz_adapter::resolve(&mut doc);
     let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
     let geometry = super::run_pass_with_break_styles(doc.deref_mut(), page_height.as_px(), &styles);
@@ -512,6 +696,31 @@ fn enclosed(case: &Case, b: usize) -> Vec<usize> {
             .collect(),
         _ => info.children.clone(),
     }
+}
+
+/// The body rows of the table `table`.
+fn body_rows(case: &Case, table: usize) -> impl Iterator<Item = usize> + '_ {
+    case.boxes[table]
+        .children
+        .iter()
+        .copied()
+        .filter(|&row| case.boxes[row].kind == Kind::Row && !case.boxes[row].in_header)
+}
+
+/// The lines of the table `table`'s body, as the cells of each: a row's,
+/// joined with the row below when a cell of it spans that row.
+fn table_lines(case: &Case, table: usize) -> Vec<Vec<usize>> {
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut spanned = false;
+    for row in body_rows(case, table) {
+        let cells = &case.boxes[row].children;
+        match lines.last_mut() {
+            Some(line) if spanned => line.extend(cells),
+            _ => lines.push(cells.clone()),
+        }
+        spanned = cells.iter().any(|&c| case.boxes[c].rowspan > 1);
+    }
+    lines
 }
 
 /// Whether `b`, or a box around it, is of one of `kinds`.
@@ -580,12 +789,17 @@ impl Placed<'_> {
         let own = match info.kind {
             Kind::Flex => self.line_growth(&info.children),
             Kind::Table => {
-                let (header, body): (Vec<usize>, Vec<usize>) = info
+                let header: Vec<usize> = info
                     .children
                     .iter()
-                    .partition(|&&row| self.case.boxes[row].in_header);
-                body.iter()
-                    .map(|&row| self.line_growth(&self.case.boxes[row].children))
+                    .copied()
+                    .filter(|&row| {
+                        self.case.boxes[row].kind == Kind::Row && self.case.boxes[row].in_header
+                    })
+                    .collect();
+                table_lines(self.case, b)
+                    .iter()
+                    .map(|line| self.line_growth(line))
                     .sum::<f32>()
                     + self.repeated_band(b, &header)
             }
@@ -878,7 +1092,10 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 format!("{} ({:?}) is not placed", info.id, info.kind),
             );
         }
-        if matches!(info.kind, Kind::Leaf | Kind::Image | Kind::Para) {
+        if matches!(
+            info.kind,
+            Kind::Leaf | Kind::Image | Kind::Float | Kind::Caption | Kind::Para
+        ) {
             for pair in pages.windows(2) {
                 if pair[1] <= pair[0] {
                     push(
@@ -900,7 +1117,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             }
         }
         match info.kind {
-            Kind::Leaf | Kind::Image if !frags.is_empty() => {
+            Kind::Leaf | Kind::Image | Kind::Float | Kind::Caption if !frags.is_empty() => {
                 let excess = placed.excess(b);
                 if excess.abs() > EPS * frags.len() as f32 {
                     push(
@@ -960,7 +1177,8 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             _ => {}
         }
 
-        // In block flow, document order matches (page, y) order.
+        // In block flow, document order matches (page, y) order; a float
+        // is out of flow, beside the boxes after it.
         let flow: Vec<usize> = if b == 0 {
             (0..case.boxes.len())
                 .filter(|&k| case.boxes[k].parent.is_none())
@@ -970,6 +1188,10 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
         } else {
             Vec::new()
         };
+        let flow: Vec<usize> = flow
+            .into_iter()
+            .filter(|&k| case.boxes[k].kind != Kind::Float)
+            .collect();
         for pair in flow.windows(2) {
             let (a, c) = (pair[0], pair[1]);
             let (Some(last), Some(first)) =
@@ -1007,14 +1229,10 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
         }
 
         // Between the body rows of a table, document order matches (page,
-        // y) order: a row starts where the row before it ends, or later.
+        // y) order: a row starts where the row before it ends, or later; a
+        // cell spanning the row below ends with that row.
         if info.kind == Kind::Table {
-            let rows: Vec<usize> = info
-                .children
-                .iter()
-                .copied()
-                .filter(|&row| !case.boxes[row].in_header)
-                .collect();
+            let rows: Vec<usize> = body_rows(case, b).collect();
             let start = |row: usize| {
                 case.boxes[row]
                     .children
@@ -1027,6 +1245,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 case.boxes[row]
                     .children
                     .iter()
+                    .filter(|&&cell| case.boxes[cell].rowspan == 1)
                     .filter_map(|&cell| placed.fragments[cell].last())
                     .map(|f| (f.page_index, f.y.to_f32() + f.height.to_f32()))
                     .reduce(|a, b| if before(a, b) { b } else { a })
@@ -1050,8 +1269,12 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             }
         }
 
-        // On each page, a parent's fragment encloses its children's.
+        // On each page, a parent's fragment encloses its children's; a float
+        // may hang out of a block that is no formatting context root.
         for child in enclosed(case, b) {
+            if case.boxes[child].kind == Kind::Float && info.kind == Kind::Block {
+                continue;
+            }
             for cf in &placed.fragments[child] {
                 // A child running past the foot is reported so already; the
                 // part on its page lies inside a parent fragment that
@@ -1244,7 +1467,10 @@ fn golden_text(found: &BTreeMap<(u64, String), String>) -> String {
 fn a_header_placed_twice_on_one_page_is_counted_once() {
     let case = Case::new(&[Gen::Table {
         style: BoxStyle::default(),
-        thead: true,
+        head: Head::Plain,
+        caption: false,
+        counts: None,
+        row_counts: None,
         cell_padding: 0,
         rows: vec![(
             false,
@@ -1253,6 +1479,7 @@ fn a_header_placed_twice_on_one_page_is_counted_once() {
                 height: 120,
             }],
         )],
+        span: None,
     }]);
     // b0 the table, b1 the header row, b2 its cell, b3 the body row, b4
     // its cell, b5 the leaf: a 140 px table on 200 px pages.
