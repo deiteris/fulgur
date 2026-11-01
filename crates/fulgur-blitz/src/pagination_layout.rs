@@ -1896,16 +1896,7 @@ fn close_line(
         !ends
     });
     stretch_line_items(geometry, doc, &line, cursor.page_height_px);
-    cursor.page_index = line.max_end_page;
-    cursor.cursor_y = line.max_end_cursor_y;
-    cursor.page_has_content = line.max_end_has_content;
-    if line.max_end_page > line.start.page_index {
-        cursor.page_start_y = 0.0;
-        Some(line.max_end_cursor_y)
-    } else {
-        cursor.page_start_y = line.start.page_start_y;
-        None
-    }
+    cursor.after_line(&line)
 }
 
 /// Gives each box of a line that crossed pages, stretched to the line's
@@ -2184,6 +2175,49 @@ impl PageCursor {
         self.page_index = end_page;
         self.cursor_y = end_y;
         self.page_start_y = 0.0;
+    }
+
+    /// Goes on below a paragraph split or a box sliced from this page, which
+    /// ended at `end_y` on `end_page`: past the pages it crossed
+    /// ([`Self::after_crossing`], the parent's fragment on this page
+    /// reaching the foot), or on this page, below it, or in a line of
+    /// boxes side by side (`in_line`) below the lowest of them, so that a
+    /// shorter box followed by `break-after: page` closes the parent at the
+    /// line's true extent (codex P2). Returns whether it crossed pages.
+    fn after_box(
+        &mut self,
+        geometry: &mut PaginationGeometryTable,
+        end_page: u32,
+        end_y: f32,
+        in_line: bool,
+    ) -> bool {
+        if end_page > self.page_index {
+            let height = self.parent_height(ParentHeight::ToFoot);
+            self.after_crossing(geometry, end_page, end_y, height);
+            return true;
+        }
+        self.cursor_y = if in_line {
+            self.cursor_y.max(end_y)
+        } else {
+            end_y
+        };
+        false
+    }
+
+    /// Goes on below the line `line` of boxes side by side, which ends
+    /// below the box that ends last, on its page ([`close_line`]). Returns
+    /// the y at which the next line starts when the line crossed pages.
+    fn after_line(&mut self, line: &LineState) -> Option<f32> {
+        self.page_index = line.max_end_page;
+        self.cursor_y = line.max_end_cursor_y;
+        self.page_has_content = line.max_end_has_content;
+        if line.max_end_page > line.start.page_index {
+            self.page_start_y = 0.0;
+            Some(line.max_end_cursor_y)
+        } else {
+            self.page_start_y = line.start.page_start_y;
+            None
+        }
     }
 
     /// Whether a break point precedes a box placed at `y` on this page in
@@ -4624,7 +4658,6 @@ fn fragment_block_subtree_inner(
                 cursor.move_before(geometry, this_top_in_parent, false);
                 child_page_y = 0.0;
             }
-            let pre_split_page = cursor.page_index;
             // codex P1: start from `child_page_y` (this child's own
             // rebased page-local y), not the parent's running
             // `cursor_y` — for block flow the two are equal, but for
@@ -4651,19 +4684,8 @@ fn fragment_block_subtree_inner(
             // below: without a parent fragment per page the split
             // crossed, the parent's own background / border would
             // disappear from every page but the last.
-            if new_page_index > pre_split_page {
-                let height = cursor.parent_height(ParentHeight::ToFoot);
-                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height);
+            if cursor.after_box(geometry, new_page_index, new_cursor_y, in_line) {
                 origin_pending_target_y = Some(new_cursor_y);
-            } else if in_line {
-                // codex P2: in a line of boxes side by side, keep the
-                // larger of the parent's `cursor_y` (a previous box's
-                // bottom) and this paragraph's end, so that a shorter
-                // paragraph followed by `break-after: page` closes the
-                // parent at the line's true (taller) extent.
-                cursor.cursor_y = cursor.cursor_y.max(new_cursor_y);
-            } else {
-                cursor.cursor_y = new_cursor_y;
             }
             cursor.entered_below_content = false;
             reach_line(&mut line, &mut spans, child, &cursor);
@@ -4948,7 +4970,6 @@ fn fragment_block_subtree_inner(
             // The slices are placed from the child's own place on the page,
             // and the walk then goes on from the last one, as after an
             // inline root that split.
-            let entry_page_index = cursor.page_index;
             let mut slices = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
             slices.page_has_content = cursor.page_has_content;
             let first_slice_h = (page_height_px - child_page_y).min(child_h);
@@ -5063,14 +5084,8 @@ fn fragment_block_subtree_inner(
             cursor.page_has_content = slices.page_has_content;
             // The parent's fragment reaches the foot of every page the
             // slices cross, as around an inline root that split.
-            if new_page_index > entry_page_index {
-                let height = cursor.parent_height(ParentHeight::ToFoot);
-                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height);
+            if cursor.after_box(geometry, new_page_index, new_cursor_y, in_line) {
                 origin_pending_target_y = Some(new_cursor_y);
-            } else if in_line {
-                cursor.cursor_y = cursor.cursor_y.max(new_cursor_y);
-            } else {
-                cursor.cursor_y = new_cursor_y;
             }
             reach_line(&mut line, &mut spans, child, &cursor);
             continue;
