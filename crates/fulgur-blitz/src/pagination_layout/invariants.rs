@@ -238,6 +238,8 @@ struct Info {
     lines: usize,
     /// The box has a margin, a border, or padding.
     edged: bool,
+    /// The top padding a table cell repeats on each page it continues on.
+    repeated_edge: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +325,7 @@ impl Case {
             in_header,
             lines,
             edged: false,
+            repeated_edge: 0.0,
         });
         if let Some(parent) = parent {
             self.boxes[parent].children.push(index);
@@ -405,6 +408,7 @@ impl Case {
                     for cell in cells {
                         let c = self.add(Kind::BodyCell, Some(r), in_header, 0);
                         self.boxes[c].edged = *cell_padding > 0;
+                        self.boxes[c].repeated_edge = f32::from(*cell_padding);
                         body.push(c);
                         let _ =
                             write!(out, r#"<td id="b{c}" style="padding: {cell_padding}px 0">"#);
@@ -560,24 +564,136 @@ impl Placed<'_> {
     /// counts down to the lowest of its children's fragments on its page.
     fn container_excess(&self, b: usize) -> f32 {
         let frags = &self.fragments[b];
-        let children = enclosed(self.case, b);
         let total: f32 = frags
             .iter()
             .enumerate()
-            .map(|(k, f)| {
-                let (top, height) = (f.y.to_f32(), f.height.to_f32());
-                if k + 1 == frags.len() || top + height < self.page_height - EPS {
-                    return height;
-                }
-                children
-                    .iter()
-                    .flat_map(|&c| &self.fragments[c])
-                    .filter(|cf| cf.page_index == f.page_index)
-                    .map(|cf| (cf.y.to_f32() + cf.height.to_f32()).min(top + height) - top)
-                    .fold(0.0_f32, f32::max)
+            .map(|(k, f)| self.counted_bottom(b, k) - f.y.to_f32())
+            .sum();
+        total - self.layout_height[b] - self.growth(b)
+    }
+
+    /// How much taller than their layout the lines of boxes side by side in
+    /// `b`'s subtree are on the pages, its own lines' and those of the boxes
+    /// in it ([`Self::line_growth`]).
+    fn growth(&self, b: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        let own = match info.kind {
+            Kind::Flex => self.line_growth(&info.children),
+            Kind::Table => info
+                .children
+                .iter()
+                .filter(|&&row| !self.case.boxes[row].in_header)
+                .map(|&row| self.line_growth(&self.case.boxes[row].children))
+                .sum(),
+            _ => 0.0,
+        };
+        own + enclosed(self.case, b)
+            .iter()
+            .map(|&c| self.growth(c))
+            .sum::<f32>()
+    }
+
+    /// How much taller than the tallest of its boxes' layouts the line of
+    /// `items` is on the pages, each page's part down to the lowest of their
+    /// fragments as counted there: boxes side by side that break at
+    /// different points make their line taller than it was unbroken, as the
+    /// line's part on each page is its tallest box's there.
+    fn line_growth(&self, items: &[usize]) -> f32 {
+        let pages: BTreeSet<u32> = items
+            .iter()
+            .flat_map(|&c| self.fragments[c].iter().map(|f| f.page_index))
+            .collect();
+        // Only a line whose boxes start on one page, side by side, grows
+        // so: one placed after another's end is the defect this measures.
+        let first_pages: BTreeSet<u32> = items
+            .iter()
+            .filter_map(|&c| self.fragments[c].first().map(|f| f.page_index))
+            .collect();
+        if pages.len() < 2 || first_pages.len() > 1 {
+            return 0.0;
+        }
+        let paged: f32 = pages
+            .iter()
+            .map(|&page| {
+                let on_page = || {
+                    items.iter().flat_map(move |&c| {
+                        self.fragments[c]
+                            .iter()
+                            .enumerate()
+                            .filter(move |(_, f)| f.page_index == page)
+                            .map(move |(k, f)| (c, k, f.y.to_f32()))
+                    })
+                };
+                let top = on_page().map(|(_, _, y)| y).fold(f32::INFINITY, f32::min);
+                let bottom = on_page()
+                    .map(|(c, k, _)| self.counted_bottom(c, k))
+                    .fold(top, f32::max);
+                bottom - top
             })
             .sum();
-        total - self.layout_height[b]
+        let layout = items
+            .iter()
+            .map(|&c| self.layout_height[c])
+            .fold(0.0_f32, f32::max);
+        (paged - layout).max(0.0)
+    }
+
+    /// Why `b`'s fragments add up past its height ([`Self::cause`]): a split
+    /// table cell's by no more than the top padding it repeats on each page
+    /// it continues on, for want of one edge model.
+    fn excess_cause(&self, b: usize) -> (&'static str, &'static str) {
+        let info = &self.case.boxes[b];
+        let continued = self.fragments[b].len().saturating_sub(1) as f32;
+        if info.repeated_edge > 0.0
+            && continued > 0.0
+            && self.container_excess(b) <= info.repeated_edge * continued + EPS
+        {
+            return (
+                fix::EDGE_MODEL,
+                "a split cell repeats its top padding on each page it continues on",
+            );
+        }
+        self.cause(b)
+    }
+
+    /// Where `b`'s fragment `k` ends as [`Self::container_excess`] counts
+    /// it: a container's fragment before its last that reaches the page
+    /// foot ends at the lowest of its children's fragments on its page,
+    /// each counted so in turn (css-break-3 §4). So does every fragment of
+    /// a split table cell or flex item, its last too, below its bottom
+    /// padding: one stretched to its line's height goes on to the line's
+    /// end below its own content, and a line that broke ends lower than its
+    /// layout when a box of it left a gap at a page foot. Every other
+    /// fragment ends at its bottom.
+    fn counted_bottom(&self, b: usize, k: usize) -> f32 {
+        let frags = &self.fragments[b];
+        let f = &frags[k];
+        let (top, bottom) = (f.y.to_f32(), f.y.to_f32() + f.height.to_f32());
+        let kind = self.case.boxes[b].kind;
+        let container = matches!(
+            kind,
+            Kind::Block | Kind::Table | Kind::BodyCell | Kind::Flex | Kind::Item
+        );
+        let in_line = frags.len() > 1 && matches!(kind, Kind::BodyCell | Kind::Item);
+        if !container || (!in_line && (k + 1 == frags.len() || bottom < self.page_height - EPS)) {
+            return bottom;
+        }
+        let content = enclosed(self.case, b)
+            .iter()
+            .flat_map(|&c| {
+                self.fragments[c]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cf)| cf.page_index == f.page_index)
+                    .map(move |(ck, _)| (c, ck))
+            })
+            .map(|(c, ck)| self.counted_bottom(c, ck).min(bottom))
+            .fold(top, f32::max);
+        if in_line && k + 1 == frags.len() {
+            (content + self.case.boxes[b].repeated_edge).min(bottom)
+        } else {
+            content
+        }
     }
 
     /// The part of the fragmenter expected to fix `b`'s fragments past the
@@ -798,7 +914,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
             Kind::Block | Kind::Table | Kind::BodyCell | Kind::Flex | Kind::Item
                 if placed.container_excess(b) > EPS * frags.len().max(1) as f32 =>
             {
-                let (note, why) = placed.cause(b);
+                let (note, why) = placed.excess_cause(b);
                 push(
                     Invariant::PlacedOnce,
                     b,
