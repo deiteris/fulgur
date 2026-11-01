@@ -579,18 +579,43 @@ impl Placed<'_> {
         let info = &self.case.boxes[b];
         let own = match info.kind {
             Kind::Flex => self.line_growth(&info.children),
-            Kind::Table => info
-                .children
-                .iter()
-                .filter(|&&row| !self.case.boxes[row].in_header)
-                .map(|&row| self.line_growth(&self.case.boxes[row].children))
-                .sum(),
+            Kind::Table => {
+                let (header, body): (Vec<usize>, Vec<usize>) = info
+                    .children
+                    .iter()
+                    .partition(|&&row| self.case.boxes[row].in_header);
+                body.iter()
+                    .map(|&row| self.line_growth(&self.case.boxes[row].children))
+                    .sum::<f32>()
+                    + self.repeated_band(&header)
+            }
             _ => 0.0,
         };
         own + enclosed(self.case, b)
             .iter()
             .map(|&c| self.growth(c))
             .sum::<f32>()
+    }
+
+    /// The height of the header rows `header` repeat on the pages after
+    /// their table's first: each page they repeat on carries their band.
+    fn repeated_band(&self, header: &[usize]) -> f32 {
+        header
+            .iter()
+            .map(|&row| {
+                let cells = &self.case.boxes[row].children;
+                let repeats = cells
+                    .iter()
+                    .map(|&c| self.fragments[c].len().saturating_sub(1))
+                    .max()
+                    .unwrap_or(0);
+                let height = cells
+                    .iter()
+                    .map(|&c| self.layout_height[c])
+                    .fold(0.0_f32, f32::max);
+                repeats as f32 * height
+            })
+            .sum()
     }
 
     /// How much taller than the tallest of its boxes' layouts the line of
