@@ -472,11 +472,13 @@ impl<'a> PaginationLayoutTree<'a> {
                 height: body_layout.size.height.as_px(),
             });
 
+        let breaks = BreakCache::default();
         let flow = Flow {
             doc: self.doc,
             column_styles: self.column_styles,
             used_page_names: self.used_page_names.as_ref(),
             running_store: self.running_store,
+            breaks: &breaks,
         };
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
         fragment_block_subtree_inner(
@@ -1020,6 +1022,18 @@ fn break_before_of(
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
+    BreakCache::get(&flow.breaks.before, node, page_height_px, || {
+        break_before_uncached(flow, node, page_height_px, depth)
+    })
+}
+
+/// [`break_before_of`], computed.
+fn break_before_uncached(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> BreakValue {
     let own = BreakValue::own_before(flow.column_styles.and_then(|styles| styles.get(&node.id)));
     if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
         return own;
@@ -1042,6 +1056,18 @@ fn break_before_of(
 /// The `break-after` of `node` as its parent's walk meets it: its last
 /// line's, which a container takes on, then its own.
 fn break_after_of(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> BreakValue {
+    BreakCache::get(&flow.breaks.after, node, page_height_px, || {
+        break_after_uncached(flow, node, page_height_px, depth)
+    })
+}
+
+/// [`break_after_of`], computed.
+fn break_after_uncached(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
     page_height_px: f32,
@@ -1148,6 +1174,18 @@ fn opportunities(
 /// opportunity lies inside an atomic box or an inline root
 /// ([`has_flow_children`]).
 fn forced_inside(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> bool {
+    BreakCache::get(&flow.breaks.forced, node, page_height_px, || {
+        forced_inside_uncached(flow, node, page_height_px, depth)
+    })
+}
+
+/// [`forced_inside`], computed.
+fn forced_inside_uncached(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
     page_height_px: f32,
@@ -2541,6 +2579,36 @@ struct Flow<'a> {
     column_styles: Option<&'a crate::column_css::ColumnStyleTable>,
     used_page_names: Option<&'a crate::blitz_adapter::UsedPageNameTable>,
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
+    breaks: &'a BreakCache,
+}
+
+/// The break values of the boxes a pass has asked about, by node and page
+/// height ([`break_before_of`], [`break_after_of`], [`forced_inside`]): each
+/// reads its box's lines, and every walk and every level asks again.
+#[derive(Default)]
+struct BreakCache {
+    before: std::cell::RefCell<BTreeMap<(usize, u32), BreakValue>>,
+    after: std::cell::RefCell<BTreeMap<(usize, u32), BreakValue>>,
+    forced: std::cell::RefCell<BTreeMap<(usize, u32), bool>>,
+}
+
+impl BreakCache {
+    /// The value `table` holds for `node` on pages `page_height_px` tall,
+    /// computed once by `compute`.
+    fn get<T: Copy>(
+        table: &std::cell::RefCell<BTreeMap<(usize, u32), T>>,
+        node: &blitz_dom::Node,
+        page_height_px: f32,
+        compute: impl FnOnce() -> T,
+    ) -> T {
+        let key = (node.id, page_height_px.to_bits());
+        if let Some(&value) = table.borrow().get(&key) {
+            return value;
+        }
+        let value = compute();
+        table.borrow_mut().insert(key, value);
+        value
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6772,6 +6840,7 @@ mod tests {
                 column_styles: None,
                 used_page_names: None,
                 running_store: None,
+                breaks: &BreakCache::default(),
             },
             parent_id,
             600.0,                // parent_w
@@ -6851,6 +6920,7 @@ mod tests {
                 column_styles: None,
                 used_page_names: None,
                 running_store: None,
+                breaks: &BreakCache::default(),
             },
             table_id,
             200.0,
