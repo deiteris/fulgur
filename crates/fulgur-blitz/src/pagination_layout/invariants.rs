@@ -744,6 +744,27 @@ struct Placed<'a> {
 }
 
 impl Placed<'_> {
+    /// Each table and page on which its header sits without a body row
+    /// ([`Invariant::HeaderAlone`]): no body cell holds content there, an
+    /// empty fragment of one being none.
+    fn alone_headers(&self) -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        for (table, header, body) in &self.case.tables {
+            let pages = |boxes: Vec<usize>| -> BTreeSet<u32> {
+                boxes
+                    .into_iter()
+                    .flat_map(|c| self.fragments[c].iter().map(|f| f.page_index))
+                    .collect()
+            };
+            let header_pages = pages(header.clone());
+            let body_pages = pages(body.iter().flat_map(|&c| enclosed(self.case, c)).collect());
+            for &page in header_pages.difference(&body_pages) {
+                out.push((*table, page));
+            }
+        }
+        out
+    }
+
     /// Each fragment of a line's item that ends past its line's end on its
     /// page ([`Invariant::EndsWithLine`]): the item, the page, and what broke.
     /// A fragment past the page foot is left to [`Invariant::PastFoot`].
@@ -1504,22 +1525,14 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
     }
 
     // No repeated header sits on a page without a body row.
-    for (table, header, body) in &case.tables {
-        let pages = |cells: &[usize]| -> BTreeSet<u32> {
-            cells
-                .iter()
-                .flat_map(|&c| placed.fragments[c].iter().map(|f| f.page_index))
-                .collect()
-        };
-        for &page in pages(header).difference(&pages(body)) {
-            push(
-                Invariant::HeaderAlone,
-                *table,
-                Some(page),
-                None,
-                format!("{}'s header is alone", case.boxes[*table].id),
-            );
-        }
+    for (table, page) in placed.alone_headers() {
+        push(
+            Invariant::HeaderAlone,
+            table,
+            Some(page),
+            None,
+            format!("{}'s header is alone", case.boxes[table].id),
+        );
     }
 
     // A line's item stretched to the line ends with it on each page.
@@ -2018,6 +2031,48 @@ fn a_repeated_header_band_carries_the_table_s_top_edge() {
     }
     .container_excess(0);
     assert!(excess.abs() < EPS, "{excess}");
+}
+
+/// A body row whose cells place nothing on a page is no body row there: a
+/// header beside its empty cell is alone. A 20 px header over a cell whose
+/// 60 px leaf is on the second of 100 px pages, the cell's empty fragment
+/// on the first.
+#[test]
+fn a_header_beside_an_empty_body_cell_is_alone() {
+    let case = Case::new(&[Gen::Table {
+        style: BoxStyle::default(),
+        head: Head::Plain,
+        caption: false,
+        counts: None,
+        row_counts: None,
+        cell_padding: 0,
+        rows: vec![(
+            false,
+            vec![Gen::Leaf {
+                style: BoxStyle::default(),
+                height: 60,
+            }],
+        )],
+        span: None,
+    }]);
+    // b0 the table, b1 the header row, b2 its cell, b3 the body row, b4
+    // its cell, b5 the leaf.
+    let mut fragments = vec![Vec::new(); case.boxes.len()];
+    fragments[0] = vec![fragment(0, 40.0, 60.0), fragment(1, 0.0, 80.0)];
+    fragments[2] = vec![fragment(0, 40.0, 20.0), fragment(1, 0.0, 20.0)];
+    fragments[4] = vec![fragment(0, 60.0, 40.0), fragment(1, 20.0, 60.0)];
+    fragments[5] = vec![fragment(1, 20.0, 60.0)];
+    let alone = Placed {
+        case: &case,
+        page_height: 100.0,
+        fragments,
+        line_boundaries: vec![Vec::new(); case.boxes.len()],
+        layout_height: vec![0.0; case.boxes.len()],
+        natural_height: vec![0.0; case.boxes.len()],
+        past: vec![BTreeSet::new(); case.boxes.len()],
+    }
+    .alone_headers();
+    assert_eq!(alone, [(0, 0)]);
 }
 
 /// A table's repeated header is counted once a page, however many times it

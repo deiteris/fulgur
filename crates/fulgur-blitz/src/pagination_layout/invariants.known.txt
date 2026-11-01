@@ -3,8 +3,9 @@
 # placed nowhere), then, where it was traced, its cause, written by
 # hand. Rewrite with FRAGMENT_INVARIANT_UPDATE=1, which keeps the note
 # of each line it keeps, and review every line.
-5 Encloses b7 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
-5 EndsWithLine b7 0  # table walker: a first row that places nothing in a captioned skip-first table leaves its cell's empty fragment on the page instead of moving the table
+5 Encloses b7 0  # table walker: a first row that places nothing, in a captioned skip-first table, does not move its table to the next page
+5 EndsWithLine b7 0  # table walker: a first row that places nothing, in a captioned skip-first table, does not move its table to the next page
+5 HeaderAlone b0 0  # table walker: a first row that places nothing, in a captioned skip-first table, does not move its table to the next page
 5 PlacedOnce b16 9 -17px  # edge model: the cell ends without its last child's bottom margin
 5 PlacedOnce b19 12 -3px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
 5 PlacedOnce b25 18 -9px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
@@ -84,6 +85,7 @@
 218 PlacedOnce b16 1 -22px  # line measure: the cell ends at its paragraph's lines, without the paragraph's padding and border
 232 PlacedOnce b9 0 -8px  # line measure: the cell ends at its paragraph's lines, without the paragraph's padding and border
 234 PlacedOnce b26 9 -36px  # line measure: the cell ends at its paragraph's lines, without the paragraph's padding and border or its own bottom padding
+242 HeaderAlone b5 7  # table walker: a last row's bottom padding runs 5 px onto a page, under a repeated header
 242 PlacedOnce b13 1 -11px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
 242 PlacedOnce b23 3 -8px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
 250 Encloses b16 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
