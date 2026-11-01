@@ -1970,6 +1970,13 @@ struct Leading {
     /// The box places content in the room it was asked for: the unit, or
     /// the whole box, fits it.
     places: bool,
+    /// Only `avoid` holds the unit together, or it is a childless box that
+    /// slices: at the top of a page, below a top edge, the walk breaks
+    /// inside it rather than move it on (css-break-3 §4.4): a box kept
+    /// whole is entered, a kept row co-splits its cells, a paragraph
+    /// relaxes its `orphans` and `widows`, and a childless box is sliced
+    /// from where it stands.
+    relaxes: bool,
 }
 
 impl Leading {
@@ -1978,6 +1985,15 @@ impl Leading {
         Self {
             extent,
             places: extent <= room,
+            relaxes: false,
+        }
+    }
+
+    /// The same unit, held together only by `avoid` ([`Self::relaxes`]).
+    fn relaxed(self) -> Self {
+        Self {
+            relaxes: true,
+            ..self
         }
     }
 
@@ -2042,6 +2058,7 @@ fn leading_of(
     let within = |inner: Leading, offset: f32| Leading {
         extent: offset + inner.extent,
         places: height <= room || inner.places,
+        relaxes: inner.relaxes,
     };
     match kind {
         // A kept box is measured through its structure only when a forced
@@ -2053,12 +2070,15 @@ fn leading_of(
             let kind = structure(flow, node);
             leading_of(flow, node, &kind, room, page_height_px, depth)
         }
-        BoxKind::Monolithic(_) => whole,
+        BoxKind::Monolithic(Whole::Kept) => whole.relaxed(),
+        BoxKind::Monolithic(Whole::Atomic) if slices_at_a_page_top(node) => whole.relaxed(),
+        BoxKind::Monolithic(Whole::Atomic) => whole,
         BoxKind::InlineRoot { lines, .. } if lines.len() <= 1 => whole,
         BoxKind::InlineRoot { lines, limits } => {
             let lead = inline_leading(lines, *limits, room);
             Leading {
                 places: lead.places || height <= room,
+                relaxes: true,
                 ..lead
             }
         }
@@ -2073,7 +2093,7 @@ fn leading_of(
                             kept_table_row_bottom(doc, column_styles, cell, page_height_px)
                         })
             {
-                return Leading::whole(bottom - top, room);
+                return Leading::whole(bottom - top, room).relaxed();
             }
             let lead = tracks
                 .iter()
@@ -2082,15 +2102,18 @@ fn leading_of(
                     let offset = track.final_layout.location.y - top;
                     let inner =
                         leading_extent(flow, track, room - offset, page_height_px, depth + 1);
-                    (offset + inner.extent, inner.places)
+                    (offset + inner.extent, inner.places, inner.relaxes)
                 })
-                .reduce(|(a, a_places), (b, b_places)| (a.min(b), a_places || b_places));
-            let Some((extent, places)) = lead else {
+                .reduce(|(a, a_places, a_relaxes), (b, b_places, b_relaxes)| {
+                    (a.min(b), a_places || b_places, a_relaxes && b_relaxes)
+                });
+            let Some((extent, places, relaxes)) = lead else {
                 return whole;
             };
             Leading {
                 extent,
                 places: places || (!row && height <= room),
+                relaxes,
             }
         }
         BoxKind::Table { table, .. } => {
@@ -2124,6 +2147,7 @@ fn leading_of(
                 return Leading {
                     extent: content_top,
                     places: height <= room || content_top <= room,
+                    relaxes: false,
                 };
             }
             let inner = leading_extent(
@@ -2153,10 +2177,7 @@ fn inline_leading(lines: &[(f32, f32)], limits: LineLimits, room: f32) -> Leadin
         .find(|&fit| split_point(fit, 0, lines.len(), limits).is_some())
         .unwrap_or(lines.len());
     let extent = lines[unit_lines - 1].1 - first_top;
-    Leading {
-        extent,
-        places: extent <= room,
-    }
+    Leading::whole(extent, room)
 }
 
 /// The leading unit of `table` ([`leading_extent`]): its top edge and its
@@ -2199,7 +2220,7 @@ fn table_leading(
         let inner = leading_extent(flow, row, room - band, rows_page, depth + 1);
         return Leading {
             extent: band + inner.extent,
-            places: inner.places,
+            ..inner
         };
     }
     let Some(row) = in_flow_children(doc, table)
@@ -2215,8 +2236,22 @@ fn table_leading(
     let inner = leading_extent(flow, row, room - top, page_height_px, depth + 1);
     Leading {
         extent: top + inner.extent,
-        places: inner.places,
+        ..inner
     }
+}
+
+/// Whether `node` is a childless box the walk slices from where it stands
+/// at the top of a page ([`Leading::relaxes`]): not replaced, as an image
+/// is, nor transformed, which paints as one shape.
+fn slices_at_a_page_top(node: &blitz_dom::Node) -> bool {
+    const REPLACED: [&str; 9] = [
+        "img", "svg", "canvas", "video", "iframe", "object", "embed", "input", "textarea",
+    ];
+    node.children.is_empty()
+        && !is_transformed(node)
+        && node
+            .element_data()
+            .is_some_and(|el| !REPLACED.contains(&el.name.local.as_ref()))
 }
 
 /// The row of the table cell `cell`, when its row group has no cell that
@@ -3595,7 +3630,7 @@ fn fragment_block_subtree_inner(
                 let lead =
                     leading_extent(flow, row, page_height_px - child_page_y, page_height_px, 0);
                 if cursor.at_page_top() {
-                    lead.moves_on(page_height_px)
+                    lead.moves_on(page_height_px) && !lead.relaxes
                 } else {
                     !lead.places
                 }
@@ -3835,8 +3870,17 @@ fn fragment_block_subtree_inner(
         // forced break or a page-name change below it, which are not the
         // unforced break `avoid` concerns itself with (fulgur-2s7p.5), and a
         // transformed box only when it is taller than a page.
-        let needs_recursion =
-            enter_for_kept_run || enters(flow, child, &kind, available_strip, page_height_px);
+        // At the top of a page, below a top edge, a box kept whole that does
+        // not fit the room left is entered: `avoid` is relaxed (css-break-3
+        // §4.4), and the box splits between its children, rather than move
+        // and leave the edge alone on the page.
+        let relaxes_kept = cursor.at_page_top()
+            && matches!(kind, BoxKind::Monolithic(Whole::Kept))
+            && !child.children.is_empty()
+            && child_page_y + extent(flow, child, depth + 1) > page_height_px;
+        let needs_recursion = enter_for_kept_run
+            || relaxes_kept
+            || enters(flow, child, &kind, available_strip, page_height_px);
         // A box entered after content in its container moves whole to the
         // next page first, and is entered there, when nothing of it places in
         // the rest of the page: its leading unit does not fit
@@ -3859,7 +3903,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if lead.moves_on(page_height_px) {
+            if lead.moves_on(page_height_px) && !(cursor.at_page_top() && lead.relaxes) {
                 cursor.close_parent_once(geometry, ParentHeight::Placed);
                 cursor.advance();
                 cursor.page_taffy_origin = this_top_in_parent;
@@ -4025,9 +4069,17 @@ fn fragment_block_subtree_inner(
         let child_extent =
             kept_row_bottom.map_or(child_h, |bottom| child_h.max(bottom - this_top_in_parent));
         let kept_row_moves = kept_row_bottom.is_some() && child_page_y > 0.0;
-        if (child_page_y > cursor.page_start_y
-            || (cursor.entered_below_content && cursor.page_index == page_in)
-            || kept_row_moves)
+        // A childless box at the top of a page that does not fit the room
+        // left below a top edge is sliced from where it stands instead
+        // (css-break-3 §4.4), in a table cell too.
+        let slices_at_top = cursor.at_page_top()
+            && child_page_y + child_h > page_height_px
+            && slices_at_a_page_top(child)
+            && slices_where_it_is(doc, child, true);
+        if !slices_at_top
+            && (child_page_y > cursor.page_start_y
+                || (cursor.entered_below_content && cursor.page_index == page_in)
+                || kept_row_moves)
             && (!cursor.at_page_top() || child_extent <= page_height_px + 1.0)
             && child_page_y + child_extent > page_height_px
         {
@@ -4083,10 +4135,11 @@ fn fragment_block_subtree_inner(
         // Nor is a box in a table cell or a flex or grid item, or one that
         // overflows an ancestor clipping it ([`slices_where_it_is`]), or a
         // first child entered below the page foot, which has no slice there.
-        if !is_transformed(child)
-            && child_h > page_height_px + 1.0
-            && child_page_y < page_height_px
-            && slices_where_it_is(doc, child)
+        if slices_at_top
+            || (!is_transformed(child)
+                && child_h > page_height_px + 1.0
+                && child_page_y < page_height_px
+                && slices_where_it_is(doc, child, false))
         {
             // The slices are placed from the child's own place on the page,
             // and the walk then goes on from the last one, as after an
@@ -5959,7 +6012,8 @@ fn is_monolithic_in_absolute_subtree(
     page_h_px: f32,
 ) -> bool {
     has_contain_size(node)
-        && !(node.final_layout.size.height > page_h_px + 1.0 && slices_where_it_is(doc, node))
+        && !(node.final_layout.size.height > page_h_px + 1.0
+            && slices_where_it_is(doc, node, false))
 }
 
 fn has_contain_size(node: &blitz_dom::Node) -> bool {
@@ -6044,8 +6098,11 @@ fn item_shares_its_row(
 /// ([`clips_overflow`]): what is past the clip paints nothing, so it takes
 /// no page. Rows and cells count up to the root of the absolute or fixed
 /// subtree the box is in, which may be the box itself; clips up to the body.
-fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
-    if displays(node, DisplayInside::TableCell) {
+/// `in_cells` lets a table cell hold the box: a box that relaxes `avoid` at
+/// the top of a page ([`slices_at_a_page_top`]) is sliced in one, as its
+/// row co-splits its cells there.
+fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node, in_cells: bool) -> bool {
+    if !in_cells && displays(node, DisplayInside::TableCell) {
         return false;
     }
     // The rows and cells are those of the flow the box is in, which ends at
@@ -6061,7 +6118,7 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
             .is_some_and(|el| el.name.local.as_ref() == "body");
         let layout = ancestor.final_layout;
         if (in_flow
-            && (displays(ancestor, DisplayInside::TableCell)
+            && ((!in_cells && displays(ancestor, DisplayInside::TableCell))
                 || (crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
                     && item_shares_its_row(doc, ancestor, below))))
             || (!is_body && clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
@@ -13212,24 +13269,26 @@ h2 { string-set: chapter-title content(text); }
         (doc, geometry)
     }
 
-    /// A box at the top of a page whose leading unit does not fit below a
-    /// padded top edge moves to the next page when it fits a whole page,
-    /// as it fits only there: a 95 px block kept whole below a 10 px top
-    /// padding (the strip cut), and one entered for its children (the move
-    /// before entering a box), each start the next page, the padding left
-    /// alone, rather than run past the foot. One taller than a page stays.
+    /// At the top of a page, below a padded top edge, a box whose leading
+    /// unit does not fit the room left breaks where it stands (css-break-3
+    /// §4.4 relaxes `avoid` when breaking elsewhere gains nothing): a 95 px
+    /// block kept whole below a 10 px top padding is sliced from y 10 and
+    /// continues on the next page, and so does one entered for its
+    /// children, whose kept first child is sliced there too; one taller
+    /// than a page also starts there. Each moved to the next page and left
+    /// the padding alone on its page.
     #[test]
-    fn a_box_below_a_padded_top_edge_at_the_page_top_moves_when_it_fits_a_page() {
+    fn a_box_below_a_padded_top_edge_at_the_page_top_breaks_where_it_stands() {
         let (doc, geometry) = after_a_forced_break(
             r#"<div style="padding-top: 10px"><div id="k" style="break-inside: avoid; height: 95px"></div></div>"#,
         );
-        assert_eq!(placements(&doc, &geometry, "k"), [(2, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0), (2, 0.0)]);
 
         let (doc, geometry) = after_a_forced_break(
             r#"<div style="padding-top: 10px"><div id="k"><div style="break-inside: avoid; height: 95px"></div><div id="n" style="height: 20px"></div></div></div>"#,
         );
-        assert_eq!(placements(&doc, &geometry, "k")[0], (2, 0.0));
-        assert_eq!(placements(&doc, &geometry, "n"), [(3, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0), (2, 0.0)]);
+        assert_eq!(placements(&doc, &geometry, "n"), [(2, 5.0)]);
 
         let (doc, geometry) = after_a_forced_break(
             r#"<div style="padding-top: 10px"><div id="k" style="height: 120px"></div></div>"#,
@@ -13238,22 +13297,34 @@ h2 { string-set: chapter-title content(text); }
     }
 
     /// A table row at the top of a page, below its table's top border,
-    /// moves to the next page when its unit fits a whole page and so fits
-    /// only there: one whose cell's first block does not fit below the
-    /// border (the row move), and one kept whole. A row whose cell's first
-    /// block is taller than a page stays.
+    /// whose cell's first block does not fit the room left breaks where it
+    /// stands (css-break-3 §4.4): the row (the row move) and a row kept
+    /// whole start below the border and continue on the next page, the
+    /// cell's 95 px block sliced at the foot; they moved to the next page
+    /// and left the border alone. A cell's block taller than a page is
+    /// sliced in the cell, where it ran past the foot.
     #[test]
-    fn a_first_row_below_its_tables_top_edge_at_the_page_top_moves_when_it_fits_a_page() {
+    fn a_first_row_below_its_tables_top_edge_at_the_page_top_breaks_where_it_stands() {
         for row in ["", " style=\"break-inside: avoid\""] {
             let (doc, geometry) = after_a_forced_break(&format!(
-                r#"<table style="border-top: 10px solid"><tr{row}><td id="c"><div style="height: 95px"></div></td></tr></table>"#
+                r#"<table style="border-top: 10px solid"><tr{row}><td id="c"><div id="k" style="height: 95px"></div></td></tr></table>"#
             ));
-            assert_eq!(placements(&doc, &geometry, "c"), [(2, 0.0)], "{row}");
+            assert_eq!(
+                placements(&doc, &geometry, "c"),
+                [(1, 10.0), (2, 0.0)],
+                "{row}"
+            );
+            assert_eq!(
+                placements(&doc, &geometry, "k"),
+                [(1, 10.0), (2, 0.0)],
+                "{row}"
+            );
         }
         let (doc, geometry) = after_a_forced_break(
-            r#"<table style="border-top: 10px solid"><tr><td id="c"><div style="height: 120px"></div></td></tr></table>"#,
+            r#"<table style="border-top: 10px solid"><tr><td id="c"><div id="k" style="height: 120px"></div></td></tr></table>"#,
         );
         assert_eq!(placements(&doc, &geometry, "c")[0], (1, 10.0));
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 10.0), (2, 0.0)]);
     }
 
     /// A gap between a box's content edge and its first child's margin edge
