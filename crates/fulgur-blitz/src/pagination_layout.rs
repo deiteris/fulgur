@@ -1116,33 +1116,7 @@ fn opportunities(
     page_height_px: f32,
     depth: usize,
 ) -> Vec<BreakValue> {
-    opportunities_and_forcing(
-        flow,
-        parent,
-        children,
-        suppress_page_names,
-        page_height_px,
-        depth,
-    )
-    .0
-}
-
-/// [`opportunities`], and whether the box before each forces its break: a
-/// forced `break-after` of the line before, or a change of used page name
-/// between the two. Such a break happens whether or not the page holds
-/// content, an empty box before it included (css-break-3 §3.1, CSS Page 3
-/// §5.3); a forced `break-before` alone makes no page that would hold
-/// nothing. A box `display: none` takes no part: it is no flow child.
-fn opportunities_and_forcing(
-    flow: Flow<'_>,
-    parent: &blitz_dom::Node,
-    children: &[usize],
-    suppress_page_names: bool,
-    page_height_px: f32,
-    depth: usize,
-) -> (Vec<BreakValue>, Vec<bool>) {
     let mut values = vec![BreakValue::Auto; children.len()];
-    let mut forcing = vec![false; children.len()];
     let mut previous_after: Option<BreakValue> = None;
     let mut previous_page: Option<Option<String>> = None;
     for line in flow_lines(flow, parent, children) {
@@ -1158,7 +1132,6 @@ fn opportunities_and_forcing(
                 ))
             })
             .unwrap_or_default();
-        forcing[line[0]] = previous_after.is_some_and(BreakValue::is_forced);
         for &index in &line {
             let id = children[index];
             if flow
@@ -1177,7 +1150,6 @@ fn opportunities_and_forcing(
                 && previous_page.as_ref().is_some_and(|page| *page != start)
             {
                 value = value.then(BreakValue::Forced(None));
-                forcing[line[0]] = true;
             }
             previous_page = Some(end);
         }
@@ -1191,7 +1163,7 @@ fn opportunities_and_forcing(
             depth,
         ));
     }
-    (values, forcing)
+    values
 }
 
 /// Whether a forced break opportunity lies inside `node`, between two of the
@@ -1433,6 +1405,23 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
         current = child;
     }
     positive + negative
+}
+
+/// Whether `node`, which the layout gives no height, holds a line all the
+/// same: text of only white space that CSS does not collapse, such as
+/// no-break spaces (only spaces, tabs, and line breaks collapse). Blitz lays
+/// such a line out with no height, so the walk counts it as the content of
+/// its page, as a browser's line box would be: the forced breaks around it
+/// are taken ([`PageCursor::at_page_top`]).
+fn holds_a_dropped_line(node: &blitz_dom::Node) -> bool {
+    node.element_data()
+        .is_some_and(|el| el.inline_layout_data.is_some())
+        && {
+            let text = node.text_content();
+            !text.is_empty()
+                && text.chars().all(char::is_whitespace)
+                && text.chars().any(|c| !c.is_ascii_whitespace())
+        }
 }
 
 /// The height `node` takes on the page it starts on, which every fit the
@@ -3395,12 +3384,8 @@ fn fragment_block_subtree_inner(
         .unwrap_or_else(|| walk_children_of(parent));
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
-    // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3);
-    // and whether the box before it forces the break (`after_forces`), by its
-    // `break-after` or a page name: those break whether or not the page holds
-    // content; a forced `break-before` alone makes no page that would hold
-    // nothing.
-    let (opportunities, after_forces) = opportunities_and_forcing(
+    // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
+    let opportunities = opportunities(
         flow,
         parent,
         &walk_children,
@@ -3593,7 +3578,7 @@ fn fragment_block_subtree_inner(
             // after Blitz's intrinsic-size collapse, and its
             // `break-before: page` still takes effect
             // (`tests/pseudo_only_break_before.rs`).
-            if opportunity.is_forced() && (after_forces[index] || !cursor.at_page_top()) {
+            if opportunity.is_forced() && !cursor.at_page_top() {
                 cursor.close_parent(geometry, ParentHeight::Placed);
                 cursor.break_to(doc, opportunity.side());
                 // Zero-height break-before: this child IS the first
@@ -3618,6 +3603,11 @@ fn fragment_block_subtree_inner(
                         width: child_w.as_px(),
                         height: 0.0_f32.as_px(),
                     });
+            }
+            // A line of only no-break spaces is content, which CSS lays out as
+            // a line box and the layout gives no height ([`holds_a_dropped_line`]).
+            if holds_a_dropped_line(child) {
+                cursor.page_has_content = true;
             }
             continue;
         }
@@ -3646,12 +3636,11 @@ fn fragment_block_subtree_inner(
             cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin);
 
         // A forced break before the child, when content precedes it on the
-        // page or the box before it forces it (`after_forces`): the parent's
-        // fragment ends at the last content, the gap above the child not
-        // included. A `break-before` with nothing placed on the page yet,
-        // here or above, makes no empty page: a side break only moves on to
-        // its side.
-        if opportunity.is_forced() && (after_forces[index] || !cursor.at_page_top()) {
+        // page: the parent's fragment ends at the last content, the gap above
+        // the child not included. With nothing placed on the page yet, here
+        // or above, a break makes no empty page: a side break only moves on
+        // to its side.
+        if opportunity.is_forced() && !cursor.at_page_top() {
             cursor.close_parent(geometry, ParentHeight::Placed);
             cursor.break_to(doc, opportunity.side());
             // The breaking child is the first in-flow child on the new page
@@ -11862,16 +11851,26 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
-    /// A `break-after` forces a break after an empty box too, with nothing
-    /// placed on the page: two empty blocks that each break after themselves
-    /// make two pages (WPT `css-break/overflowed-abs-pos-with-percentage-height-print`,
-    /// whose reference is such blocks, empty as laid out). A `break-before`
-    /// alone after an empty box at the page top makes no page. The breaks
-    /// were dropped while the page held no content: one page.
+    /// A forced break is taken only where content precedes it on the page
+    /// (css-break-3 §3.1 and css-page-3 §5 leave a break at the start of a
+    /// page that holds nothing without effect, and the WPT references let such
+    /// breaks coalesce): a `break-after`, a `break-before`, and a change of
+    /// page name alike. A box with no height is no content: two empty blocks
+    /// that break after themselves make one page; an empty box of its own page
+    /// name between two others breaks before itself, after the box of content,
+    /// and not after itself (WPT `css-page/page-name-display-none-child`); and
+    /// boxes of zero height with their own page names, between two boxes of
+    /// content, share the second's page (WPT `css-page/page-name-zero-height-001`:
+    /// three pages). A line of only no-break spaces is content
+    /// ([`holds_a_dropped_line`]): two such blocks breaking after themselves
+    /// make two pages (WPT `css-break/overflowed-abs-pos-with-percentage-height`'s
+    /// reference).
     #[test]
-    fn a_break_after_an_empty_box_breaks_with_nothing_on_the_page() {
+    fn a_forced_break_with_nothing_on_the_page_is_not_taken() {
         let pages = |body: &str| {
-            let html = format!(r#"<html><body style="margin: 0; padding: 0">{body}</body></html>"#);
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0; line-height: 20px">{body}</body></html>"#
+            );
             let mut doc = parse(&html, 600.0);
             let table = blitz_adapter::extract_column_style_table(&doc, &[]);
             let geom =
@@ -11880,37 +11879,29 @@ h2 { string-set: chapter-title content(text); }
         };
         assert_eq!(
             pages(r#"<div style="break-after: page"></div><div style="break-after: page"></div>"#),
-            2
+            1,
+            "two empty breaking blocks"
         );
-        assert_eq!(
-            pages(r#"<div></div><div style="break-before: page"></div>"#),
-            1
-        );
-    }
-
-    /// A change of used page name forces a break between two siblings
-    /// whether or not the page holds content, as a `break-after` does: an
-    /// empty box of its own page name between two others makes a page of its
-    /// own, and a `display: none` child is no box, so it leaves it empty (WPT
-    /// `css-page/page-name-display-none-child-print`, three pages as its
-    /// reference's two empty breaking blocks make). With the break after an
-    /// empty box forced by `break-after` only, the page-name break before
-    /// the last box waited for content: two pages.
-    #[test]
-    fn a_page_name_change_after_an_empty_box_breaks_with_nothing_on_the_page() {
-        let pages = |body: &str| {
-            let html = format!(r#"<html><body style="margin: 0; padding: 0">{body}</body></html>"#);
-            let mut doc = parse(&html, 600.0);
-            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
-            let geom =
-                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
-            super::implied_page_count(&geom)
-        };
         assert_eq!(
             pages(
                 r#"<div style="page: a; height: 20px"></div><div style="page: c"><div style="display: none">c</div></div><div style="page: b; height: 20px"></div>"#
             ),
-            3
+            2,
+            "an empty box between two page names"
+        );
+        assert_eq!(
+            pages(
+                r#"<div style="page: a">a</div><div style="page: b; height: 0">b</div><div style="page: c; height: 0">c</div><div style="page: e">e</div><div style="page: f">f</div>"#
+            ),
+            3,
+            "zero-height boxes of their own page names"
+        );
+        assert_eq!(
+            pages(
+                r#"<div style="break-after: page">&nbsp;</div><div style="break-after: page">&nbsp;</div>"#
+            ),
+            2,
+            "lines of no-break spaces"
         );
     }
 
