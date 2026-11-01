@@ -909,6 +909,12 @@ fn leaves_the_flow(child: &blitz_dom::Node) -> bool {
             .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed))
 }
 
+/// Whether `child` takes no room in its parent's block flow: it leaves the
+/// flow ([`leaves_the_flow`]), or it floats.
+fn out_of_flow(child: &blitz_dom::Node) -> bool {
+    leaves_the_flow(child) || crate::blitz_adapter::node_is_floating(child)
+}
+
 /// Whether `child` is a `position: running()` element, which takes no room
 /// in the flow: it is placed in a page margin box.
 fn is_running(flow: Flow<'_>, child: &blitz_dom::Node) -> bool {
@@ -1495,9 +1501,7 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
             let Some(child) = doc.get_node(id) else {
                 continue;
             };
-            if crate::blitz_adapter::is_whitespace_only_text_node(child)
-                || crate::blitz_adapter::is_out_of_flow_node(child)
-            {
+            if out_of_flow(child) {
                 continue;
             }
             if child.element_data().is_none() || child.unrounded_layout.location.y > edge + 0.01 {
@@ -1590,8 +1594,7 @@ fn skipped_header_row_below(
         return false;
     };
     node.children.iter().any(|&child_id| {
-        !doc.get_node(child_id)
-            .is_some_and(crate::blitz_adapter::is_out_of_flow_node)
+        !doc.get_node(child_id).is_some_and(out_of_flow)
             && (column_styles
                 .and_then(|styles| styles.get(&child_id))
                 .is_some_and(|props| {
@@ -2489,19 +2492,17 @@ fn is_transformed(node: &blitz_dom::Node) -> bool {
         .is_some_and(|s| !s.get_box().transform.0.is_empty())
 }
 
-/// The children of `node` that stay in the flow ([`leaves_the_flow`]) with
-/// height that are not floats, in layout order: the boxes that lead it
+/// The children of `node` in its block flow ([`out_of_flow`]) with
+/// height, in layout order: the boxes that lead it
 /// ([`leading_of`]) and form its first line ([`structure`]). A running
 /// element the layout gives a height is one of them.
 fn in_flow_children(flow: Flow<'_>, node: &blitz_dom::Node) -> Vec<usize> {
     walk_children_of(node)
         .into_iter()
         .filter(|&id| {
-            flow.doc.get_node(id).is_some_and(|child| {
-                !leaves_the_flow(child)
-                    && !crate::blitz_adapter::node_is_floating(child)
-                    && child.final_layout.size.height > 0.0
-            })
+            flow.doc
+                .get_node(id)
+                .is_some_and(|child| !out_of_flow(child) && child.final_layout.size.height > 0.0)
         })
         .collect()
 }
@@ -6866,10 +6867,7 @@ fn item_shares_its_row(
         .iter()
         .filter(|&&id| id != item.id)
         .filter_map(|&id| doc.get_node(id))
-        .filter(|sibling| {
-            !crate::blitz_adapter::is_whitespace_only_text_node(sibling)
-                && !crate::blitz_adapter::is_out_of_flow_node(sibling)
-        })
+        .filter(|sibling| !out_of_flow(sibling))
         .any(|sibling| {
             let layout = sibling.final_layout;
             layout.location.y < bottom - 0.5 && layout.location.y + layout.size.height > top + 0.5
