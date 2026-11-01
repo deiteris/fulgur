@@ -502,6 +502,25 @@ impl<'a> PaginationLayoutTree<'a> {
     }
 }
 
+/// How far past the page foot a box may reach and still fit the page. Stylo
+/// and Taffy round some lengths to whole CSS pixels (a 220pt spacer, 293.33
+/// px, lays out 294 px tall), while the page height is not rounded, so a box
+/// sized to fill a page measures up to a pixel taller than it.
+const FIT_SLACK_PX: f32 = 1.0;
+
+/// Whether `extent` px fit a page strip `page_height_px` tall, within
+/// [`FIT_SLACK_PX`]: the fits the walk measures against a page.
+fn fits(extent: f32, page_height_px: f32) -> bool {
+    extent <= page_height_px + FIT_SLACK_PX
+}
+
+/// Whether `extent` px run past a page strip `page_height_px` tall by more
+/// than [`FIT_SLACK_PX`]: not [`fits`], but for an extent that is no
+/// number, which neither fits nor overflows.
+fn overflows(extent: f32, page_height_px: f32) -> bool {
+    extent > page_height_px + FIT_SLACK_PX
+}
+
 /// The page that content after a forced break starts on, given the page
 /// `page_index` the break reached: one page further when the break asks for
 /// a side (`left`, `right`, `recto`, `verso`) that `page_index` is not (CSS
@@ -914,7 +933,7 @@ fn walk_children_of(node: &blitz_dom::Node) -> Vec<usize> {
 /// (it paints as one shape, CSS Transforms §6.1), an atomic inline, or a box
 /// in an orthogonal flow (CSS Writing Modes 4 §9).
 fn is_atomic(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px: f32) -> bool {
-    let fits_page = node.final_layout.size.height <= page_height_px + 1.0;
+    let fits_page = fits(node.final_layout.size.height, page_height_px);
     let orthogonal = node
         .parent
         .and_then(|id| doc.get_node(id))
@@ -1806,7 +1825,7 @@ fn line_moves_on(
                 BoxKind::Monolithic(Whole::Atomic)
             ) && !slices_at_a_page_top(item)
                 && offset + height > room
-                && offset + height <= page_height_px + 1.0
+                && fits(offset + height, page_height_px)
         });
     monolithic_overflow || (lead.moves_on(page_height_px) && !(at_page_top && lead.relaxes))
 }
@@ -2323,7 +2342,7 @@ fn kept_table_row_bottom(
             (layout.location.y, layout.location.y + layout.size.height)
         })
         .reduce(|(top, bottom), (y, end)| (top.min(y), bottom.max(end)))?;
-    (bottom - top <= page_height_px + 1.0).then_some(bottom)
+    fits(bottom - top, page_height_px).then_some(bottom)
 }
 
 /// What a box is to the fragmenter: whether the walk places it whole,
@@ -2387,7 +2406,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    if (avoid && extent(flow, node, 0) <= page_height_px + 1.0)
+    if (avoid && fits(extent(flow, node, 0), page_height_px))
         || kept_table_row_bottom(flow, node, page_height_px).is_some()
     {
         return BoxKind::Monolithic(Whole::Kept);
@@ -2536,7 +2555,7 @@ impl Leading {
     /// an empty page of `page_height_px`. A unit taller than a page has to
     /// start somewhere, and moving it would leave a blank page behind.
     fn moves_on(&self, page_height_px: f32) -> bool {
-        !self.places && self.extent <= page_height_px + 1.0
+        !self.places && fits(self.extent, page_height_px)
     }
 }
 
@@ -3398,7 +3417,7 @@ fn widows_row(
         .map(|cell| cell.final_layout.location.y)
         .fold(f32::INFINITY, f32::min);
     let bottom = line_bottom(&boxes(lines.last()?));
-    (bottom - top <= page_height_px - band + 1.0).then(|| cells[lines[from][0]])
+    fits(bottom - top, page_height_px - band).then(|| cells[lines[from][0]])
 }
 
 /// [`fragment_block_subtree`] of a box whose rows need no second walk.
@@ -4425,7 +4444,7 @@ fn fragment_block_subtree_inner(
                 && after_content
                 && !cursor.at_page_top()
                 && line_y + height + kept > page_height_px
-                && height + kept <= page_height_px + 1.0;
+                && fits(height + kept, page_height_px);
             if run_moves
                 || line_moves_on(
                     flow,
@@ -4524,12 +4543,12 @@ fn fragment_block_subtree_inner(
                         let below = (child_h - lines[lines.len() - 1].1).max(0.0) + kept;
                         let first = lines.len().saturating_sub(limits.widows.max(1));
                         let trailing = lines[lines.len() - 1].1 - lines[first].0;
-                        if trailing + below <= page_height_px + 1.0 {
+                        if fits(trailing + below, page_height_px) {
                             inline_kept_after = below;
                         }
                     }
                     BoxKind::Monolithic(_) | BoxKind::InlineRoot { .. } => {
-                        if !cursor.at_page_top() && run <= page_height_px + 1.0 {
+                        if !cursor.at_page_top() && fits(run, page_height_px) {
                             cursor.move_before(geometry, this_top_in_parent, false);
                             child_page_y = 0.0;
                         }
@@ -4669,7 +4688,10 @@ fn fragment_block_subtree_inner(
         let relaxes_kept = cursor.at_page_top()
             && matches!(kind, BoxKind::Monolithic(Whole::Kept))
             && !child.children.is_empty()
-            && child_page_y + extent(flow, child, depth + 1) > page_height_px + 1.0;
+            && overflows(
+                child_page_y + extent(flow, child, depth + 1),
+                page_height_px,
+            );
         let needs_recursion = enter_for_kept_run
             || relaxes_kept
             || enters(flow, child, &kind, available_strip, page_height_px);
@@ -4841,7 +4863,7 @@ fn fragment_block_subtree_inner(
         // left below a top edge is sliced from where it stands instead
         // (css-break-3 §4.4), in a table cell too.
         let slices_at_top = cursor.at_page_top()
-            && child_page_y + child_h > page_height_px + 1.0
+            && overflows(child_page_y + child_h, page_height_px)
             && slices_at_a_page_top(child)
             && slices_where_it_is(doc, child, true);
         // A box of a line placed whole that crosses the page foot, neither
@@ -4850,7 +4872,7 @@ fn fragment_block_subtree_inner(
         // stretched to the line's height also reaches the line's end when
         // the line closes ([`stretch_line_items`]).
         let slices_in_line = in_line
-            && child_page_y + child_h > page_height_px + 1.0
+            && overflows(child_page_y + child_h, page_height_px)
             && child_page_y < page_height_px
             && !is_transformed(child)
             && !is_replaced(child)
@@ -4858,7 +4880,7 @@ fn fragment_block_subtree_inner(
         if !in_line
             && !slices_at_top
             && cursor.break_point_before(child_page_y)
-            && (!cursor.at_page_top() || child_h <= page_height_px + 1.0)
+            && (!cursor.at_page_top() || fits(child_h, page_height_px))
             && child_page_y + child_h > page_height_px
         {
             // Forced to a fresh page: the current child lands at its top,
@@ -4883,17 +4905,12 @@ fn fragment_block_subtree_inner(
         // exact mid-element pagination of nested content is still
         // future work (see `record_subtree_descendants` notes).
         //
-        // Tolerance: Stylo / Taffy round CSS-resolved `<length>`
-        // values to integer CSS pixels in some cases — a 220pt
-        // spacer (= 293.333… px) is reported back as `child_h =
-        // 294` while `page_height_px` is computed without that
-        // round-trip (= 293.33334). The literal `>` then trips
-        // by ~0.67 px and the spacer is wrongly sliced into two
-        // pages (gcpm_snapshot tests regress: spacer + page-break
-        // pair becomes 2 + 1 instead of 1 + 1 per section). One
-        // CSS pixel of slack absorbs the quantization without
-        // letting truly oversized content (`300vh ≈ 880 px on a
-        // 293-px strip`) slip through.
+        // Tolerance ([`fits`]): without the slack a 220pt spacer that
+        // lays out 294 px tall on a 293.33 px strip is sliced into two
+        // pages (gcpm_snapshot tests regress: spacer + page-break pair
+        // becomes 2 + 1 instead of 1 + 1 per section), while truly
+        // oversized content (`300vh ≈ 880 px on a 293-px strip`) is
+        // still sliced.
         //
         // Atomic children opt out: a transformed subtree paints
         // as a single atomic box (CSS Transforms §6.1) — it must
@@ -4910,7 +4927,7 @@ fn fragment_block_subtree_inner(
         if slices_at_top
             || slices_in_line
             || (!is_transformed(child)
-                && child_h > page_height_px + 1.0
+                && overflows(child_h, page_height_px)
                 && child_page_y < page_height_px
                 && slices_where_it_is(doc, child, true))
         {
@@ -6795,7 +6812,7 @@ fn is_monolithic_in_absolute_subtree(
     page_h_px: f32,
 ) -> bool {
     has_contain_size(node)
-        && !(node.final_layout.size.height > page_h_px + 1.0
+        && !(overflows(node.final_layout.size.height, page_h_px)
             && slices_where_it_is(doc, node, false))
 }
 
