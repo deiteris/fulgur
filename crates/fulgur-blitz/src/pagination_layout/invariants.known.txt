@@ -50,9 +50,8 @@
 30 PlacedOnce b11 4  # table walker
 33 PastFoot b1 0  # rows side by side
 33 PlacedOnce b0 0  # rows side by side
-34 PastFoot b17 4  # table walker
-34 PastFoot b18 4  # table walker
-34 PastFoot b3 4  # table walker
+34 PastFoot b17 5  # table walker
+34 PastFoot b3 5  # table walker
 34 PlacedOnce b3 2  # table walker
 38 PastFoot b0 0  # rows side by side
 38 PastFoot b1 0  # rows side by side
@@ -63,9 +62,6 @@
 40 PlacedOnce b8 0  # edge model
 43 PastFoot b0 0  # table walker
 43 PastFoot b0 2  # table walker
-43 PastFoot b0 4  # table walker
-43 PastFoot b14 4  # table walker
-43 PastFoot b15 4  # table walker
 43 PastFoot b2 0  # table walker
 43 PastFoot b4 0  # table walker
 43 PastFoot b5 0  # table walker
@@ -73,14 +69,14 @@
 43 PlacedOnce b0 0  # table walker
 43 PlacedOnce b12 3  # table walker
 43 PlacedOnce b7 1  # table walker
-44 PastFoot b11 12  # table walker
-44 PastFoot b15 12  # table walker
-44 PastFoot b16 12  # table walker
+44 PastFoot b11 13  # table walker
+44 PastFoot b15 13  # table walker
+44 PastFoot b16 13  # table walker
 44 PastFoot b4 0  # rows side by side
 44 PlacedOnce b0 0  # rows side by side
 44 PlacedOnce b1 0  # rows side by side
 44 PlacedOnce b11 11  # table walker
-44 PlacedOnce b22 16  # rows side by side
+44 PlacedOnce b22 17  # rows side by side
 46 PastFoot b1 0  # rows side by side
 46 PlacedOnce b0 0  # rows side by side
 47 PlacedOnce b3 1  # page cursor
@@ -101,11 +97,9 @@
 54 PlacedOnce b7 3  # page cursor
 57 PlacedOnce b11 1  # table walker
 57 PlacedOnce b5 1  # table walker
-58 PastFoot b0 2  # table walker
-58 PastFoot b9 2  # table walker
 58 PlacedOnce b0 0  # table walker
-58 PlacedOnce b14 3  # table walker
-58 PlacedOnce b19 5  # table walker
+58 PlacedOnce b14 4  # table walker
+58 PlacedOnce b19 6  # table walker
 60 PastFoot b0 0  # table walker
 60 PastFoot b0 4  # table walker
 60 PastFoot b11 4  # table walker
@@ -131,9 +125,8 @@
 78 PlacedOnce b2 1  # rows side by side
 78 PlacedOnce b5 1  # rows side by side
 78 PlacedOnce b6 1  # rows side by side
-79 PastFoot b18 5  # table walker
-79 PastFoot b19 5  # table walker
-79 PastFoot b4 5  # table walker
+79 PastFoot b18 6  # table walker
+79 PastFoot b4 6  # table walker
 79 PlacedOnce b4 3  # table walker
 83 PastFoot b1 0  # rows side by side
 83 PlacedOnce b0 0  # rows side by side
@@ -166,9 +159,6 @@
 100 PlacedOnce b0 0  # page cursor
 101 PastFoot b13 5  # rows side by side
 101 PlacedOnce b8 5  # rows side by side
-102 PastFoot b0 6  # table walker
-102 PastFoot b20 6  # table walker
-102 PastFoot b21 6  # table walker
 102 PlacedOnce b0 0  # table walker
 106 PlacedOnce b3 2  # edge model
 107 PastFoot b11 1  # table walker
@@ -182,11 +172,8 @@
 110 PlacedOnce b1 1  # page cursor
 114 PlacedOnce b10 1  # table walker
 116 PlacedOnce b1 1  # table walker
-118 PastFoot b0 2  # table walker
-118 PastFoot b18 2  # table walker
-118 PastFoot b19 2  # table walker
-118 PastFoot b20 2  # table walker
-118 PastFoot b21 2  # table walker
+118 PastFoot b0 3  # table walker
+118 PastFoot b18 3  # table walker
 118 PlacedOnce b0 0  # table walker
 119 Encloses b9 0  # table walker
 119 PlacedOnce b5 0  # page cursor
@@ -246,13 +233,10 @@
 180 PlacedOnce b4 3  # table walker
 180 PlacedOnce b5 3  # table walker
 182 PastFoot b0 0  # page cursor
-182 PastFoot b0 1  # page cursor
 182 PastFoot b4 0  # table walker
 182 PastFoot b5 0  # table walker
-182 PastFoot b7 1  # table walker
-182 PastFoot b8 1  # table walker
 182 PlacedOnce b0 0  # page cursor
-182 PlacedOnce b16 3  # table walker
+182 PlacedOnce b16 4  # table walker
 183 PlacedOnce b14 1  # rows side by side
 184 PastFoot b13 5  # table walker
 184 PastFoot b14 5  # table walker
@@ -288,11 +272,11 @@
 201 PlacedOnce b0 0  # page cursor
 201 PlacedOnce b12 2  # table walker
 202 PastFoot b10 7  # rows side by side
-202 PastFoot b12 7  # table walker
+202 PastFoot b12 8  # table walker
 202 PastFoot b14 3  # table walker
 202 PastFoot b15 3  # table walker
-202 PastFoot b21 7  # table walker
-202 PastFoot b24 8  # table walker
+202 PastFoot b21 8  # table walker
+202 PastFoot b24 9  # table walker
 202 PastFoot b5 7  # rows side by side
 202 PastFoot b6 3  # rows side by side
 202 PastFoot b6 7  # rows side by side
@@ -315,7 +299,6 @@
 232 PlacedOnce b0 0  # rows side by side
 232 PlacedOnce b10 3  # edge model
 233 PastFoot b1 0  # edge model
-237 PastFoot b4 1  # table walker
 237 PlacedOnce b0 0  # table walker
 238 PastFoot b5 4  # rows side by side
 238 PastFoot b6 4  # rows side by side
