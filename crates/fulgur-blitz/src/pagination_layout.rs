@@ -953,13 +953,17 @@ fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px:
                 .is_none_or(|el| el.inline_layout_data.is_none()))
 }
 
-/// The flow children of a walk over `children` ([`is_flow_child`]), as
-/// indices into `children`, in lines: a child that starts beside the first
-/// box of the line before it, and above its bottom, sits in that line, as
-/// the items of a flex row, a grid row, or the cells of a table row do. No
-/// class A opportunity lies between the boxes of a line (css-break-3 §4.1);
-/// each line takes on its boxes' `break-before` and `break-after`.
-fn flow_lines(flow: Flow<'_>, children: &[usize]) -> Vec<Vec<usize>> {
+/// The flow children of a walk over `children` of `parent`
+/// ([`is_flow_child`]), as indices into `children`, in lines, as the walk
+/// groups them: in a flex or grid container a child that starts above the
+/// bottom of the line before it sits in that line, whatever its alignment
+/// (the rows of [`RowState`]); elsewhere one must also start beside the
+/// line's first box, as a table row's cells do and a float and the block
+/// after it do not. No class A opportunity lies between the boxes of a line
+/// (css-break-3 §4.1); each line takes on its boxes' `break-before` and
+/// `break-after`.
+fn flow_lines(flow: Flow<'_>, parent: &blitz_dom::Node, children: &[usize]) -> Vec<Vec<usize>> {
+    let by_extent = crate::blitz_adapter::is_flex_or_grid_container_node(parent);
     let mut lines: Vec<Vec<usize>> = Vec::new();
     let mut line_box = (0.0_f32, 0.0_f32);
     for (index, &id) in children.iter().enumerate() {
@@ -972,7 +976,7 @@ fn flow_lines(flow: Flow<'_>, children: &[usize]) -> Vec<Vec<usize>> {
         let layout = child.final_layout;
         let (top, bottom) = (layout.location.y, layout.location.y + layout.size.height);
         match lines.last_mut() {
-            Some(line) if top < line_box.1 - 0.5 && top <= line_box.0 + 0.5 => {
+            Some(line) if top < line_box.1 - 0.5 && (by_extent || top <= line_box.0 + 0.5) => {
                 line.push(index);
                 line_box.1 = line_box.1.max(bottom);
             }
@@ -1021,16 +1025,18 @@ fn break_before_of(
         return own;
     }
     let children = walk_children_of(node);
-    flow_lines(flow, &children).first().map_or(own, |line| {
-        own.then(line_break(
-            flow,
-            &children,
-            line,
-            false,
-            page_height_px,
-            depth + 1,
-        ))
-    })
+    flow_lines(flow, node, &children)
+        .first()
+        .map_or(own, |line| {
+            own.then(line_break(
+                flow,
+                &children,
+                line,
+                false,
+                page_height_px,
+                depth + 1,
+            ))
+        })
 }
 
 /// The `break-after` of `node` as its parent's walk meets it: its last
@@ -1046,9 +1052,11 @@ fn break_after_of(
         return own;
     }
     let children = walk_children_of(node);
-    flow_lines(flow, &children).last().map_or(own, |line| {
-        line_break(flow, &children, line, true, page_height_px, depth + 1).then(own)
-    })
+    flow_lines(flow, node, &children)
+        .last()
+        .map_or(own, |line| {
+            line_break(flow, &children, line, true, page_height_px, depth + 1).then(own)
+        })
 }
 
 /// Whether the walk compares no used page names between the children of
@@ -1076,6 +1084,7 @@ fn page_names_suppressed(doc: &BaseDocument, parent: &blitz_dom::Node) -> bool {
 /// walk applies them. Every other slot holds `Auto`.
 fn opportunities(
     flow: Flow<'_>,
+    parent: &blitz_dom::Node,
     children: &[usize],
     suppress_page_names: bool,
     page_height_px: f32,
@@ -1084,7 +1093,7 @@ fn opportunities(
     let mut values = vec![BreakValue::Auto; children.len()];
     let mut previous_after: Option<BreakValue> = None;
     let mut previous_page: Option<Option<String>> = None;
-    for line in flow_lines(flow, children) {
+    for line in flow_lines(flow, parent, children) {
         let mut value = previous_after
             .map(|after| {
                 after.then(line_break(
@@ -1149,7 +1158,7 @@ fn forced_inside(
     }
     let children = walk_children_of(node);
     let suppress = page_names_suppressed(flow.doc, node);
-    opportunities(flow, &children, suppress, page_height_px, depth + 1)
+    opportunities(flow, node, &children, suppress, page_height_px, depth + 1)
         .into_iter()
         .any(BreakValue::is_forced)
         || children
@@ -1258,7 +1267,7 @@ fn kept_after_box(
         return 0.0;
     }
     let children = walk_children_of(parent);
-    let lines = flow_lines(flow, &children);
+    let lines = flow_lines(flow, parent, &children);
     let Some(line) = lines
         .iter()
         .position(|line| line.iter().any(|&index| children[index] == node.id))
@@ -1267,6 +1276,7 @@ fn kept_after_box(
     };
     let values = opportunities(
         flow,
+        parent,
         &children,
         page_names_suppressed(doc, parent),
         page_height_px,
@@ -3292,6 +3302,7 @@ fn fragment_block_subtree_inner(
     // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
     let opportunities = opportunities(
         flow,
+        parent,
         &walk_children,
         suppress_page_check,
         page_height_px,
@@ -3301,7 +3312,7 @@ fn fragment_block_subtree_inner(
     // and whether the walk meets them in block flow, where `avoid` between
     // two lines keeps them together ([`kept_after_line`]); a table's rows and
     // a flex or grid container's lines are another walk's.
-    let lines = flow_lines(flow, &walk_children);
+    let lines = flow_lines(flow, parent, &walk_children);
     let mut line_at = vec![None; walk_children.len()];
     for (number, line) in lines.iter().enumerate() {
         line_at[line[0]] = Some(number);
@@ -11819,6 +11830,31 @@ h2 { string-set: chapter-title content(text); }
         );
         let nested = r#"<section><div style="height: 150px"></div><h2 id="h">H</h2></section><p id="n">N</p>"#;
         assert_eq!(page("h2 { break-after: avoid }", nested), moved, "nested");
+    }
+
+    /// The items of a flex line are one line for its breaks whatever their
+    /// alignment: a tall item with `break-after: page` and a shorter one
+    /// centred beside it have no opportunity between them, so the break goes
+    /// after the container, and the short item stays beside the tall one.
+    /// The breaks grouped the centred item, which starts below the line's
+    /// top, into a line of its own: the break fell between the two items,
+    /// inside the row the walk places side by side, and was lost.
+    #[test]
+    fn a_centred_flex_item_shares_its_line_with_a_tall_item_that_breaks_after_it() {
+        let html = r#"<html><body style="margin: 0; padding: 0">
+              <div id="row" style="display: flex; align-items: center">
+                <div id="a" style="width: 50px; height: 60px; break-after: page"></div>
+                <div id="b" style="width: 50px; height: 20px"></div>
+              </div>
+              <div id="n" style="height: 10px"></div>
+            </body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        assert_eq!(
+            (placements(&doc, &geom, "b"), placements(&doc, &geom, "n")),
+            (vec![(0, 20.0)], vec![(1, 0.0)])
+        );
     }
 
     /// A paragraph that avoids a break after it keeps only its last
