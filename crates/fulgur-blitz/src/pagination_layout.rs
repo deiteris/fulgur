@@ -961,7 +961,7 @@ fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px:
 /// groups them: in a table, whose layout children are its cells, the cells
 /// of one row element, in document order; in a flex or grid container a
 /// child that starts above the bottom of the line before it sits in that
-/// line, whatever its alignment (the rows of [`RowState`]); elsewhere one
+/// line, whatever its alignment (the lines of [`LineState`]); elsewhere one
 /// must also start beside the line's first box, as a float and the block
 /// after it do not. No class A opportunity lies between the boxes of a line
 /// (css-break-3 §4.1); each line takes on its boxes' `break-before` and
@@ -12223,13 +12223,12 @@ h2 { string-set: chapter-title content(text); }
 
     /// CodeRabbit review on PR #741 (fulgur-2s7p.1 follow-up): when the
     /// new inline-root split branch's multi-line `<p>` is a grid/flex
-    /// row's FIRST cell and crosses a page boundary, it never set
-    /// `origin_pending_same_row` / `row_state.crossed_by_recursion`
-    /// (the same-row co-split bookkeeping the recursion branch already
-    /// has, fulgur-ysms). Later cells in the same row then never
-    /// restored to the row-start state — they landed only on the page
-    /// the paragraph's tail ended up on, losing their earlier-page row
-    /// content entirely.
+    /// row's FIRST cell and crosses a page boundary, the later cells in
+    /// the same row must still start where the row does (fulgur-ysms; since
+    /// the walk places a line as one unit, every box of a [`LineState`]
+    /// restores its start): before the fix they landed only on the page the
+    /// paragraph's tail ended up on, losing their earlier-page row content
+    /// entirely.
     ///
     /// Fixture: 3-column grid row on a 100px strip, 50px into the page.
     /// Column 1 is a narrow multi-line `<p>` (one word per line, 20px
@@ -12511,9 +12510,10 @@ h2 { string-set: chapter-title content(text); }
     }
 
     /// CodeRabbit review on PR #741 (third round, commit 32aa763):
-    /// `row_state.is_some()` alone doesn't distinguish a later cell of
-    /// the row *already on the current page* from the row's *first*
-    /// cell, which can itself trigger split-before onto a fresh page.
+    /// Being in a row alone doesn't distinguish a later cell of the row
+    /// *already on the current page* from the row's *first* cell, which
+    /// could itself trigger split-before onto a fresh page (a box of a
+    /// [`LineState`] no longer moves alone).
     /// In the latter case `cursor_y` still holds the *previous row's*
     /// bottom on the *old* page — not a same-page previous-cell bottom
     /// — so `.max(new_cursor_y)` against it is exactly as stale as the
