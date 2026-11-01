@@ -957,17 +957,20 @@ fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px:
 
 /// The flow children of a walk over `children` of `parent`
 /// ([`is_flow_child`]), as indices into `children`, in lines, as the walk
-/// groups them: in a flex or grid container a child that starts above the
-/// bottom of the line before it sits in that line, whatever its alignment
-/// (the rows of [`RowState`]); elsewhere one must also start beside the
-/// line's first box, as a table row's cells do and a float and the block
+/// groups them: in a table, whose layout children are its cells, the cells
+/// of one row element, in document order; in a flex or grid container a
+/// child that starts above the bottom of the line before it sits in that
+/// line, whatever its alignment (the rows of [`RowState`]); elsewhere one
+/// must also start beside the line's first box, as a float and the block
 /// after it do not. No class A opportunity lies between the boxes of a line
 /// (css-break-3 §4.1); each line takes on its boxes' `break-before` and
 /// `break-after`.
 fn flow_lines(flow: Flow<'_>, parent: &blitz_dom::Node, children: &[usize]) -> Vec<Vec<usize>> {
     let by_extent = crate::blitz_adapter::is_flex_or_grid_container_node(parent);
+    let by_row = displays(parent, DisplayInside::Table);
     let mut lines: Vec<Vec<usize>> = Vec::new();
     let mut line_box = (0.0_f32, 0.0_f32);
+    let mut line_row = None;
     for (index, &id) in children.iter().enumerate() {
         let Some(child) = flow.doc.get_node(id) else {
             continue;
@@ -977,14 +980,19 @@ fn flow_lines(flow: Flow<'_>, parent: &blitz_dom::Node, children: &[usize]) -> V
         }
         let layout = child.final_layout;
         let (top, bottom) = (layout.location.y, layout.location.y + layout.size.height);
+        let row = by_row.then_some(child.parent).flatten();
         match lines.last_mut() {
-            Some(line) if top < line_box.1 - 0.5 && (by_extent || top <= line_box.0 + 0.5) => {
+            Some(line) if by_row && row.is_some() && row == line_row => line.push(index),
+            Some(line)
+                if !by_row && top < line_box.1 - 0.5 && (by_extent || top <= line_box.0 + 0.5) =>
+            {
                 line.push(index);
                 line_box.1 = line_box.1.max(bottom);
             }
             _ => {
                 lines.push(vec![index]);
                 line_box = (top, bottom);
+                line_row = row;
             }
         }
     }
@@ -1499,10 +1507,8 @@ struct RowState {
     max_end_cursor_y: f32,
     /// A cell placed content on `max_end_page`.
     max_end_has_content: bool,
-    /// Taffy `location.y` of the first cell in this row (reserved for future use).
-    _row_top: f32,
-    /// Max `location.y + height` seen across cells in this row.
-    row_bottom: f32,
+    /// The row's line among the walk's children ([`flow_lines`]).
+    line: usize,
     /// True when at least one cell in this row has crossed a page boundary via
     /// recursion. Only in this case do subsequent same-row cells need the full
     /// state-restore (co-split); non-recursion page advances are already handled
@@ -3330,13 +3336,14 @@ fn fragment_block_subtree_inner(
     let mut origin_pending_target_y: Option<f32> = None;
     let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
     let mut row_state: Option<RowState> = None;
-    // Outside a flex or grid row (whose `RowState` does the same): the
-    // previous in-flow child's layout top and bottom, and the page and
-    // `page_has_content` where the children side by side with it started.
-    // Blitz lays a table out as a grid of its cells, so the cells of a row
-    // are such children; a child beside another is placed below what was
-    // on the page when the first of them started, not below its neighbour.
-    let mut prev_in_flow: Option<(f32, f32)> = None;
+    // Outside a flex or grid row (whose `RowState` does the same): the line
+    // of the previous in-flow child with height ([`flow_lines`]), and the
+    // page and `page_has_content` where the children side by side with it
+    // started. Blitz lays a table out as a grid of its cells, so the cells
+    // of a row are such children; a child beside another is placed below
+    // what was on the page when the first of them started, not below its
+    // neighbour.
+    let mut prev_line: Option<usize> = None;
     let mut beside_start = (cursor.page_index, cursor.page_has_content);
     // fulgur-uebl: flex / grid containers establish a flex/grid
     // formatting context where children are not class A break points
@@ -3399,8 +3406,13 @@ fn fragment_block_subtree_inner(
     // a flex or grid container's lines are another walk's.
     let lines = flow_lines(flow, parent, &walk_children);
     let mut line_at = vec![None; walk_children.len()];
+    // The line each flow child belongs to.
+    let mut line_of = vec![None; walk_children.len()];
     for (number, line) in lines.iter().enumerate() {
         line_at[line[0]] = Some(number);
+        for &index in line {
+            line_of[index] = Some(number);
+        }
     }
     let block_flow =
         children_override.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
@@ -3489,9 +3501,7 @@ fn fragment_block_subtree_inner(
         // Must run BEFORE origin_pending_target_y is consumed so that
         // restoring page_taffy_origin is consistent.
         if allow_same_row_rebase {
-            let same_row = row_state
-                .as_ref()
-                .map(|rs| this_top_in_parent < rs.row_bottom - 0.5);
+            let same_row = row_state.as_ref().map(|rs| line_of[index] == Some(rs.line));
             match same_row {
                 Some(true) => {
                     let rs = row_state.as_ref().unwrap();
@@ -3547,13 +3557,10 @@ fn fragment_block_subtree_inner(
                     max_end_page: cursor.page_index,
                     max_end_cursor_y: cursor.cursor_y,
                     max_end_has_content: cursor.page_has_content,
-                    _row_top: this_top_in_parent,
-                    row_bottom: this_top_in_parent + child_h,
+                    line: line_of[index].unwrap_or(usize::MAX),
                     crossed_by_recursion: false,
                 });
                 cursor.open_row();
-            } else if let Some(ref mut rs) = row_state {
-                rs.row_bottom = rs.row_bottom.max(this_top_in_parent + child_h);
             }
         }
 
@@ -3613,15 +3620,13 @@ fn fragment_block_subtree_inner(
         }
 
         if !allow_same_row_rebase {
-            let beside = prev_in_flow.is_some_and(|(top, bottom)| {
-                this_top_in_parent < bottom - 0.5 && this_top_in_parent <= top + 0.5
-            });
+            let beside = prev_line.is_some() && prev_line == line_of[index];
             if beside {
                 cursor.page_has_content = cursor.page_index == beside_start.0 && beside_start.1;
             } else {
                 beside_start = (cursor.page_index, cursor.page_has_content);
             }
-            prev_in_flow = Some((this_top_in_parent, this_top_in_parent + child_h));
+            prev_line = line_of[index];
         }
 
         // fulgur-kv0r: place the child at its Taffy-reported parent-
