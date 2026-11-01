@@ -2108,20 +2108,17 @@ impl PageCursor {
 
     /// A child that started on this page ended on the later `end_page`, at
     /// `end_y`: closes the parent's fragment on this page `height` tall when
-    /// positive (when `grow`, growing the one a box beside it closed), gives
-    /// the parent a full fragment on each page between, and goes on below
-    /// the child, the parent's fragment on `end_page` starting at the page
-    /// top.
+    /// positive (growing the one a box beside it closed), gives the parent
+    /// a full fragment on each page between, and goes on below the child,
+    /// the parent's fragment on `end_page` starting at the page top.
     fn after_crossing(
         &mut self,
         geometry: &mut PaginationGeometryTable,
         end_page: u32,
         end_y: f32,
         height: f32,
-        grow: bool,
     ) {
-        if height > 0.0 && !self.close_parent_once(geometry, ParentHeight::Measured(height)) && grow
-        {
+        if height > 0.0 && !self.close_parent_once(geometry, ParentHeight::Measured(height)) {
             self.grow_parent(geometry, height);
         }
         self.fill_parent_pages(geometry, end_page);
@@ -4570,7 +4567,7 @@ fn fragment_block_subtree_inner(
             // disappear from every page but the last.
             if new_page_index > pre_split_page {
                 let height = cursor.parent_height(ParentHeight::ToFoot);
-                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height, false);
+                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height);
                 origin_pending_target_y = Some(new_cursor_y);
             } else if in_line {
                 // codex P2: in a line of boxes side by side, keep the
@@ -4748,7 +4745,7 @@ fn fragment_block_subtree_inner(
                 } else {
                     cursor.parent_height(ParentHeight::ToFoot)
                 };
-                cursor.after_crossing(geometry, np, nc, prev_height, true);
+                cursor.after_crossing(geometry, np, nc, prev_height);
             } else {
                 // fulgur-u0p0: when the recursion stayed on the same page,
                 // keep the larger of the parent's existing `cursor_y` (row
@@ -4984,7 +4981,7 @@ fn fragment_block_subtree_inner(
             // slices cross, as around an inline root that split.
             if new_page_index > entry_page_index {
                 let height = cursor.parent_height(ParentHeight::ToFoot);
-                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height, false);
+                cursor.after_crossing(geometry, new_page_index, new_cursor_y, height);
                 origin_pending_target_y = Some(new_cursor_y);
             } else if in_line {
                 cursor.cursor_y = cursor.cursor_y.max(new_cursor_y);
@@ -15604,6 +15601,49 @@ h2 { string-set: chapter-title content(text); }
         let p_id = find_by_id(&doc, "p").expect("p#p");
         let geom = super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
         assert_eq!(line_partition(&geom, p_id), (vec![0, 1], vec![0, 2, 3]));
+    }
+
+    /// A flex item's fragment on a page its line crosses reaches the page
+    /// foot whichever of its items crosses first: a paragraph that splits
+    /// after an entered item that broke early grows the fragment the item
+    /// closed, as an entered item grows the one a paragraph closed. The
+    /// container `x` starts 20 px down a 60 px page, below content, beside a
+    /// taller box, so that its line does not stretch it to the foot.
+    #[test]
+    fn a_split_paragraph_grows_its_containers_fragment_an_item_beside_it_closed() {
+        let item = |first: bool| {
+            let entered = r#"<div style="flex:1 1 0"><div style="height:10px"></div><div style="height:10px;break-before:page"></div></div>"#;
+            let paragraph = r#"<p style="flex:1 1 0;margin:0;line-height:20px;orphans:1;widows:1">1<br>2<br>3<br>4<br>5</p>"#;
+            if first {
+                format!("{entered}{paragraph}")
+            } else {
+                format!("{paragraph}{entered}")
+            }
+        };
+        for entered_first in [true, false] {
+            let html = format!(
+                r#"<html><body style="margin:0"><div style="height:20px"></div>
+                  <div style="display:flex;align-items:flex-start"><div id="x" style="flex:1 1 0;display:flex">{}</div><div style="flex:1 1 0;height:150px"></div></div>
+                </body></html>"#,
+                item(entered_first)
+            );
+            let mut doc = parse(&html, 200.0);
+            let table_cs = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let x = find_by_id(&doc, "x").expect("div#x");
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 60.0_f32.as_px(), &table_cs);
+            let first: Vec<(u32, f32, f32)> = geom[&x]
+                .fragments
+                .iter()
+                .filter(|f| f.page_index == 0)
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect();
+            assert_eq!(
+                first,
+                [(0, 20.0, 40.0)],
+                "entered item first: {entered_first}; geom={geom:?}"
+            );
+        }
     }
 
     /// Blitz lays a table out as a grid of its cells: the first cell of a
