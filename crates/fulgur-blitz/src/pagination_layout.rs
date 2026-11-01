@@ -1493,52 +1493,321 @@ fn skipped_header_row_below(
     })
 }
 
-/// Row-level state for grid/flex parallel-sibling co-split (fulgur-ysms).
-///
-/// Saved once at the first cell of each row; subsequent cells in the same
-/// row restore from `start_*` so their recursion begins at the same
-/// (page, cursor) as the first cell did. After all cells in the row are
-/// processed the outer cursor advances to `max_end_*`.
-struct RowState {
-    /// The cursor where the row's first cell started.
+/// A line of boxes side by side that the walk places as one unit
+/// (`BoxKind::Parallel`): a table row's cells, or a flex or grid line's
+/// items ([`flow_lines`]). Whether it starts on this page is decided once,
+/// before its first box ([`line_moves_on`]); then every box starts on the
+/// line's first page at the line's top (fulgur-ysms), each continues as far
+/// as its content reaches, and the walk goes on below the box that ends
+/// last ([`close_line`]).
+struct LineState {
+    /// The line's number among the walk's children ([`flow_lines`]).
+    number: usize,
+    /// The cursor where the line starts, which each of its boxes restores.
     start: PageMark,
     started_on_occupied_strip: bool,
     max_end_page: u32,
     max_end_cursor_y: f32,
-    /// A cell placed content on `max_end_page`.
+    /// A box placed content on `max_end_page`.
     max_end_has_content: bool,
-    /// The row's line among the walk's children ([`flow_lines`]).
-    line: usize,
-    /// True when at least one cell in this row has crossed a page boundary via
-    /// recursion. Only in this case do subsequent same-row cells need the full
-    /// state-restore (co-split); non-recursion page advances are already handled
-    /// by the existing `origin_pending_same_row` mechanism.
-    crossed_by_recursion: bool,
+    /// The bottom of the line's own boxes in their parent's layout: a box
+    /// that reaches it is stretched to the line's height. A cell that
+    /// spans rows reaches below its row and is not one.
+    bottom: f32,
+    /// The boxes placed so far.
+    items: Vec<usize>,
 }
 
-impl RowState {
-    /// Starts the row again where a forced break before its first cell put
-    /// the cursor: its cells start, and it ends at least, on the new page.
-    fn restart(&mut self, cursor: &PageCursor) {
-        self.start = cursor.mark();
-        self.started_on_occupied_strip = false;
-        self.max_end_page = cursor.page_index;
-        self.max_end_cursor_y = cursor.cursor_y;
-        self.max_end_has_content = cursor.page_has_content;
-    }
-
-    /// Records where a cell of the row ended, when it is past every other,
-    /// and whether the row placed content on its last page.
-    fn reach(&mut self, cursor: &PageCursor) {
-        if cursor.page_index > self.max_end_page {
-            self.max_end_page = cursor.page_index;
-            self.max_end_cursor_y = cursor.cursor_y;
-            self.max_end_has_content = cursor.page_has_content;
-        } else if cursor.page_index == self.max_end_page {
-            self.max_end_cursor_y = self.max_end_cursor_y.max(cursor.cursor_y);
-            self.max_end_has_content |= cursor.page_has_content;
+impl LineState {
+    /// Records where a box of the line ended, at `y` on `page`, when it is
+    /// past every other, and whether the line placed content on its last
+    /// page.
+    fn reach(&mut self, page: u32, y: f32, has_content: bool) {
+        if page > self.max_end_page {
+            self.max_end_page = page;
+            self.max_end_cursor_y = y;
+            self.max_end_has_content = has_content;
+        } else if page == self.max_end_page {
+            self.max_end_cursor_y = self.max_end_cursor_y.max(y);
+            self.max_end_has_content |= has_content;
         }
     }
+}
+
+/// Where a table cell that spans rows ended, which ends the last row it
+/// spans rather than its own ([`reach_line`]).
+struct SpanEnd {
+    /// The line of the last row the cell spans ([`flow_lines`]).
+    last_line: usize,
+    page: u32,
+    y: f32,
+    has_content: bool,
+}
+
+/// The `rowspan` of the table cell `node`, when above 1.
+fn rowspan_of(node: &blitz_dom::Node) -> Option<usize> {
+    if !displays(node, DisplayInside::TableCell) {
+        return None;
+    }
+    node.element_data()
+        .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&rowspan| rowspan > 1)
+}
+
+/// Records where the box `child` of the open line ended, at the cursor
+/// ([`LineState::reach`]): a cell that spans rows ends the last row it
+/// spans, not its own, as the rows below it are placed beside it
+/// ([`SpanEnd`]).
+fn reach_line(
+    line: &mut Option<LineState>,
+    spans: &mut Vec<SpanEnd>,
+    child: &blitz_dom::Node,
+    cursor: &PageCursor,
+) {
+    let Some(open) = line.as_mut() else {
+        return;
+    };
+    match rowspan_of(child) {
+        Some(rowspan) => spans.push(SpanEnd {
+            last_line: open.number + rowspan - 1,
+            page: cursor.page_index,
+            y: cursor.cursor_y,
+            has_content: cursor.page_has_content,
+        }),
+        None => open.reach(cursor.page_index, cursor.cursor_y, cursor.page_has_content),
+    }
+}
+
+/// The table row of the cell `node`, or `None` for a node that is not a
+/// cell of a row.
+fn table_row_of<'a>(doc: &'a BaseDocument, node: &blitz_dom::Node) -> Option<&'a blitz_dom::Node> {
+    if !displays(node, DisplayInside::TableCell) {
+        return None;
+    }
+    doc.get_node(node.parent?)
+        .filter(|&row| displays(row, DisplayInside::TableRow))
+}
+
+/// The bottom of the line of `items` in their parent's layout ([`LineState`]):
+/// of a table row, its cells' that span no rows, else of every box.
+fn line_bottom(items: &[&blitz_dom::Node]) -> f32 {
+    let bottom =
+        |node: &&blitz_dom::Node| node.final_layout.location.y + node.final_layout.size.height;
+    items
+        .iter()
+        .filter(|item| !may_span_rows(item))
+        .map(bottom)
+        .reduce(f32::max)
+        .or_else(|| items.iter().map(bottom).reduce(f32::min))
+        .unwrap_or(0.0)
+}
+
+/// Whether the line of `items`, whose layout top is `top`, moves whole to
+/// the next page before its first box, starting `line_y` down a page of
+/// `page_height_px` ([`LineState`]).
+///
+/// - A table row moves when none of its cells places content in the room
+///   left ([`leading_extent`]): a cell has no break point between its top
+///   edge and its first content. A row kept whole moves when it does not
+///   fit. At the top of a page, below its table's top edge, a row moves only
+///   when its unit fits a whole page and is not held together by `avoid`
+///   alone (css-break-3 §4.4). A row a cell above spans down to moves with
+///   that cell's row only ([`spanned_from_above`]), and the table's first
+///   row does not move at the top of its fragment.
+/// - A flex or grid line after content in its container moves when none of
+///   its items places content and its unit fits a page, or when an item
+///   placed whole that is no slice of a box does not fit the room but fits
+///   a page; at the top of a page not when `avoid` alone holds it.
+#[allow(clippy::too_many_arguments)]
+fn line_moves_on(
+    flow: Flow<'_>,
+    items: &[&blitz_dom::Node],
+    top: f32,
+    line_y: f32,
+    after_content: bool,
+    at_page_top: bool,
+    page_height_px: f32,
+    depth: usize,
+) -> bool {
+    let Flow {
+        doc, column_styles, ..
+    } = flow;
+    let Some(&first) = items.first() else {
+        return false;
+    };
+    let room = page_height_px - line_y;
+    if let Some(row) = table_row_of(doc, first) {
+        let movable = kept_table_row_bottom(doc, column_styles, first, page_height_px).is_some()
+            || !spanned_from_above(doc, row);
+        if !movable || line_y <= 0.0 {
+            return false;
+        }
+        let lead = leading_extent(flow, row, room, page_height_px, 0);
+        return if at_page_top {
+            lead.moves_on(page_height_px) && !lead.relaxes
+        } else {
+            !lead.places
+        };
+    }
+    if !after_content {
+        return false;
+    }
+    let ids: Vec<usize> = items.iter().map(|item| item.id).collect();
+    let Some(lead) = tracks_leading(flow, &ids, top, room, page_height_px, depth) else {
+        return false;
+    };
+    let height = line_bottom(items) - top;
+    let lead = Leading {
+        places: lead.places || height <= room,
+        ..lead
+    };
+    let monolithic_overflow = !at_page_top
+        && items.iter().any(|item| {
+            let offset = item.final_layout.location.y - top;
+            let height = item.final_layout.size.height;
+            matches!(
+                classify(flow, item, page_height_px),
+                BoxKind::Monolithic(Whole::Atomic)
+            ) && !slices_at_a_page_top(item)
+                && offset + height > room
+                && offset + height <= page_height_px + 1.0
+        });
+    monolithic_overflow || (lead.moves_on(page_height_px) && !(at_page_top && lead.relaxes))
+}
+
+/// Ends the line `line` of a walk: each of its boxes stretched to the
+/// line's height ([`stretch_line_items`]), the cursor moved below the box
+/// that ends last, on its page, the cells that span rows down to it among
+/// them (`spans`, all that are left when it is the walk's `last` line).
+/// Returns the y at which the next line starts when the line crossed pages:
+/// right below it, the gap above the next line dropped, as below a box that
+/// crossed.
+fn close_line(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    mut line: LineState,
+    spans: &mut Vec<SpanEnd>,
+    last: bool,
+    cursor: &mut PageCursor,
+) -> Option<f32> {
+    cursor.close_row();
+    spans.retain(|span| {
+        let ends = last || span.last_line <= line.number;
+        if ends {
+            line.reach(span.page, span.y, span.has_content);
+        }
+        !ends
+    });
+    stretch_line_items(geometry, doc, &line, cursor.page_height_px);
+    cursor.page_index = line.max_end_page;
+    cursor.cursor_y = line.max_end_cursor_y;
+    cursor.page_has_content = line.max_end_has_content;
+    if line.max_end_page > line.start.page_index {
+        cursor.page_start_y = 0.0;
+        Some(line.max_end_cursor_y)
+    } else {
+        cursor.page_start_y = line.start.page_start_y;
+        None
+    }
+}
+
+/// Gives each box of a line that crossed pages, stretched to the line's
+/// height by a taller neighbour (it reaches [`LineState::bottom`]), but a
+/// cell that spans rows, a
+/// fragment on every page down to the line's end: cut at the foot of each
+/// page before the line's last, where a box placed whole ran past it, and
+/// on the last page reaching the line's end, as an empty fragment where its
+/// own content ended before. A replaced or transformed box is not cut. The
+/// lines of an inline root are on its first fragments; the added ones hold
+/// none (`line_boundaries`).
+fn stretch_line_items(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    line: &LineState,
+    page_height_px: f32,
+) {
+    let (end_page, end_y) = (line.max_end_page, line.max_end_cursor_y);
+    if end_page <= line.start.page_index {
+        return;
+    }
+    for &id in &line.items {
+        let Some(node) = doc.get_node(id) else {
+            continue;
+        };
+        let layout = node.final_layout;
+        if layout.location.y + layout.size.height < line.bottom - 0.5
+            || may_span_rows(node)
+            || is_transformed(node)
+            || is_replaced(node)
+        {
+            continue;
+        }
+        let Some(entry) = geometry.get_mut(&id) else {
+            continue;
+        };
+        let Some(first) = entry.fragments.first().cloned() else {
+            continue;
+        };
+        let lines = entry.line_boundaries.last().copied().or_else(|| {
+            node.element_data()
+                .is_some_and(|el| el.inline_layout_data.is_some())
+                .then(|| collect_inline_line_metrics(node).len())
+        });
+        let before = entry.fragments.len();
+        for page in first.page_index..=end_page {
+            let bottom = if page < end_page {
+                page_height_px
+            } else {
+                end_y
+            };
+            if let Some(fragment) = entry
+                .fragments
+                .iter_mut()
+                .rev()
+                .find(|fragment| fragment.page_index == page)
+            {
+                let top = fragment.y.to_f32();
+                let height = if page < end_page {
+                    bottom - top
+                } else {
+                    fragment.height.to_f32().max(bottom - top)
+                };
+                fragment.height = height.max(0.0).as_px();
+            } else {
+                entry.fragments.push(Fragment {
+                    page_index: page,
+                    x: first.x,
+                    y: 0.0_f32.as_px(),
+                    width: first.width,
+                    height: bottom.max(0.0).as_px(),
+                });
+            }
+        }
+        let added = entry.fragments.len() - before;
+        if added > 0 {
+            entry.fragments.sort_by_key(|fragment| fragment.page_index);
+            if let Some(lines) = lines {
+                if entry.line_boundaries.is_empty() && before == 1 {
+                    entry.line_boundaries = vec![0, lines];
+                }
+                if entry.line_boundaries.len() == before + 1 {
+                    entry
+                        .line_boundaries
+                        .extend(std::iter::repeat_n(lines, added));
+                }
+            }
+        }
+    }
+}
+
+/// Whether `node` is a replaced element, which paints as one image.
+fn is_replaced(node: &blitz_dom::Node) -> bool {
+    const REPLACED: [&str; 9] = [
+        "img", "svg", "canvas", "video", "iframe", "object", "embed", "input", "textarea",
+    ];
+    node.element_data()
+        .is_some_and(|el| REPLACED.contains(&el.name.local.as_ref()))
 }
 
 /// How tall a walker makes the fragment of its parent on the page it
@@ -1711,17 +1980,28 @@ impl PageCursor {
         let Some(parent) = &self.parent else {
             return;
         };
-        geometry
-            .entry(parent.id)
-            .or_default()
-            .fragments
-            .push(Fragment {
-                page_index,
-                x: parent.x.as_px(),
-                y: y.as_px(),
-                width: parent.width.as_px(),
-                height: height.as_px(),
-            });
+        let fragments = &mut geometry.entry(parent.id).or_default().fragments;
+        // The lines of a table or a flex or grid container close the
+        // parent on a page each time one of them crosses it: its fragment
+        // there is one, reaching the lowest of them.
+        if let Some(fragment) = fragments
+            .iter_mut()
+            .rev()
+            .find(|fragment| fragment.page_index == page_index)
+        {
+            let top = fragment.y.to_f32().min(y);
+            let bottom = (fragment.y.to_f32() + fragment.height.to_f32()).max(y + height);
+            fragment.y = top.as_px();
+            fragment.height = (bottom - top).as_px();
+            return;
+        }
+        fragments.push(Fragment {
+            page_index,
+            x: parent.x.as_px(),
+            y: y.as_px(),
+            width: parent.width.as_px(),
+            height: height.as_px(),
+        });
     }
 
     /// Closes the parent's fragment on this page.
@@ -2161,25 +2441,12 @@ fn leading_of(
             {
                 return Leading::whole(bottom - top, room).relaxed();
             }
-            let lead = tracks
-                .iter()
-                .filter_map(|&id| doc.get_node(id))
-                .map(|track| {
-                    let offset = track.final_layout.location.y - top;
-                    let inner =
-                        leading_extent(flow, track, room - offset, page_height_px, depth + 1);
-                    (offset + inner.extent, inner.places, inner.relaxes)
-                })
-                .reduce(|(a, a_places, a_relaxes), (b, b_places, b_relaxes)| {
-                    (a.min(b), a_places || b_places, a_relaxes && b_relaxes)
-                });
-            let Some((extent, places, relaxes)) = lead else {
+            let Some(lead) = tracks_leading(flow, tracks, *top, room, page_height_px, depth) else {
                 return whole;
             };
             Leading {
-                extent,
-                places: places || (!row && height <= room),
-                relaxes,
+                places: lead.places || (!row && height <= room),
+                ..lead
             }
         }
         BoxKind::Table { table, .. } => {
@@ -2226,6 +2493,36 @@ fn leading_of(
             within(inner, layout.location.y)
         }
     }
+}
+
+/// The leading unit of boxes side by side, `tracks`, whose line's top is
+/// `top` in their parent's layout, with `room` px left below it: it places
+/// content when one of the boxes does, and ends with the shortest of their
+/// units, as no box moves alone ([`LineState`]). `None` for no box.
+fn tracks_leading(
+    flow: Flow<'_>,
+    tracks: &[usize],
+    top: f32,
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+) -> Option<Leading> {
+    tracks
+        .iter()
+        .filter_map(|&id| flow.doc.get_node(id))
+        .map(|track| {
+            let offset = track.final_layout.location.y - top;
+            let inner = leading_extent(flow, track, room - offset, page_height_px, depth + 1);
+            Leading {
+                extent: offset + inner.extent,
+                ..inner
+            }
+        })
+        .reduce(|a, b| Leading {
+            extent: a.extent.min(b.extent),
+            places: a.places || b.places,
+            relaxes: a.relaxes && b.relaxes,
+        })
 }
 
 /// The leading unit of an inline root of `lines`, with `room` px left
@@ -2310,39 +2607,36 @@ fn table_leading(
 /// at the top of a page ([`Leading::relaxes`]): not replaced, as an image
 /// is, nor transformed, which paints as one shape.
 fn slices_at_a_page_top(node: &blitz_dom::Node) -> bool {
-    const REPLACED: [&str; 9] = [
-        "img", "svg", "canvas", "video", "iframe", "object", "embed", "input", "textarea",
-    ];
     node.children.is_empty()
         && !is_transformed(node)
-        && node
-            .element_data()
-            .is_some_and(|el| !REPLACED.contains(&el.name.local.as_ref()))
+        && node.element_data().is_some()
+        && !is_replaced(node)
 }
 
-/// The row of the table cell `cell`, when its row group has no cell that
-/// spans rows: the rows of such a group are tied together
-/// ([`kept_table_row_bottom`]), so no one of them moves alone. `None` for
-/// a node that is not a cell of a row.
-fn cell_row<'a>(doc: &'a BaseDocument, cell: &blitz_dom::Node) -> Option<&'a blitz_dom::Node> {
-    if !displays(cell, DisplayInside::TableCell) {
-        return None;
-    }
-    let row = doc
-        .get_node(cell.parent?)
-        .filter(|&row| displays(row, DisplayInside::TableRow))?;
-    let group_spans = row
-        .parent
-        .and_then(|id| doc.get_node(id))
-        .is_some_and(|group| {
-            group
-                .children
-                .iter()
-                .filter_map(|&id| doc.get_node(id))
-                .filter(|&node| displays(node, DisplayInside::TableRow))
-                .any(|row| row_cells(doc, row).any(may_span_rows))
-        });
-    (!group_spans).then_some(row)
+/// Whether a cell of an earlier row of `row`'s group spans down to it, by
+/// its `rowspan`: the rows a cell spans have no break opportunity between
+/// them, so none of them but the first moves alone ([`line_moves_on`]).
+fn spanned_from_above(doc: &BaseDocument, row: &blitz_dom::Node) -> bool {
+    let Some(group) = row.parent.and_then(|id| doc.get_node(id)) else {
+        return false;
+    };
+    let rows: Vec<&blitz_dom::Node> = group
+        .children
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .filter(|&node| displays(node, DisplayInside::TableRow))
+        .collect();
+    let Some(index) = rows.iter().position(|node| node.id == row.id) else {
+        return false;
+    };
+    rows[..index].iter().enumerate().any(|(earlier, above)| {
+        row_cells(doc, above).any(|cell| {
+            cell.element_data()
+                .and_then(|el| crate::blitz_adapter::get_attr(el, "rowspan"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|rowspan| rowspan > index - earlier)
+        })
+    })
 }
 
 /// Whether `node`'s display has the inner type `inside`.
@@ -3013,7 +3307,27 @@ fn fragment_repeating_table(
     let orphaned_header = !band_overflows
         && !first_row_places(page_height_px - cursor_in)
         && first_row_places(page_height_px);
-    let (first_page, first_table_top) = if band_overflows || orphaned_header {
+    // The first body row's `break-before`, which its walk below leaves to
+    // the table, as the first line's of any walk: forced after content on
+    // the page, the table starts on the next page, its header with it,
+    // rather than leave the header alone above the break.
+    let first_row_break = table.map_or(BreakValue::Auto, |table| {
+        flow_lines(flow, table, &header.body_cell_ids)
+            .first()
+            .map_or(BreakValue::Auto, |line| {
+                line_break(
+                    flow,
+                    &header.body_cell_ids,
+                    line,
+                    false,
+                    page_height_px,
+                    depth + 1,
+                )
+            })
+    });
+    let (first_page, first_table_top) = if first_row_break.is_forced() && *page_has_content {
+        (page_on_side(doc, page_in + 1, first_row_break.side()), 0.0)
+    } else if band_overflows || orphaned_header {
         (page_in + 1, 0.0)
     } else {
         (page_in, cursor_in)
@@ -3283,10 +3597,7 @@ fn fragment_block_subtree_inner(
     root: bool,
 ) -> (u32, f32) {
     let Flow {
-        doc,
-        column_styles,
-        running_store,
-        ..
+        doc, running_store, ..
     } = flow;
     // The parent's fragment on each page starts at the cursor's
     // `page_start_y`: the walk closes one and starts the next each time it
@@ -3334,9 +3645,12 @@ fn fragment_block_subtree_inner(
     // siblings after them up: the parent ends that much higher too.
     let mut own_lift = 0.0_f32;
     let mut origin_pending_target_y: Option<f32> = None;
-    let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
-    let mut row_state: Option<RowState> = None;
-    // Outside a flex or grid row (whose `RowState` does the same): the line
+    // The line of boxes side by side the walk is placing ([`LineState`]),
+    // and where the cells that span rows below it ended ([`SpanEnd`]).
+    let mut line: Option<LineState> = None;
+    let mut spans: Vec<SpanEnd> = Vec::new();
+    // Outside a table row or a flex or grid line (whose [`LineState`] does
+    // the same): the line
     // of the previous in-flow child with height ([`flow_lines`]), and the
     // page and `page_has_content` where the children side by side with it
     // started. Blitz lays a table out as a grid of its cells, so the cells
@@ -3367,6 +3681,10 @@ fn fragment_block_subtree_inner(
     let suppress_page_check = allow_same_row_rebase
         || crate::blitz_adapter::is_atomic_inline_container_node(parent)
         || parent_is_orthogonal;
+    // The children lie side by side in lines the walk places as units
+    // ([`LineState`]): a table's cells in its rows, or a flex or grid
+    // container's items in its lines.
+    let parallel = allow_same_row_rebase || displays(parent, DisplayInside::Table);
 
     // fulgur-yb27: prefer `layout_children` over raw `children` —
     // same rationale as `record_subtree_descendants`. When a block
@@ -3497,79 +3815,26 @@ fn fragment_block_subtree_inner(
         // `page_taffy_origin` against it on page advance).
         let this_top_in_parent = layout.location.y;
 
-        // fulgur-ysms: row-level co-split for flex/grid containers.
-        // Must run BEFORE origin_pending_target_y is consumed so that
-        // restoring page_taffy_origin is consistent.
-        if allow_same_row_rebase {
-            let same_row = row_state.as_ref().map(|rs| line_of[index] == Some(rs.line));
-            match same_row {
-                Some(true) => {
-                    let rs = row_state.as_ref().unwrap();
-                    if rs.crossed_by_recursion {
-                        // Co-split: a previous cell in this row crossed a page
-                        // boundary via recursion. Restore to the row-start state
-                        // so this cell's recursion begins at the same (page,
-                        // cursor) — both cells will independently fragment and
-                        // their results are merged via max_end_*.
-                        //
-                        // Also clear origin_pending_* set by the previous cell's
-                        // recursion: the restored page_taffy_origin is the one
-                        // that puts THIS cell at the correct row-start y, and the
-                        // previous cell's pending origin would incorrectly shift
-                        // page_taffy_origin again.
-                        cursor.restore(rs.start);
-                        origin_pending_target_y = None;
-                        origin_pending_same_row = None;
-                    } else {
-                        // If crossed_by_recursion is false (e.g., a previous
-                        // cell crossed via the non-recursion strip-overflow
-                        // path), the existing origin_pending_same_row mechanism
-                        // already handles correct placement — no additional
-                        // restore is needed. The cells before this one sit
-                        // beside it, not above: the page holds content above
-                        // it only as it did when the row started there.
-                        cursor.page_has_content =
-                            cursor.page_index == rs.start.page_index && rs.start.page_has_content;
-                    }
-                }
-                Some(false) => {
-                    // New row: advance outer cursor to the max end reached
-                    // across all cells in the previous row.
-                    let rs = row_state.take().unwrap();
-                    cursor.page_index = rs.max_end_page;
-                    cursor.cursor_y = rs.max_end_cursor_y;
-                    cursor.page_has_content = rs.max_end_has_content;
-                    if rs.max_end_page > rs.start.page_index {
-                        cursor.page_start_y = 0.0;
-                        origin_pending_target_y = Some(rs.max_end_cursor_y);
-                        origin_pending_same_row = None;
-                    } else {
-                        cursor.page_start_y = rs.start.page_start_y;
-                    }
-                }
-                None => {}
-            }
-            if row_state.is_none() {
-                // First cell in a new row: snapshot current state.
-                row_state = Some(RowState {
-                    start: cursor.mark(),
-                    started_on_occupied_strip: cursor.entered_below_content,
-                    max_end_page: cursor.page_index,
-                    max_end_cursor_y: cursor.cursor_y,
-                    max_end_has_content: cursor.page_has_content,
-                    line: line_of[index].unwrap_or(usize::MAX),
-                    crossed_by_recursion: false,
-                });
-                cursor.open_row();
+        // The line of boxes side by side this child belongs to, in a table
+        // or a flex or grid container ([`LineState`]). Must run before
+        // `origin_pending_target_y` is consumed: the line before it ends
+        // here, and sets it when it crossed pages. A later box of the open
+        // line starts where the line does, on its first page at its top,
+        // whatever its neighbours before it placed (fulgur-ysms).
+        let line_number = if parallel { line_of[index] } else { None };
+        if let Some(open) = line.take_if(|open| Some(open.number) != line_number) {
+            if let Some(target_y) = close_line(geometry, doc, open, &mut spans, false, &mut cursor)
+            {
+                origin_pending_target_y = Some(target_y);
             }
         }
+        if let Some(open) = &line {
+            cursor.restore(open.start);
+            origin_pending_target_y = None;
+        }
+        let in_line = line_number.is_some();
 
-        if let Some(mut target_y) = origin_pending_target_y.take() {
-            if let Some((row_top, row_bottom, same_row_y)) = origin_pending_same_row.take()
-                && this_top_in_parent < row_bottom - 0.5
-            {
-                target_y = same_row_y + (this_top_in_parent - row_top);
-            }
+        if let Some(target_y) = origin_pending_target_y.take() {
             cursor.page_taffy_origin = this_top_in_parent - (target_y - cursor.page_start_y);
         }
 
@@ -3591,10 +3856,7 @@ fn fragment_block_subtree_inner(
                 // Zero-height break-before: this child IS the first
                 // on the new page — apply origin rebase eagerly.
                 cursor.page_taffy_origin = this_top_in_parent;
-                (origin_pending_target_y, origin_pending_same_row) = (None, None);
-                if let Some(rs) = row_state.as_mut() {
-                    rs.restart(&cursor);
-                }
+                origin_pending_target_y = None;
             } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
                 cursor.move_to_side(doc, opportunity.side());
             }
@@ -3619,7 +3881,7 @@ fn fragment_block_subtree_inner(
             continue;
         }
 
-        if !allow_same_row_rebase {
+        if !parallel {
             let beside = prev_line.is_some() && prev_line == line_of[index];
             if beside {
                 cursor.page_has_content = cursor.page_index == beside_start.0 && beside_start.1;
@@ -3656,12 +3918,61 @@ fn fragment_block_subtree_inner(
             let margin = adjoining_top_margin(doc, child).max(0.0);
             cursor.page_taffy_origin = this_top_in_parent - margin;
             child_page_y = margin;
-            // A row that the break opens starts on the new page.
-            if let Some(rs) = row_state.as_mut() {
-                rs.restart(&cursor);
-            }
         } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
             cursor.move_to_side(doc, opportunity.side());
+        }
+        // The first box of a line opens it, after any forced break before
+        // it: the line moves to the next page whole when it starts here with
+        // no box of it placing content ([`line_moves_on`]), then each of its
+        // boxes starts where it does. No box of a line moves alone.
+        if let Some(number) = line_number
+            && line.is_none()
+        {
+            let items: Vec<&blitz_dom::Node> = lines[number]
+                .iter()
+                .filter_map(|&i| doc.get_node(walk_children[i]))
+                .collect();
+            let top = items
+                .iter()
+                .map(|item| item.final_layout.location.y)
+                .fold(this_top_in_parent, f32::min);
+            let line_y = child_page_y - (this_top_in_parent - top);
+            let after_content = line_y > cursor.page_start_y
+                || (cursor.entered_below_content && cursor.page_index == page_in);
+            if line_moves_on(
+                flow,
+                &items,
+                top,
+                line_y,
+                after_content,
+                cursor.at_page_top(),
+                page_height_px,
+                depth + 1,
+            ) {
+                // A table's first row leaves nothing of the table behind.
+                if !displays(parent, DisplayInside::Table) || cursor.cursor_y > cursor.page_start_y
+                {
+                    cursor.close_parent_once(geometry, ParentHeight::Placed);
+                }
+                cursor.advance();
+                cursor.page_taffy_origin = top;
+                child_page_y = this_top_in_parent - top;
+                cursor.entered_below_content = false;
+            }
+            line = Some(LineState {
+                number,
+                start: cursor.mark(),
+                started_on_occupied_strip: cursor.entered_below_content,
+                max_end_page: cursor.page_index,
+                max_end_cursor_y: cursor.cursor_y,
+                max_end_has_content: cursor.page_has_content,
+                bottom: line_bottom(&items),
+                items: Vec::new(),
+            });
+            cursor.open_row();
+        }
+        if let Some(open) = line.as_mut() {
+            open.items.push(child_id);
         }
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
@@ -3744,35 +4055,6 @@ fn fragment_block_subtree_inner(
                 }
             }
         }
-        let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
-        // A row none of whose cells can place content in the rest of the
-        // page ([`leading_extent`]) moves to the next one whole, leaving no
-        // empty cell boxes at the page foot: a cell has no break point
-        // between its top edge and its first content. Its other cells
-        // follow it there, as those of a kept row do, and a row that is the
-        // table's first leaves nothing of the table behind. A row at the top
-        // of a page, below its table's top edge, moves only when its unit
-        // fits a whole page, so fits only the next one.
-        if kept_row_bottom.is_none()
-            && child_page_y > 0.0
-            && cell_row(doc, child).is_some_and(|row| {
-                let lead =
-                    leading_extent(flow, row, page_height_px - child_page_y, page_height_px, 0);
-                if cursor.at_page_top() {
-                    lead.moves_on(page_height_px) && !lead.relaxes
-                } else {
-                    !lead.places
-                }
-            })
-        {
-            if cursor.cursor_y > cursor.page_start_y {
-                cursor.close_parent_once(geometry, ParentHeight::Placed);
-            }
-            cursor.advance();
-            cursor.page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
-            cursor.entered_below_content = false;
-        }
         // fulgur-2s7p.1: an inline root splits at line boundaries. Without
         // the line split a multi-line inline root falls through to the
         // block-child gate below, which can only push the *whole* child to
@@ -3821,34 +4103,21 @@ fn fragment_block_subtree_inner(
             // this container precedes the paragraph on this page (the
             // fulgur-2s7p.1 first-child exemption), regardless of row
             // position; `at_page_top` whether the page holds any content,
-            // which a move whole would leave it without.
-            if cursor.cursor_y > cursor.page_start_y
+            // which a move whole would leave it without. A box of a line
+            // never moves alone: its line moved or stayed already.
+            if !in_line
+                && cursor.cursor_y > cursor.page_start_y
                 && !cursor.at_page_top()
                 && !inline_leading(line_metrics, limits, page_height_px - child_page_y).places
             {
-                // Only widen to the full page strip when we're actually
-                // inside a grid/flex row (`row_state.is_some()`, whose open
-                // row closes the parent once a page): a later same-row
-                // sibling cell can restore this same page
-                // (`origin_pending_same_row`) and paint past `cursor_y`, so
-                // the parent fragment must already cover the whole strip to
-                // avoid a gap under that restored content. Outside a row
-                // context (plain block flow — the common case, e.g. a
-                // `break-inside:avoid` block pushed to a fresh page) there is
-                // no such later sibling, so stretching to the full remaining
-                // page height is wrong: it paints the parent's background far
-                // past its actual content and pushes whatever comes after it
-                // onto a spurious extra page (confirmed regression in
-                // examples/break-inside via PR #741).
-                let height = if row_state.is_some() {
-                    ParentHeight::ToFoot
-                } else {
-                    ParentHeight::Placed
-                };
-                cursor.close_parent_once(geometry, height);
-                // The cursor keeps the lowest point placed on the page left
-                // behind: the row's cells beside this one may return to it
-                // (see the `cursor_y` choice below).
+                // The parent's fragment ends at the content placed on the
+                // page (plain block flow, e.g. a `break-inside:avoid` block
+                // pushed to a fresh page): reaching the page foot paints
+                // the parent's background far past its content and pushes
+                // whatever comes after it onto a spurious extra page
+                // (confirmed regression in examples/break-inside via PR
+                // #741).
+                cursor.close_parent_once(geometry, ParentHeight::Placed);
                 let left_behind = cursor.cursor_y;
                 cursor.advance();
                 cursor.cursor_y = left_behind;
@@ -3899,35 +4168,11 @@ fn fragment_block_subtree_inner(
                 cursor.page_start_y = 0.0;
                 origin_pending_target_y = Some(new_cursor_y);
             }
-            // CodeRabbit + codex P1: mirror the recursion branch's
-            // same-row co-split bookkeeping (fulgur-ysms). Gated on
-            // `entry_page_index` (captured before split-before), not
-            // `pre_split_page`, so a split-before-only crossing (the
-            // paragraph fits whole on the fresh page, so
-            // `fragment_inline_root` never advances past
-            // `pre_split_page`) still marks the row as crossed. Without
-            // this, a multi-line `<p>` that is a grid/flex row's item
-            // and crosses a page boundary — via either path — leaves
-            // `origin_pending_same_row` unset and `row_state`'s
-            // `crossed_by_recursion` false, so the row's *next*
-            // parallel item doesn't restore to the row-start state — it
-            // gets placed after this paragraph's last fragment instead
-            // of beside it, and the earlier-page row content is lost
-            // for that sibling.
-            if new_page_index > entry_page_index {
-                let row_top = this_top_in_parent;
-                let row_bottom = row_top + child_h;
-                origin_pending_same_row =
-                    allow_same_row_rebase.then_some((row_top, row_bottom, 0.0));
-                if let Some(ref mut rs) = row_state {
-                    rs.crossed_by_recursion = true;
-                }
-            }
             cursor.page_index = new_page_index;
             // codex P2: mirror the recursion branch's fulgur-u0p0
             // cursor handling — when `fragment_inline_root` stayed on
             // the same page (`new_page_index == pre_split_page`) AND
-            // we're inside a grid/flex row (`row_state.is_some()`),
+            // we're inside a line of boxes side by side,
             // keep the larger of the parent's existing `cursor_y` (a
             // previous parallel row cell's bottom) and this split's own
             // `new_cursor_y`, rather than unconditionally shrinking to
@@ -3955,19 +4200,10 @@ fn fragment_block_subtree_inner(
             // had its short paragraph's actual end (`new_cursor_y`)
             // discarded in favor of the pre-push cursor).
             //
-            // CodeRabbit: `row_state.is_some()` alone isn't enough —
-            // it's also true for the *first* cell of a brand-new
-            // grid/flex row. If split-before fires for that cell
-            // (`pre_split_page > entry_page_index`), `cursor_y` still
-            // holds the *previous row's* bottom on the *old* page, not
-            // a same-page previous-cell bottom — `.max()` against it is
-            // just as stale as the no-row case above. Only preserve /
-            // max when split-before did **not** advance the page
-            // (`pre_split_page == entry_page_index`), i.e. this is
-            // genuinely a later cell still being placed on the row's
-            // already-current page.
+            // A box of a line never moves on alone, so in one the page
+            // only changes when the paragraph splits.
             cursor.cursor_y = if new_page_index == pre_split_page {
-                if row_state.is_some() && pre_split_page == entry_page_index {
+                if in_line && pre_split_page == entry_page_index {
                     cursor.cursor_y.max(new_cursor_y)
                 } else {
                     new_cursor_y
@@ -3976,9 +4212,7 @@ fn fragment_block_subtree_inner(
                 new_cursor_y
             };
             cursor.entered_below_content = false;
-            if let Some(ref mut rs) = row_state {
-                rs.reach(&cursor);
-            }
+            reach_line(&mut line, &mut spans, child, &cursor);
             continue;
         }
 
@@ -3994,7 +4228,14 @@ fn fragment_block_subtree_inner(
         // against the "parent CSS height > children sum" case where
         // recursion would emit a parent fragment shorter than
         // expected.
-        let available_strip = (page_height_px - cursor.cursor_y).max(0.0);
+        // A box of a line measures from its own place: the boxes beside it
+        // placed before it do not take its room.
+        let placed_to = if in_line {
+            child_page_y
+        } else {
+            cursor.cursor_y
+        };
+        let available_strip = (page_height_px - placed_to).max(0.0);
         // fulgur-7hf5: a multicol container is not entered unless a child
         // spans its columns ([`classify`]), a box kept whole only for a
         // forced break or a page-name change below it, which are not the
@@ -4017,11 +4258,10 @@ fn fragment_block_subtree_inner(
         // ([`leading_extent`]) but fits a whole page, as a box not entered
         // moves (the strip-overflow cut below). At the top of a page, below a
         // padded top edge only, it moves too: css-break-3 §4.1 has no break
-        // point there, so the unit fits only the next page. A flex or grid item takes the items
-        // beside it along; a table cell moves with its row instead (the
-        // row move above).
+        // point there, so the unit fits only the next page. A box of a
+        // line moves with its line instead ([`line_moves_on`]).
         if needs_recursion
-            && !displays(child, DisplayInside::TableCell)
+            && !in_line
             && (child_page_y > cursor.page_start_y
                 || (cursor.entered_below_content && cursor.page_index == page_in))
         {
@@ -4043,8 +4283,8 @@ fn fragment_block_subtree_inner(
         }
         if needs_recursion {
             let occupied_before_recursion = cursor.entered_below_content;
-            let row_started_on_occupied_strip = row_state.as_ref().is_some_and(|rs| {
-                rs.started_on_occupied_strip && rs.start.page_index == cursor.page_index
+            let row_started_on_occupied_strip = line.as_ref().is_some_and(|open| {
+                open.started_on_occupied_strip && open.start.page_index == cursor.page_index
             });
             let pre_recursion_page = cursor.page_index;
 
@@ -4059,6 +4299,16 @@ fn fragment_block_subtree_inner(
             // `child_page_y` keeps each cell's recursion strip aligned to
             // the row's y on the current page.
             let mut child_lift = 0.0;
+            // A box of a line that starts below content on its page is
+            // entered so: its first content that does not fit goes on to
+            // the next page, as the line stays for the boxes beside it. Not
+            // a cell that spans rows: the rows it spans are placed beside
+            // it, not after its content.
+            let below_content = cursor.entered_below_content
+                || (!may_span_rows(child)
+                    && line.as_ref().is_some_and(|open| {
+                        open.start.page_has_content && open.start.page_index == cursor.page_index
+                    }));
             let (np, nc) = fragment_block_subtree(
                 geometry,
                 flow,
@@ -4069,7 +4319,7 @@ fn fragment_block_subtree_inner(
                 child_page_y,
                 page_height_px,
                 depth + 1,
-                cursor.entered_below_content,
+                below_content,
                 &mut cursor.page_has_content,
                 remaining_repeat_budget,
                 &mut child_lift,
@@ -4157,27 +4407,16 @@ fn fragment_block_subtree_inner(
             // after it up with it, here and, through `lifted`, in the
             // parent's own siblings. Cells side by side in a row are not
             // moved: the row's height is not this child's alone.
-            if np == pre_recursion_page && child_lift > 0.0 && row_state.is_none() {
+            if np == pre_recursion_page && child_lift > 0.0 && line.is_none() {
                 cursor.page_taffy_origin += child_lift;
                 own_lift += child_lift;
             }
             if crossed {
                 cursor.page_start_y = 0.0;
                 origin_pending_target_y = Some(cursor.cursor_y);
-                let row_top = this_top_in_parent;
-                let row_bottom = row_top + child_h;
-                origin_pending_same_row =
-                    allow_same_row_rebase.then_some((row_top, row_bottom, 0.0));
-                // fulgur-ysms: mark that this row had a recursion-driven page
-                // cross so subsequent same-row cells know to co-split.
-                if let Some(ref mut rs) = row_state {
-                    rs.crossed_by_recursion = true;
-                }
             }
 
-            if let Some(ref mut rs) = row_state {
-                rs.reach(&cursor);
-            }
+            reach_line(&mut line, &mut spans, child, &cursor);
             continue;
         }
 
@@ -4189,16 +4428,11 @@ fn fragment_block_subtree_inner(
         // rather than `cursor_y + child_h` so a parallel sibling
         // returning to a smaller page-local y is checked correctly.
         //
-        // A cell of a row kept whole moves when the row does not fit, also
-        // as the first row of a table that starts on this page; the table
-        // then leaves nothing behind when no content of it precedes the row.
         // At the top of a page, below a top edge or a margin only
         // ([`PageCursor::at_page_top`]), a box moves only when it fits a
         // whole page, so fits only the next one: one taller stays, as moving
-        // would gain nothing.
-        let child_extent =
-            kept_row_bottom.map_or(child_h, |bottom| child_h.max(bottom - this_top_in_parent));
-        let kept_row_moves = kept_row_bottom.is_some() && child_page_y > 0.0;
+        // would gain nothing. A box of a line moves with its line, never
+        // alone ([`line_moves_on`]).
         // A childless box at the top of a page that does not fit the room
         // left below a top edge is sliced from where it stands instead
         // (css-break-3 §4.4), in a table cell too.
@@ -4206,17 +4440,25 @@ fn fragment_block_subtree_inner(
             && child_page_y + child_h > page_height_px + 1.0
             && slices_at_a_page_top(child)
             && slices_where_it_is(doc, child, true);
-        if !slices_at_top
+        // A box of a line placed whole that crosses the page foot, neither
+        // replaced nor transformed, is sliced where it stands, as the boxes
+        // beside it go on from the line's start, not after it; one
+        // stretched to the line's height also reaches the line's end when
+        // the line closes ([`stretch_line_items`]).
+        let slices_in_line = in_line
+            && child_page_y + child_h > page_height_px + 1.0
+            && child_page_y < page_height_px
+            && !is_transformed(child)
+            && !is_replaced(child)
+            && slices_where_it_is(doc, child, true);
+        if !in_line
+            && !slices_at_top
             && (child_page_y > cursor.page_start_y
-                || (cursor.entered_below_content && cursor.page_index == page_in)
-                || kept_row_moves)
-            && (!cursor.at_page_top() || child_extent <= page_height_px + 1.0)
-            && child_page_y + child_extent > page_height_px
+                || (cursor.entered_below_content && cursor.page_index == page_in))
+            && (!cursor.at_page_top() || child_h <= page_height_px + 1.0)
+            && child_page_y + child_h > page_height_px
         {
-            let leaves_parent = kept_row_bottom.is_none() || cursor.cursor_y > cursor.page_start_y;
-            if leaves_parent {
-                cursor.close_parent_once(geometry, ParentHeight::Placed);
-            }
+            cursor.close_parent_once(geometry, ParentHeight::Placed);
             cursor.advance();
             // Forced to a fresh page: rebase the Taffy origin so the
             // current child lands at page_start_y (= 0) on the new
@@ -4266,10 +4508,11 @@ fn fragment_block_subtree_inner(
         // overflows an ancestor clipping it ([`slices_where_it_is`]), or a
         // first child entered below the page foot, which has no slice there.
         if slices_at_top
+            || slices_in_line
             || (!is_transformed(child)
                 && child_h > page_height_px + 1.0
                 && child_page_y < page_height_px
-                && slices_where_it_is(doc, child, false))
+                && slices_where_it_is(doc, child, true))
         {
             // The slices are placed from the child's own place on the page,
             // and the walk then goes on from the last one, as after an
@@ -4396,24 +4639,14 @@ fn fragment_block_subtree_inner(
                 cursor.fill_parent_pages(geometry, new_page_index);
                 cursor.page_start_y = 0.0;
                 origin_pending_target_y = Some(new_cursor_y);
-                origin_pending_same_row = allow_same_row_rebase.then_some((
-                    this_top_in_parent,
-                    this_top_in_parent + child_h,
-                    0.0,
-                ));
-                if let Some(ref mut rs) = row_state {
-                    rs.crossed_by_recursion = true;
-                }
             }
             cursor.page_index = new_page_index;
-            cursor.cursor_y = if new_page_index == entry_page_index && row_state.is_some() {
+            cursor.cursor_y = if new_page_index == entry_page_index && in_line {
                 cursor.cursor_y.max(new_cursor_y)
             } else {
                 new_cursor_y
             };
-            if let Some(ref mut rs) = row_state {
-                rs.reach(&cursor);
-            }
+            reach_line(&mut line, &mut spans, child, &cursor);
             continue;
         }
 
@@ -4449,21 +4682,12 @@ fn fragment_block_subtree_inner(
         // the per-row max bottom).
         cursor.cursor_y = cursor.cursor_y.max(child_page_y + child_h);
         cursor.place(child_h);
-        if let Some(ref mut rs) = row_state {
-            rs.reach(&cursor);
-        }
+        reach_line(&mut line, &mut spans, child, &cursor);
     }
 
-    // fulgur-ysms: finalize any open row — advance to the max end state
-    // reached across all parallel sibling cells.
-    if let Some(rs) = row_state.take() {
-        cursor.close_row();
-        cursor.page_index = rs.max_end_page;
-        cursor.cursor_y = rs.max_end_cursor_y;
-        cursor.page_has_content = rs.max_end_has_content;
-        if rs.max_end_page > rs.start.page_index {
-            cursor.page_start_y = 0.0;
-        }
+    // The last line ends the walk.
+    if let Some(open) = line.take() {
+        close_line(geometry, doc, open, &mut spans, true, &mut cursor);
     }
 
     // A parent entered only to lift a table on its page (it ends on the
@@ -6227,23 +6451,26 @@ fn item_shares_its_row(
         })
 }
 
-/// Whether a box taller than a page that the walker does not enter may be
-/// sliced where it is, at any depth: in block flow, or in a flex or grid
-/// item alone in its row, only. Not in a table cell or a flex or grid item
-/// that shares its row ([`item_shares_its_row`]), of the body too: the
-/// items of a row share its height (a cell or item stretched past the page by a taller
-/// neighbour is one), and a row is no unit the walker fragments, so one
-/// that continued on the next page would take the walk of the cells or
-/// items beside it there, or back to the row's start. Nor past the bottom
-/// of an ancestor below the body that clips its overflow
-/// ([`clips_overflow`]): what is past the clip paints nothing, so it takes
-/// no page. Rows and cells count up to the root of the absolute or fixed
-/// subtree the box is in, which may be the box itself; clips up to the body.
-/// `in_cells` lets a table cell hold the box: a box that relaxes `avoid` at
-/// the top of a page ([`slices_at_a_page_top`]) is sliced in one, as its
-/// row co-splits its cells there.
-fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node, in_cells: bool) -> bool {
-    if !in_cells && displays(node, DisplayInside::TableCell) {
+/// Whether a box taller than a page that a walk does not enter may be
+/// sliced where it is, at any depth. Not past the bottom of an ancestor
+/// below the body that clips its overflow ([`clips_overflow`]): what is
+/// past the clip paints nothing, so it takes no page. `in_lines` is the
+/// walker's: it places a table row's cells and a flex or grid line's items
+/// side by side as a unit ([`LineState`]), so a box in a cell or an item
+/// slices as in block flow. The absolute-positioning pass places no lines:
+/// there a box in a table cell, or in a flex or grid item that shares its
+/// row ([`item_shares_its_row`]), is not sliced, as the items of a row
+/// share its height and one that continued on the next page would part
+/// from those beside it. Rows and cells count up to the root of the
+/// absolute or fixed subtree the box is in, which may be the box itself;
+/// clips up to the body.
+fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node, in_lines: bool) -> bool {
+    // A cell that spans rows ties them together, which the walker does not
+    // place as one unit yet: nothing in it is sliced.
+    let tied = |cell: &blitz_dom::Node| {
+        displays(cell, DisplayInside::TableCell) && (!in_lines || may_span_rows(cell))
+    };
+    if tied(node) {
         return false;
     }
     // The rows and cells are those of the flow the box is in, which ends at
@@ -6259,8 +6486,9 @@ fn slices_where_it_is(doc: &BaseDocument, node: &blitz_dom::Node, in_cells: bool
             .is_some_and(|el| el.name.local.as_ref() == "body");
         let layout = ancestor.final_layout;
         if (in_flow
-            && ((!in_cells && displays(ancestor, DisplayInside::TableCell))
-                || (crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
+            && (tied(ancestor)
+                || (!in_lines
+                    && crate::blitz_adapter::is_flex_or_grid_container_node(ancestor)
                     && item_shares_its_row(doc, ancestor, below))))
             || (!is_body && clips_overflow(ancestor) && bottom > layout.size.height + 0.5)
         {
@@ -7927,6 +8155,86 @@ mod tests {
         assert!((right[0].y.to_f32() - left[0].y.to_f32()).abs() < 0.5);
     }
 
+    /// The cells of a row that splits all start on the row's first page at
+    /// its top, without an explicit height to make them equal: the second
+    /// cell, one 30 px paragraph beside the first's eight, is placed beside
+    /// the first paragraph, not after the first cell ends three pages on.
+    /// It is stretched to the row's height, so it is cut at each page foot
+    /// and continues, empty, to the row's end.
+    #[test]
+    fn the_cells_of_a_row_split_at_the_page_foot_start_side_by_side() {
+        let paragraphs = (1..=8).map(|n| format!("<p>{n}</p>")).collect::<String>();
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 200px; }}
+              td {{ padding: 0; }}
+              p {{ margin: 0; height: 30px; }}
+            </style></head><body>
+              <table><tbody><tr>
+                <td id="left">{paragraphs}</td>
+                <td id="right"><p id="short">S</p></td>
+              </tr><tr><td id="after"><div style="height: 10px"></div></td><td></td></tr>
+              </tbody></table>
+            </body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let geometry = run_pass(&mut doc, 70.0);
+
+        let left = fragments_of(&doc, &geometry, "left");
+        assert_eq!(left.first().map(|f| f.0), Some(0));
+        assert_eq!(left.last().map(|f| f.0), Some(3), "{left:?}");
+        assert_eq!(fragments_of(&doc, &geometry, "short"), [(0, 0.0, 30.0)]);
+        assert_eq!(
+            fragments_of(&doc, &geometry, "right"),
+            [
+                (0, 0.0, 70.0),
+                (1, 0.0, 70.0),
+                (2, 0.0, 70.0),
+                (3, 0.0, 60.0)
+            ],
+            "the stretched cell is cut at each foot and runs to the row's end"
+        );
+        assert_eq!(placements(&doc, &geometry, "after"), [(3, 60.0)]);
+    }
+
+    /// A flex item stretched to its line's height by a taller neighbour,
+    /// whose own content fits the page, is cut at the page foot and goes on
+    /// as an empty fragment to the line's end, rather than run past the
+    /// foot as one fragment of the line's height. The line is 207 px on
+    /// 194 px pages: its first item splits, its 112 px block moving to the
+    /// next page, and the second item's paragraph fits the first.
+    #[test]
+    fn a_stretched_flex_item_whose_content_fits_is_cut_at_the_page_foot() {
+        let html = r#"<!doctype html><html><head><style>
+            html, body { margin: 0; padding: 0; font-family: 'Noto Sans'; }
+            p { margin: 0; }
+            </style></head><body><div id="row" style="display: flex">
+            <div id="tall" style="flex: 1 1 0"><div><div style="height: 91px"></div>
+            <div id="block" style="border: 2px solid; height: 112px"></div></div></div>
+            <div id="short" style="flex: 1 1 0"><p id="lines" style="padding: 2px;
+            border: 4px solid; line-height: 20px">1<br>2<br>3<br>4<br>5</p></div>
+            </div></body></html>"#;
+        let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
+        let (mut doc, _, _) =
+            blitz_adapter::parse_html_with_local_resources(html, 200.0, 10000, &fonts, false, None);
+        blitz_adapter::resolve(&mut doc);
+        let geometry = run_pass(doc.deref_mut(), 194.0);
+
+        assert_eq!(placements(&doc, &geometry, "block"), [(1, 0.0)]);
+        assert_eq!(fragments_of(&doc, &geometry, "lines"), [(0, 0.0, 112.0)]);
+        assert_eq!(
+            fragments_of(&doc, &geometry, "short"),
+            [(0, 0.0, 194.0), (1, 0.0, 116.0)],
+            "cut at the foot, then on to the line's end"
+        );
+        assert_eq!(
+            fragments_of(&doc, &geometry, "row"),
+            [(0, 0.0, 194.0), (1, 0.0, 116.0)]
+        );
+    }
+
     /// A table on 100 px pages whose cells are padded 10 px above and below,
     /// under `head`, after the rows `before`: a row of the cell `cell`
     /// holding ten 20 px blocks `d1` to `d10`, then, when `side`, the cell
@@ -8290,10 +8598,13 @@ mod tests {
         let row1 = &geometry[&row1_id].fragments[0];
         let row2 = &geometry[&row2_id].fragments[0];
 
+        // The 90 px row is sliced at the foot of its 80 px strip and ends
+        // 10 px down the next page, under the repeated header.
         assert_eq!(row1.page_index, 0);
         assert!((row1.y.to_f32() - 20.0).abs() < 0.5);
+        assert_eq!(geometry[&row1_id].fragments.len(), 2);
         assert_eq!(row2.page_index, 1);
-        assert!((row2.y.to_f32() - 20.0).abs() < 0.5);
+        assert!((row2.y.to_f32() - 30.0).abs() < 0.5);
         assert_eq!(
             geometry[&header_id]
                 .fragments
@@ -10603,13 +10914,12 @@ h2 { string-set: chapter-title content(text); }
             .map(|f| (f.height.to_f32(), f.x.to_f32(), f.y.to_f32()))
             .collect();
         page_one_cells.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let unshifted = page_one_cells
-            .iter()
-            .find(|(h, _, _)| (*h - 100.0).abs() < 0.5)
-            .expect("expected unshifted second-row grid cell on page 1");
-        assert!(
-            (unshifted.2 + 20.0).abs() < 0.5,
-            "same-row sibling must preserve its cross-axis offset relative to the split row; got {page_one_cells:?}"
+        // The line moves whole: its top at the page top, the grid cell 20 px
+        // below it still 20 px below.
+        assert_eq!(
+            page_one_cells,
+            [(80.0, 0.0, 20.0), (100.0, 100.0, 0.0)],
+            "same-row sibling must preserve its cross-axis offset relative to the line"
         );
     }
 
@@ -10639,13 +10949,12 @@ h2 { string-set: chapter-title content(text); }
             .map(|f| (f.height.to_f32(), f.x.to_f32(), f.y.to_f32()))
             .collect();
         page_one_cells.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let unshifted = page_one_cells
-            .iter()
-            .find(|(h, _, _)| (*h - 100.0).abs() < 0.5)
-            .expect("expected unshifted second-row flex item on page 1");
-        assert!(
-            (unshifted.2 + 20.0).abs() < 0.5,
-            "same-row sibling must preserve its cross-axis offset relative to the split row; got {page_one_cells:?}"
+        // The line moves whole: its top at the page top, the flex item 20 px
+        // below it still 20 px below.
+        assert_eq!(
+            page_one_cells,
+            [(80.0, 0.0, 20.0), (100.0, 100.0, 0.0)],
+            "same-row sibling must preserve its cross-axis offset relative to the line"
         );
     }
 
@@ -12129,10 +12438,11 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
-    /// A flex body's item taller than a page is not sliced, as a nested flex
-    /// container's is not: the items of a row share its height.
+    /// A flex body's item taller than a page is sliced, as a nested flex
+    /// container's is: the walk places the line's items side by side from
+    /// its start, so the item beside it stays on the first page.
     #[test]
-    fn a_tall_item_of_a_flex_body_is_not_sliced() {
+    fn a_tall_item_of_a_flex_body_is_sliced() {
         let html = r#"
             <html><body style="margin: 0; padding: 0; display: flex">
               <div id="a" style="flex: 1; height: 250px"></div>
@@ -12141,8 +12451,11 @@ h2 { string-set: chapter-title content(text); }
         "#;
         let mut doc = parse(html, 600.0);
         let geom = run_pass(doc.deref_mut(), 100.0);
-        let a = &geom[&find_by_id(&doc, "a").unwrap()].fragments;
-        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(
+            fragments_of(&doc, &geom, "a"),
+            [(0, 0.0, 100.0), (1, 0.0, 100.0), (2, 0.0, 50.0)]
+        );
+        assert_eq!(fragments_of(&doc, &geom, "b"), [(0, 0.0, 50.0)]);
     }
 
     /// A forced break keeps the top margin of the child after it at the body

@@ -5,8 +5,8 @@ html[1]/body[1]/div#flex[3]/div#f1[1] page=1 x=0.00 y=0.00 w=100.00 h=60.00
 html[1]/body[1]/div#flex[3]/div#f2[3] page=1 x=100.00 y=0.00 w=100.00 h=60.00
 html[1]/body[1]/div#grid[5] page=1 x=0.00 y=60.00 w=200.00 h=40.00
 html[1]/body[1]/div#grid[5] page=2 x=0.00 y=0.00 w=200.00 h=90.00
-html[1]/body[1]/div#grid[5]/div#g1[1] page=1 x=0.00 y=60.00 w=100.00 h=30.00
-html[1]/body[1]/div#grid[5]/div#g1[1] page=2 x=0.00 y=0.00 w=100.00 h=30.00
+html[1]/body[1]/div#grid[5]/div#g1[1] page=1 x=0.00 y=60.00 w=100.00 h=40.00
+html[1]/body[1]/div#grid[5]/div#g1[1] page=2 x=0.00 y=0.00 w=100.00 h=40.00
 html[1]/body[1]/div#grid[5]/div#g1[1]/div[0] page=1 x=0.00 y=60.00 w=100.00 h=30.00
 html[1]/body[1]/div#grid[5]/div#g1[1]/div[1] page=2 x=0.00 y=0.00 w=100.00 h=30.00
 html[1]/body[1]/div#grid[5]/div#g2[3] page=1 x=100.00 y=60.00 w=100.00 h=40.00
