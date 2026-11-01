@@ -5315,6 +5315,7 @@ fn record_subtree_fragments_at_offset(
                     *emitted += 1;
                 }
                 descendant_total_pages = descendant_total_pages.max(last_page.saturating_add(1));
+                sliced.reached = sliced.reached.max(last_page.saturating_add(1));
             }
         }
 
@@ -5521,12 +5522,13 @@ fn record_subtree_fragments_at_offset(
     walk_within(geometry, emitted, total_pages, &mut sliced);
     // The slices of a box block flow would slice take pages past the flow's,
     // as block flow's slices do, and the subtree around them reaches those
-    // pages too: walk it again with them in the budget. Each node then emits
-    // on at least the pages it did, so every entry of the first walk is
-    // rewritten.
+    // pages too: walk it again with them in the budget, and with the pages
+    // the boxes past the flow's pages reached, which now start within it.
+    // Each node then emits on at least the pages it did, so every entry of
+    // the first walk is rewritten.
     if !may_extend_pages && sliced.pages > total_pages {
         *emitted = emitted_before;
-        let budget = sliced.pages;
+        let budget = sliced.pages.max(sliced.reached);
         sliced = SlicedBoxes::default();
         walk_within(geometry, emitted, budget, &mut sliced);
     }
@@ -5556,11 +5558,13 @@ fn record_subtree_fragments_at_offset(
 }
 
 /// The boxes the walk of an absolute subtree sliced
-/// ([`is_monolithic_in_absolute_subtree`]), and the number of pages their
-/// slices reach, budget or not.
+/// ([`is_monolithic_in_absolute_subtree`]), the number of pages their
+/// slices reach, budget or not, and the number of pages the fragments the
+/// walk emitted reach.
 #[derive(Default)]
 struct SlicedBoxes {
     pages: u32,
+    reached: u32,
     boxes: Vec<usize>,
 }
 
@@ -9402,7 +9406,8 @@ h2 { string-set: chapter-title content(text); }
 
     /// The slices of a tall box in an absolute subtree take pages past the
     /// flow's, as block flow's do, and the subtree around them reaches
-    /// those pages too: none is left blank.
+    /// those pages too: none is left blank. A box after them that extends
+    /// the pages further keeps the pages it reaches.
     #[test]
     fn a_sliced_box_in_an_absolute_subtree_extends_the_pages_of_the_flow() {
         let (doc, geom) = absolute_pass(
@@ -9410,13 +9415,14 @@ h2 { string-set: chapter-title content(text); }
               <p style="margin: 0">in flow</p>
               <div id="root" style="position: absolute; top: 0; width: 100%">
                 <div id="tall" style="contain: size; width: 50px; height: 250px"></div>
-                <p id="after" style="margin: 0">after</p>
+                <div id="plain" style="width: 50px; height: 300px"></div>
               </div>
             </body></html>"#,
             1,
         );
         assert_eq!(pages_of(&doc, &geom, "tall"), [0, 1, 2]);
-        assert_eq!(pages_of(&doc, &geom, "root"), [0, 1, 2]);
+        assert_eq!(pages_of(&doc, &geom, "plain"), [2, 3, 4, 5]);
+        assert_eq!(pages_of(&doc, &geom, "root"), [0, 1, 2, 3, 4, 5]);
     }
 
     /// A table cell is no place block flow slices a box, in an absolute
