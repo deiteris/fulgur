@@ -272,15 +272,21 @@ impl Point2 {
     }
 }
 
+/// `break-before` as it concerns pages (CSS Fragmentation 3 §3.1):
+/// `auto`, `avoid` (`avoid`, `avoid-page`), or a forced page break (`page`,
+/// `always`, and the sides). The column values are no page break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakBefore {
     Auto,
+    Avoid,
     Page,
 }
 
+/// `break-after`, as [`BreakBefore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakAfter {
     Auto,
+    Avoid,
     Page,
 }
 

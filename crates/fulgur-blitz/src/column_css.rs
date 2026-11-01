@@ -608,6 +608,11 @@ fn break_side(value: &str) -> Option<PageSide> {
     }
 }
 
+/// Parse the value side of `break-after` or `page-break-after`: a forced
+/// page break with its side, `avoid` and `avoid-page` as
+/// [`BreakAfter::Avoid`], and `auto`, `column`, and `avoid-column`, which
+/// concern no page break, as [`BreakAfter::Auto`]. Any other value drops
+/// the declaration.
 fn parse_break_after_value<'i>(
     input: &mut Parser<'i, '_>,
 ) -> Result<(BreakAfter, Option<PageSide>), ParseError<'i, ()>> {
@@ -616,11 +621,14 @@ fn parse_break_after_value<'i>(
         value @ ("always" | "page" | "left" | "right" | "recto" | "verso") => {
             Ok((BreakAfter::Page, break_side(value)))
         }
-        "auto" => Ok((BreakAfter::Auto, None)),
+        "avoid" | "avoid-page" => Ok((BreakAfter::Avoid, None)),
+        "auto" | "column" | "avoid-column" => Ok((BreakAfter::Auto, None)),
         _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
 }
 
+/// Parse the value side of `break-before` or `page-break-before`, as
+/// [`parse_break_after_value`].
 fn parse_break_before_value<'i>(
     input: &mut Parser<'i, '_>,
 ) -> Result<(BreakBefore, Option<PageSide>), ParseError<'i, ()>> {
@@ -629,7 +637,8 @@ fn parse_break_before_value<'i>(
         value @ ("always" | "page" | "left" | "right" | "recto" | "verso") => {
             Ok((BreakBefore::Page, break_side(value)))
         }
-        "auto" => Ok((BreakBefore::Auto, None)),
+        "avoid" | "avoid-page" => Ok((BreakBefore::Avoid, None)),
+        "auto" | "column" | "avoid-column" => Ok((BreakBefore::Auto, None)),
         _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
     }
 }
@@ -2004,6 +2013,30 @@ mod tests {
     fn parse_break_after_via_selector() {
         let rules = parse_stylesheet(".forced { break-after: page; }");
         assert_eq!(rules[0].props.break_after, Some(BreakAfter::Page));
+    }
+
+    /// `avoid` and `avoid-page` avoid a page break before or after a box,
+    /// in either spelling; `column` and `avoid-column` concern no page break.
+    #[test]
+    fn parse_break_after_and_before_read_avoid_and_the_column_values() {
+        for (value, expected) in [
+            ("avoid", BreakAfter::Avoid),
+            ("avoid-page", BreakAfter::Avoid),
+            ("column", BreakAfter::Auto),
+            ("avoid-column", BreakAfter::Auto),
+        ] {
+            let after = parse_inline_style(&format!("break-after: {value}"));
+            assert_eq!(after.break_after, Some(expected), "{value}");
+            assert_eq!(after.break_after_side, None, "{value}");
+            let before = parse_inline_style(&format!("page-break-before: {value}"));
+            let expected_before = match expected {
+                BreakAfter::Avoid => BreakBefore::Avoid,
+                _ => BreakBefore::Auto,
+            };
+            assert_eq!(before.break_before, Some(expected_before), "{value}");
+        }
+        let rules = parse_stylesheet("h2 { page-break-after: avoid }");
+        assert_eq!(rules[0].props.break_after, Some(BreakAfter::Avoid));
     }
 
     // -------- break-before / page-break-before --------
