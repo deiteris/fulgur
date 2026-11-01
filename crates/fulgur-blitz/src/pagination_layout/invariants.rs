@@ -344,6 +344,8 @@ struct Info {
     repeated_edge: f32,
     /// The rows a table cell spans.
     rowspan: usize,
+    /// The top margin.
+    margin_top: f32,
     /// The bottom margin.
     margin_bottom: f32,
     /// The bottom padding and border.
@@ -443,6 +445,7 @@ impl Case {
             lines,
             repeated_edge: 0.0,
             rowspan: 1,
+            margin_top: 0.0,
             margin_bottom: 0.0,
             bottom_edge: 0.0,
         });
@@ -455,6 +458,7 @@ impl Case {
     /// Record the edges `style` gives the box `b`.
     fn edges(&mut self, b: usize, style: &BoxStyle) {
         let info = &mut self.boxes[b];
+        info.margin_top = f32::from(style.margin_top);
         info.margin_bottom = f32::from(style.margin_bottom);
         info.bottom_edge = f32::from(style.padding) + f32::from(style.border);
     }
@@ -642,15 +646,22 @@ struct Violation {
     box_id: String,
     /// The page the violation is on; `None` for a box placed nowhere.
     page: Option<u32>,
+    /// By how many px a box's fragments add up past (or short of) its
+    /// height, so that the golden fails when it grows.
+    amount: Option<f32>,
     /// What broke, for a reader.
     what: String,
 }
 
 impl Violation {
-    /// What the golden compares: the invariant, the box, and the page.
+    /// What the golden compares: the invariant, the box, the page, and the
+    /// amount to the px, signed, where there is one.
     fn key(&self) -> String {
         let page = self.page.map_or_else(|| "-".to_string(), |p| p.to_string());
-        format!("{:?} {} {page}", self.invariant, self.box_id)
+        let amount = self
+            .amount
+            .map_or_else(String::new, |amount| format!(" {amount:+.0}px"));
+        format!("{:?} {} {page}{amount}", self.invariant, self.box_id)
     }
 }
 
@@ -724,6 +735,10 @@ struct Placed<'a> {
     fragments: Vec<Vec<Fragment>>,
     line_boundaries: Vec<Vec<usize>>,
     layout_height: Vec<f32>,
+    /// Each table cell's height down to its content's end as laid out,
+    /// before its row stretches it: its children's margin boxes and its
+    /// bottom edge. Zero for every other box.
+    natural_height: Vec<f32>,
     /// The pages on which each box's fragment ends past the page foot.
     past: Vec<BTreeSet<u32>>,
 }
@@ -828,7 +843,7 @@ impl Placed<'_> {
 
     /// Where the content of `b`'s fragment `k` ends: its fragment's end as
     /// [`Self::counted_bottom`] counts it, a paragraph's padding and border
-    /// added, which its fragments, measured by its lines, leave out (its
+    /// added where its fragments, measured by its lines, leave them out (its
     /// top edge on its first fragment, its bottom edge on its last), and a
     /// container's lowest child on its page below it, with the container's
     /// bottom edge on its last fragment; a float in a block that is no
@@ -839,6 +854,11 @@ impl Placed<'_> {
         let own = self.counted_bottom(b, k);
         let last = k + 1 == frags.len();
         if info.kind == Kind::Para {
+            // A paragraph placed by its lines has fragments that add up to
+            // its lines alone; one placed as a whole box, to its height.
+            if self.excess(b).abs() <= EPS * frags.len() as f32 {
+                return own;
+            }
             let top = if k == 0 { info.bottom_edge } else { 0.0 };
             let bottom = if last { info.bottom_edge } else { 0.0 };
             return own + top + bottom;
@@ -904,6 +924,63 @@ impl Placed<'_> {
         }
     }
 
+    /// How far the split table cell `b`'s fragments add up past its height
+    /// as laid out down to its content ([`Placed::natural_height`]; a split
+    /// cell's line, not the cell, carries the row's stretch). Each fragment
+    /// holding content counts down to its content ([`Self::children_end`]),
+    /// the last one its bottom edge too; what of that content's margin and
+    /// edge runs past the last one's end counts in the fragments after it,
+    /// as far as they reach.
+    fn split_cell_excess(&self, b: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        let frags = &self.fragments[b];
+        let with_content: Vec<(usize, f32, f32, f32)> = frags
+            .iter()
+            .enumerate()
+            .filter_map(|(k, f)| {
+                let (top, bottom) = (f.y.to_f32(), f.y.to_f32() + f.height.to_f32());
+                let end = self.children_end(b, f.page_index)?.max(top);
+                Some((k, top, bottom, end))
+            })
+            .collect();
+        let Some(&(last, _, last_bottom, last_end)) = with_content.last() else {
+            return -self.natural_height[b];
+        };
+        let content: f32 = with_content
+            .iter()
+            .map(|&(_, top, bottom, end)| end.min(bottom) - top)
+            .sum();
+        let edge_end = last_end + info.bottom_edge;
+        let on_last = edge_end.min(last_bottom) - last_end.min(last_bottom);
+        let later: f32 = frags[last + 1..].iter().map(|f| f.height.to_f32()).sum();
+        let spilled = (edge_end - last_bottom).max(0.0).min(later);
+        content + on_last + spilled - self.natural_height[b]
+    }
+
+    /// How far the container `b`'s fragments add up past its height. A
+    /// split cell repeats its top edge by design (`fragment_table_cell`)
+    /// above its content on each page it continues its content on, so its
+    /// fragments add up to its height and those repeats
+    /// ([`Self::split_cell_excess`]); short of that, it lost an edge or a
+    /// margin.
+    fn placed_excess(&self, b: usize) -> f32 {
+        let info = &self.case.boxes[b];
+        if info.kind == Kind::BodyCell && self.fragments[b].len() > 1 {
+            let repeated = info.repeated_edge * self.content_pages(b).saturating_sub(1) as f32;
+            self.split_cell_excess(b) - repeated
+        } else {
+            self.container_excess(b)
+        }
+    }
+
+    /// The fragments of `b` whose page holds a fragment of a child of it.
+    fn content_pages(&self, b: usize) -> usize {
+        self.fragments[b]
+            .iter()
+            .filter(|f| self.children_end(b, f.page_index).is_some())
+            .count()
+    }
+
     /// How far `b`'s fragments add up past its layout height.
     fn excess(&self, b: usize) -> f32 {
         let total: f32 = self.fragments[b].iter().map(|f| f.height.to_f32()).sum();
@@ -955,13 +1032,23 @@ impl Placed<'_> {
     }
 
     /// The height the header rows `header` of the table `table` repeat on
-    /// the pages after its first: each page of the table they are on
-    /// carries their band once. A header placed twice on one page repeats
-    /// on it once.
+    /// the pages after its first, with the table's top edge above them:
+    /// each page of the table they are on carries their band once. A header
+    /// placed twice on one page repeats on it once.
     fn repeated_band(&self, table: usize, header: &[usize]) -> f32 {
         let table_pages: BTreeSet<u32> =
             self.fragments[table].iter().map(|f| f.page_index).collect();
-        header
+        // The band repeats from the table's top edge down
+        // (`repeating_table_header`, `band_height_px`), so the edge repeats
+        // with it on each page after the first a header is placed on.
+        let band_pages: BTreeSet<u32> = header
+            .iter()
+            .flat_map(|&row| &self.case.boxes[row].children)
+            .flat_map(|&c| self.fragments[c].iter().map(|f| f.page_index))
+            .filter(|page| table_pages.contains(page))
+            .collect();
+        let edge = self.case.boxes[table].bottom_edge * band_pages.len().saturating_sub(1) as f32;
+        edge + header
             .iter()
             .map(|&row| {
                 let cells = &self.case.boxes[row].children;
@@ -976,7 +1063,7 @@ impl Placed<'_> {
                     .fold(0.0_f32, f32::max);
                 pages.len().saturating_sub(1) as f32 * height
             })
-            .sum()
+            .sum::<f32>()
     }
 
     /// How much taller than the tallest of its boxes' layouts the line of
@@ -1046,17 +1133,24 @@ impl Placed<'_> {
         if !container || (!in_line && (k + 1 == frags.len() || bottom < self.page_height - EPS)) {
             return bottom;
         }
-        let content = enclosed(self.case, b)
-            .iter()
-            .flat_map(|&c| {
-                self.fragments[c]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, cf)| cf.page_index == f.page_index)
-                    .map(move |(ck, _)| (c, ck))
-            })
-            .map(|(c, ck)| self.counted_bottom(c, ck).min(bottom))
-            .fold(top, f32::max);
+        let content = if in_line {
+            // A split cell or item ends its content where its children's do,
+            // their edges and its last child's bottom margin included.
+            self.children_end(b, f.page_index)
+                .map_or(top, |end| end.min(bottom).max(top))
+        } else {
+            enclosed(self.case, b)
+                .iter()
+                .flat_map(|&c| {
+                    self.fragments[c]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, cf)| cf.page_index == f.page_index)
+                        .map(move |(ck, _)| (c, ck))
+                })
+                .map(|(c, ck)| self.counted_bottom(c, ck).min(bottom))
+                .fold(top, f32::max)
+        };
         if in_line && k + 1 == frags.len() {
             (content + self.case.boxes[b].repeated_edge).min(bottom)
         } else {
@@ -1096,20 +1190,58 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 .collect()
         })
         .collect();
-    let placed = Placed {
+    let mut placed = Placed {
         case,
         page_height,
         fragments,
         line_boundaries,
         layout_height,
+        natural_height: vec![0.0; case.boxes.len()],
         past,
     };
+    placed.natural_height = (0..case.boxes.len())
+        .map(|b| {
+            let info = &case.boxes[b];
+            if info.kind != Kind::BodyCell {
+                return 0.0;
+            }
+            let last = info
+                .children
+                .iter()
+                .rev()
+                .find(|&&c| case.boxes[c].kind != Kind::Float);
+            // A first child that starts on a later page than the cell has
+            // its top margin truncated at the break (css-break-3 §5.2).
+            let first_page = placed.fragments[b].first().map(|f| f.page_index);
+            let truncated = info
+                .children
+                .iter()
+                .find(|&&c| case.boxes[c].kind != Kind::Float)
+                .filter(|&&c| placed.fragments[c].first().map(|f| f.page_index) != first_page)
+                .map_or(0.0, |&c| case.boxes[c].margin_top);
+            info.children
+                .iter()
+                .filter_map(|&c| {
+                    let layout = &doc.get_node(ids[c]?)?.final_layout;
+                    let margin = if Some(&c) == last {
+                        placed.margin_through(c)
+                    } else {
+                        0.0
+                    };
+                    Some(layout.location.y + layout.size.height + margin)
+                })
+                .fold(info.repeated_edge, f32::max)
+                + info.bottom_edge
+                - truncated
+        })
+        .collect();
     let mut out = Vec::new();
-    let mut push = |invariant, b: usize, page: Option<u32>, what: String| {
+    let mut push = |invariant, b: usize, page: Option<u32>, amount: Option<f32>, what: String| {
         out.push(Violation {
             invariant,
             box_id: case.boxes[b].id.clone(),
             page,
+            amount,
             what,
         });
     };
@@ -1124,6 +1256,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::PastFoot,
                 b,
                 Some(page),
+                None,
                 format!("{} ({:?}) ends past the page foot", info.id, info.kind),
             );
         }
@@ -1134,6 +1267,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::PlacedOnce,
                 b,
                 Some(f.page_index),
+                None,
                 format!("{} starts above the page top, at {}", info.id, f.y.to_f32()),
             );
         }
@@ -1149,6 +1283,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::PlacedOnce,
                 b,
                 None,
+                None,
                 format!("{} ({:?}) is not placed", info.id, info.kind),
             );
         }
@@ -1162,6 +1297,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pair[1]),
+                        None,
                         format!("{} is placed twice or out of order: {pages:?}", info.id),
                     );
                 } else if pair[1] > pair[0] + 1 {
@@ -1169,6 +1305,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pair[0] + 1),
+                        None,
                         format!("{} skips a page: {pages:?}", info.id),
                     );
                 }
@@ -1182,6 +1319,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pages[0]),
+                        Some(excess),
                         format!(
                             "{}'s fragments add up to {excess} px more than its height",
                             info.id
@@ -1204,6 +1342,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::PlacedOnce,
                         b,
                         Some(pages[0]),
+                        None,
                         format!(
                             "{} partitions {} lines as {boundaries:?} over {} fragments",
                             info.id,
@@ -1214,23 +1353,34 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 }
             }
             Kind::Block | Kind::Table | Kind::BodyCell | Kind::Flex | Kind::Item
-                if placed.container_excess(b) > EPS * frags.len().max(1) as f32 =>
+                if !frags.is_empty() =>
             {
-                // A cell's top padding, as it repeats on each page the cell
-                // continues on, for whoever reads the case.
-                let repeated = info.repeated_edge * frags.len().saturating_sub(1) as f32;
-                push(
-                    Invariant::PlacedOnce,
-                    b,
-                    Some(pages[0]),
-                    format!(
-                        "{} ({:?})'s fragments add up to {} px more than its height \
-                         (its top padding on the pages it continues on: {repeated} px)",
-                        info.id,
-                        info.kind,
-                        placed.container_excess(b)
-                    ),
-                );
+                let repeated =
+                    info.repeated_edge * placed.content_pages(b).saturating_sub(1) as f32;
+                let excess = placed.placed_excess(b);
+                let tolerance = EPS * frags.len() as f32;
+                if excess > tolerance || (info.kind == Kind::BodyCell && excess < -tolerance) {
+                    // Where a split cell's last fragment ends against its
+                    // content, margin, and bottom edge, for whoever reads it.
+                    let last = frags.len() - 1;
+                    let end = placed
+                        .children_end(b, frags[last].page_index)
+                        .map_or(0.0, |end| end + info.bottom_edge);
+                    let bottom = frags[last].y.to_f32() + frags[last].height.to_f32();
+                    push(
+                        Invariant::PlacedOnce,
+                        b,
+                        Some(pages[0]),
+                        Some(excess),
+                        format!(
+                            "{} ({:?})'s fragments add up to {excess} px past its height \
+                             and the {repeated} px of top edge it repeats; its last \
+                             fragment ends at {bottom} on page {}, its content with its \
+                             bottom edge at {end}",
+                            info.id, info.kind, frags[last].page_index
+                        ),
+                    );
+                }
             }
             _ => {}
         }
@@ -1264,6 +1414,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                     Invariant::DocumentOrder,
                     c,
                     Some(first.page_index),
+                    None,
                     format!(
                         "{} starts at {c_start:?}, before {} ends at {a_end:?}",
                         case.boxes[c].id, case.boxes[a].id
@@ -1303,6 +1454,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                         Invariant::DocumentOrder,
                         pair[1],
                         Some(c_start.0),
+                        None,
                         format!(
                             "row {} starts at {c_start:?}, before row {} ends at {a_end:?}",
                             case.boxes[pair[1]].id, case.boxes[pair[0]].id
@@ -1336,6 +1488,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                     Invariant::Encloses,
                     child,
                     Some(cf.page_index),
+                    None,
                     format!(
                         "{} ({:?}) at y {} h {} is outside {} ({:?})",
                         case.boxes[child].id,
@@ -1363,6 +1516,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
                 Invariant::HeaderAlone,
                 *table,
                 Some(page),
+                None,
                 format!("{}'s header is alone", case.boxes[*table].id),
             );
         }
@@ -1370,7 +1524,7 @@ fn check(case: &Case, page_height: f32) -> Vec<Violation> {
 
     // A line's item stretched to the line ends with it on each page.
     for (item, page, what) in placed.past_line_end() {
-        push(Invariant::EndsWithLine, item, Some(page), what);
+        push(Invariant::EndsWithLine, item, Some(page), None, what);
     }
     out
 }
@@ -1545,6 +1699,7 @@ fn an_item_stretched_past_its_line_s_end_is_flagged() {
             fragments,
             line_boundaries: vec![Vec::new(); case.boxes.len()],
             layout_height: vec![150.0, 150.0, 150.0, 150.0, 30.0],
+            natural_height: vec![0.0; case.boxes.len()],
             past: vec![BTreeSet::new(); case.boxes.len()],
         }
         .past_line_end()
@@ -1589,6 +1744,7 @@ fn flagged_items(
         fragments,
         line_boundaries: vec![Vec::new(); case.boxes.len()],
         layout_height: vec![0.0; case.boxes.len()],
+        natural_height: vec![0.0; case.boxes.len()],
         past: vec![BTreeSet::new(); case.boxes.len()],
     }
     .past_line_end()
@@ -1774,6 +1930,96 @@ fn a_split_paragraph_s_top_edge_stays_on_its_first_page() {
     assert_eq!(flagged_items(&case, 100.0, fragments), [(1, 1), (3, 1)]);
 }
 
+/// A split cell repeats its top edge above its content on each page it
+/// continues on by design, and ends below its bottom edge: its fragments
+/// then add up to no excess, and one that ends without its bottom edge
+/// falls that much short. A 150 px leaf in a cell padded 10 px, split on
+/// 100 px pages.
+#[test]
+fn a_split_cell_counts_its_repeated_top_edge_and_its_lost_bottom_edge() {
+    let case = Case::new(&[Gen::Table {
+        style: BoxStyle::default(),
+        head: Head::None,
+        caption: false,
+        counts: None,
+        row_counts: None,
+        cell_padding: 10,
+        rows: vec![(
+            false,
+            vec![Gen::Leaf {
+                style: BoxStyle::default(),
+                height: 150,
+            }],
+        )],
+        span: None,
+    }]);
+    // b0 the table, b1 the row, b2 the cell, b3 its leaf.
+    let excess = |last_cell: f32| {
+        let mut fragments = vec![Vec::new(); case.boxes.len()];
+        fragments[2] = vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, last_cell)];
+        fragments[3] = vec![fragment(0, 10.0, 90.0), fragment(1, 10.0, 60.0)];
+        let mut natural_height = vec![0.0; case.boxes.len()];
+        natural_height[2] = 170.0;
+        Placed {
+            case: &case,
+            page_height: 100.0,
+            fragments,
+            line_boundaries: vec![Vec::new(); case.boxes.len()],
+            layout_height: vec![170.0; case.boxes.len()],
+            natural_height,
+            past: vec![BTreeSet::new(); case.boxes.len()],
+        }
+        .placed_excess(2)
+    };
+    assert!(excess(80.0).abs() < EPS, "{}", excess(80.0));
+    assert!((excess(70.0) + 10.0).abs() < EPS, "{}", excess(70.0));
+}
+
+/// A table's repeated header band reaches up to its top edge, which
+/// repeats with it on each page after the first: a 120 px leaf in a table
+/// padded 5 px under a 20 px header, split on 100 px pages, adds up to no
+/// excess.
+#[test]
+fn a_repeated_header_band_carries_the_table_s_top_edge() {
+    let case = Case::new(&[Gen::Table {
+        style: BoxStyle {
+            padding: 5,
+            ..BoxStyle::default()
+        },
+        head: Head::Plain,
+        caption: false,
+        counts: None,
+        row_counts: None,
+        cell_padding: 0,
+        rows: vec![(
+            false,
+            vec![Gen::Leaf {
+                style: BoxStyle::default(),
+                height: 120,
+            }],
+        )],
+        span: None,
+    }]);
+    // b0 the table, b1 the header row, b2 its cell, b3 the body row, b4
+    // its cell, b5 the leaf.
+    let mut fragments = vec![Vec::new(); case.boxes.len()];
+    fragments[0] = vec![fragment(0, 0.0, 100.0), fragment(1, 0.0, 75.0)];
+    fragments[2] = vec![fragment(0, 5.0, 20.0), fragment(1, 5.0, 20.0)];
+    fragments[4] = vec![fragment(0, 25.0, 75.0), fragment(1, 25.0, 45.0)];
+    fragments[5] = fragments[4].clone();
+    let excess = Placed {
+        case: &case,
+        page_height: 100.0,
+        fragments,
+        line_boundaries: vec![Vec::new(); case.boxes.len()],
+        layout_height: vec![150.0, 0.0, 20.0, 0.0, 120.0, 120.0],
+        natural_height: vec![0.0; case.boxes.len()],
+        past: vec![BTreeSet::new(); case.boxes.len()],
+    }
+    .container_excess(0);
+    assert!(excess.abs() < EPS, "{excess}");
+}
+
 /// A table's repeated header is counted once a page, however many times it
 /// is placed there: a header doubled on the table's second page leaves the
 /// table's excess one band past its repeat, as a placement the checks flag.
@@ -1810,6 +2056,7 @@ fn a_header_placed_twice_on_one_page_is_counted_once() {
             fragments,
             line_boundaries: vec![Vec::new(); case.boxes.len()],
             layout_height,
+            natural_height: vec![0.0; case.boxes.len()],
             past: vec![BTreeSet::new(); case.boxes.len()],
         }
         .container_excess(0)
