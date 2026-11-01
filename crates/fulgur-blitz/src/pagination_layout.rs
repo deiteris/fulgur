@@ -3385,6 +3385,22 @@ fn fragment_block_subtree_inner(
     for (number, line) in lines.iter().enumerate() {
         line_at[line[0]] = Some(number);
     }
+    // The opportunities a forced `break-after` of the line before takes
+    // part in: those break whether or not the page holds content, as the box
+    // before asks for the break itself (an empty one included); a forced
+    // `break-before` alone makes no page that would hold nothing.
+    let mut after_forces = vec![false; walk_children.len()];
+    for pair in lines.windows(2) {
+        after_forces[pair[1][0]] = line_break(
+            flow,
+            &walk_children,
+            &pair[0],
+            true,
+            page_height_px,
+            depth + 1,
+        )
+        .is_forced();
+    }
     let block_flow =
         children_override.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
     for (index, (&child_id, &opportunity)) in walk_children.iter().zip(&opportunities).enumerate() {
@@ -3561,7 +3577,7 @@ fn fragment_block_subtree_inner(
             // after Blitz's intrinsic-size collapse, and its
             // `break-before: page` still takes effect
             // (`tests/pseudo_only_break_before.rs`).
-            if opportunity.is_forced() && !cursor.at_page_top() {
+            if opportunity.is_forced() && (after_forces[index] || !cursor.at_page_top()) {
                 cursor.close_parent(geometry, ParentHeight::Placed);
                 cursor.break_to(doc, opportunity.side());
                 // Zero-height break-before: this child IS the first
@@ -3614,11 +3630,12 @@ fn fragment_block_subtree_inner(
             cursor.page_start_y + (this_top_in_parent - cursor.page_taffy_origin);
 
         // A forced break before the child, when content precedes it on the
-        // page: the parent's fragment ends at the last content, the gap above
-        // the child not included. With nothing placed on the page yet, here
-        // or above, a break makes no empty page: a side break only moves on
-        // to its side.
-        if opportunity.is_forced() && !cursor.at_page_top() {
+        // page or the box before it forces it (`after_forces`): the parent's
+        // fragment ends at the last content, the gap above the child not
+        // included. A `break-before` with nothing placed on the page yet,
+        // here or above, makes no empty page: a side break only moves on to
+        // its side.
+        if opportunity.is_forced() && (after_forces[index] || !cursor.at_page_top()) {
             cursor.close_parent(geometry, ParentHeight::Placed);
             cursor.break_to(doc, opportunity.side());
             // The breaking child is the first in-flow child on the new page
@@ -11827,6 +11844,32 @@ h2 { string-set: chapter-title content(text); }
                 "{section}"
             );
         }
+    }
+
+    /// A `break-after` forces a break after an empty box too, with nothing
+    /// placed on the page: two empty blocks that each break after themselves
+    /// make two pages (WPT `css-break/overflowed-abs-pos-with-percentage-height-print`,
+    /// whose reference is such blocks, empty as laid out). A `break-before`
+    /// alone after an empty box at the page top makes no page. The breaks
+    /// were dropped while the page held no content: one page.
+    #[test]
+    fn a_break_after_an_empty_box_breaks_with_nothing_on_the_page() {
+        let pages = |body: &str| {
+            let html = format!(r#"<html><body style="margin: 0; padding: 0">{body}</body></html>"#);
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            super::implied_page_count(&geom)
+        };
+        assert_eq!(
+            pages(r#"<div style="break-after: page"></div><div style="break-after: page"></div>"#),
+            2
+        );
+        assert_eq!(
+            pages(r#"<div></div><div style="break-before: page"></div>"#),
+            1
+        );
     }
 
     /// A `break-after` and the next box's `break-before`, forced, are one
