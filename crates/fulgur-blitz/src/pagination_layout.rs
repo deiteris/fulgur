@@ -1116,7 +1116,33 @@ fn opportunities(
     page_height_px: f32,
     depth: usize,
 ) -> Vec<BreakValue> {
+    opportunities_and_forcing(
+        flow,
+        parent,
+        children,
+        suppress_page_names,
+        page_height_px,
+        depth,
+    )
+    .0
+}
+
+/// [`opportunities`], and whether the box before each forces its break: a
+/// forced `break-after` of the line before, or a change of used page name
+/// between the two. Such a break happens whether or not the page holds
+/// content, an empty box before it included (css-break-3 §3.1, CSS Page 3
+/// §5.3); a forced `break-before` alone makes no page that would hold
+/// nothing. A box `display: none` takes no part: it is no flow child.
+fn opportunities_and_forcing(
+    flow: Flow<'_>,
+    parent: &blitz_dom::Node,
+    children: &[usize],
+    suppress_page_names: bool,
+    page_height_px: f32,
+    depth: usize,
+) -> (Vec<BreakValue>, Vec<bool>) {
     let mut values = vec![BreakValue::Auto; children.len()];
+    let mut forcing = vec![false; children.len()];
     let mut previous_after: Option<BreakValue> = None;
     let mut previous_page: Option<Option<String>> = None;
     for line in flow_lines(flow, parent, children) {
@@ -1132,6 +1158,7 @@ fn opportunities(
                 ))
             })
             .unwrap_or_default();
+        forcing[line[0]] = previous_after.is_some_and(BreakValue::is_forced);
         for &index in &line {
             let id = children[index];
             if flow
@@ -1150,6 +1177,7 @@ fn opportunities(
                 && previous_page.as_ref().is_some_and(|page| *page != start)
             {
                 value = value.then(BreakValue::Forced(None));
+                forcing[line[0]] = true;
             }
             previous_page = Some(end);
         }
@@ -1163,7 +1191,7 @@ fn opportunities(
             depth,
         ));
     }
-    values
+    (values, forcing)
 }
 
 /// Whether a forced break opportunity lies inside `node`, between two of the
@@ -3367,8 +3395,12 @@ fn fragment_block_subtree_inner(
         .unwrap_or_else(|| walk_children_of(parent));
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
-    // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
-    let opportunities = opportunities(
+    // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3);
+    // and whether the box before it forces the break (`after_forces`), by its
+    // `break-after` or a page name: those break whether or not the page holds
+    // content; a forced `break-before` alone makes no page that would hold
+    // nothing.
+    let (opportunities, after_forces) = opportunities_and_forcing(
         flow,
         parent,
         &walk_children,
@@ -3384,22 +3416,6 @@ fn fragment_block_subtree_inner(
     let mut line_at = vec![None; walk_children.len()];
     for (number, line) in lines.iter().enumerate() {
         line_at[line[0]] = Some(number);
-    }
-    // The opportunities a forced `break-after` of the line before takes
-    // part in: those break whether or not the page holds content, as the box
-    // before asks for the break itself (an empty one included); a forced
-    // `break-before` alone makes no page that would hold nothing.
-    let mut after_forces = vec![false; walk_children.len()];
-    for pair in lines.windows(2) {
-        after_forces[pair[1][0]] = line_break(
-            flow,
-            &walk_children,
-            &pair[0],
-            true,
-            page_height_px,
-            depth + 1,
-        )
-        .is_forced();
     }
     let block_flow =
         children_override.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
@@ -11869,6 +11885,32 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(
             pages(r#"<div></div><div style="break-before: page"></div>"#),
             1
+        );
+    }
+
+    /// A change of used page name forces a break between two siblings
+    /// whether or not the page holds content, as a `break-after` does: an
+    /// empty box of its own page name between two others makes a page of its
+    /// own, and a `display: none` child is no box, so it leaves it empty (WPT
+    /// `css-page/page-name-display-none-child-print`, three pages as its
+    /// reference's two empty breaking blocks make). With the break after an
+    /// empty box forced by `break-after` only, the page-name break before
+    /// the last box waited for content: two pages.
+    #[test]
+    fn a_page_name_change_after_an_empty_box_breaks_with_nothing_on_the_page() {
+        let pages = |body: &str| {
+            let html = format!(r#"<html><body style="margin: 0; padding: 0">{body}</body></html>"#);
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            super::implied_page_count(&geom)
+        };
+        assert_eq!(
+            pages(
+                r#"<div style="page: a; height: 20px"></div><div style="page: c"><div style="display: none">c</div></div><div style="page: b; height: 20px"></div>"#
+            ),
+            3
         );
     }
 
