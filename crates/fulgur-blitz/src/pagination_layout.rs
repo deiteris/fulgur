@@ -479,6 +479,7 @@ impl<'a> PaginationLayoutTree<'a> {
             used_page_names: self.used_page_names.as_ref(),
             running_store: self.running_store,
             breaks: &breaks,
+            forced_before: None,
         };
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
         fragment_block_subtree_inner(
@@ -2661,6 +2662,15 @@ fn table_leading(
         };
         let rows_page = page_height_px - header.band_height_px;
         let inner = leading_extent(flow, row, room - band, rows_page, depth + 1);
+        let inner = orphan_rows(
+            flow,
+            table,
+            &header.body_cell_ids,
+            room - band,
+            rows_page,
+            depth,
+        )
+        .unwrap_or(inner);
         return Leading {
             extent: band + inner.extent,
             ..inner
@@ -2677,10 +2687,76 @@ fn table_leading(
         return Leading::whole(table.final_layout.size.height, room);
     };
     let inner = leading_extent(flow, row, room - top, page_height_px, depth + 1);
+    let inner = orphan_rows(
+        flow,
+        table,
+        &walk_children_of(table),
+        room - top,
+        page_height_px,
+        depth,
+    )
+    .unwrap_or(inner);
     Leading {
         extent: top + inner.extent,
         ..inner
     }
+}
+
+/// The leading unit of the rows of `table` among `cells`, its body's, from
+/// the first row's top with `room` px left below it, when the table's
+/// `orphans` keep more than one row start together ([`table_line_limits`]):
+/// its first `orphans` rows, the last of them by its own leading unit, or
+/// all its rows when it has no more. The unit is held together by
+/// `orphans` alone, so it is relaxed at a page top, and it is no taller
+/// than a page: a table whose rows that fit a page are fewer than its
+/// `orphans` moves on whole once, and breaks where it stands there.
+fn orphan_rows(
+    flow: Flow<'_>,
+    table: &blitz_dom::Node,
+    cells: &[usize],
+    room: f32,
+    page_height_px: f32,
+    depth: usize,
+) -> Option<Leading> {
+    let orphans = table_line_limits(flow.column_styles, table)?.orphans;
+    if orphans < 2 || depth >= crate::MAX_DOM_DEPTH {
+        return None;
+    }
+    let rows: Vec<Vec<&blitz_dom::Node>> = flow_lines(flow, table, cells)
+        .iter()
+        .map(|line| {
+            line.iter()
+                .filter_map(|&index| flow.doc.get_node(cells[index]))
+                .collect()
+        })
+        .collect();
+    let top_of = |row: &[&blitz_dom::Node]| {
+        row.iter()
+            .map(|cell| cell.final_layout.location.y)
+            .fold(f32::INFINITY, f32::min)
+    };
+    let first_top = top_of(rows.first()?);
+    let extent = match rows.get(orphans - 1) {
+        Some(last) => {
+            let top = top_of(last) - first_top;
+            let lead = line_leading(
+                flow,
+                last,
+                top_of(last),
+                room - top,
+                page_height_px,
+                depth + 1,
+            )?;
+            top + lead.extent
+        }
+        None => line_bottom(rows.last()?) - first_top,
+    };
+    let extent = extent.min(page_height_px);
+    Some(Leading {
+        extent,
+        places: extent <= room,
+        relaxes: true,
+    })
 }
 
 /// Whether `node` is a childless box the walk slices from where it stands
@@ -2977,6 +3053,9 @@ struct Flow<'a> {
     used_page_names: Option<&'a crate::blitz_adapter::UsedPageNameTable>,
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
     breaks: &'a BreakCache,
+    /// The first cell of a table row before which the walk takes a forced
+    /// break, for its table's `widows` ([`fragment_table_rows`]).
+    forced_before: Option<usize>,
 }
 
 /// The break values of the boxes a pass has asked about, by node and page
@@ -3010,6 +3089,190 @@ impl BreakCache {
 
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree(
+    geometry: &mut PaginationGeometryTable,
+    flow: Flow<'_>,
+    parent_id: usize,
+    parent_w: f32,
+    parent_x_in_body: f32,
+    page_in: u32,
+    cursor_in: f32,
+    page_height_px: f32,
+    depth: usize,
+    entered_below_content: bool,
+    page_has_content: &mut bool,
+    remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
+) -> (u32, f32) {
+    let widows = flow
+        .doc
+        .get_node(parent_id)
+        .filter(|&node| displays(node, DisplayInside::Table))
+        .and_then(|table| table_line_limits(flow.column_styles, table))
+        .map_or(1, |limits| limits.widows);
+    if widows < 2 {
+        return fragment_block_box(
+            geometry,
+            flow,
+            parent_id,
+            parent_w,
+            parent_x_in_body,
+            page_in,
+            cursor_in,
+            page_height_px,
+            depth,
+            entered_below_content,
+            page_has_content,
+            remaining_repeat_budget,
+            lifted,
+        );
+    }
+    fragment_table_rows(
+        geometry,
+        flow,
+        parent_id,
+        parent_w,
+        parent_x_in_body,
+        page_in,
+        cursor_in,
+        page_height_px,
+        depth,
+        entered_below_content,
+        page_has_content,
+        remaining_repeat_budget,
+        lifted,
+        widows,
+    )
+}
+
+/// Fragments the table `table_id` whose `widows` keep `widows` rows on its
+/// last page ([`table_line_limits`]): it is walked once, and when its last
+/// page holds fewer rows (a row split between pages counting as one), a
+/// second time with a forced break before the row that leaves `widows` on
+/// it ([`widows_row`]), when those rows fit a page and an earlier row
+/// stays before them. Each walk writes to a table of its own, merged once
+/// the table is placed.
+#[allow(clippy::too_many_arguments)]
+fn fragment_table_rows(
+    geometry: &mut PaginationGeometryTable,
+    flow: Flow<'_>,
+    table_id: usize,
+    width: f32,
+    x_in_body: f32,
+    page_in: u32,
+    cursor_in: f32,
+    page_height_px: f32,
+    depth: usize,
+    entered_below_content: bool,
+    page_has_content: &mut bool,
+    remaining_repeat_budget: &mut usize,
+    lifted: &mut f32,
+    widows: usize,
+) -> (u32, f32) {
+    let before = (*page_has_content, *remaining_repeat_budget, *lifted);
+    let mut walk = |geometry: &mut PaginationGeometryTable, flow: Flow<'_>| {
+        (*page_has_content, *remaining_repeat_budget, *lifted) = before;
+        fragment_block_box(
+            geometry,
+            flow,
+            table_id,
+            width,
+            x_in_body,
+            page_in,
+            cursor_in,
+            page_height_px,
+            depth,
+            entered_below_content,
+            page_has_content,
+            remaining_repeat_budget,
+            lifted,
+        )
+    };
+    let mut rows = PaginationGeometryTable::new();
+    let mut end = walk(&mut rows, flow);
+    if let Some(cell) = widows_row(&rows, flow, table_id, widows, page_height_px, depth) {
+        rows.clear();
+        end = walk(
+            &mut rows,
+            Flow {
+                forced_before: Some(cell),
+                ..flow
+            },
+        );
+    }
+    for (node_id, source) in rows {
+        let target = geometry.entry(node_id).or_default();
+        if target.fragments.is_empty() {
+            target.line_boundaries = source.line_boundaries;
+        } else {
+            target.line_boundaries.clear();
+        }
+        target.fragments.extend(source.fragments);
+        target.is_repeat |= source.is_repeat;
+        target.lift_px += source.lift_px;
+    }
+    end
+}
+
+/// The first cell of the row of `table_id` before which a forced break
+/// leaves `widows` rows on the table's last page, as `rows` place them
+/// ([`fragment_table_rows`]); `None` when that page holds as many already,
+/// when the table ends on its first page, when no earlier row would stay
+/// before the break, or when those rows do not fit a page.
+fn widows_row(
+    rows: &PaginationGeometryTable,
+    flow: Flow<'_>,
+    table_id: usize,
+    widows: usize,
+    page_height_px: f32,
+    depth: usize,
+) -> Option<usize> {
+    let doc = flow.doc;
+    let table = doc.get_node(table_id)?;
+    let header = (depth < crate::MAX_DOM_DEPTH)
+        .then(|| repeating_table_header(doc, table_id, depth + 1, flow.column_styles))
+        .flatten();
+    let (cells, band) = match &header {
+        Some(header) => (header.body_cell_ids.clone(), header.band_height_px),
+        None => (walk_children_of(table), 0.0),
+    };
+    let lines = flow_lines(flow, table, &cells);
+    let pages = |line: &[usize]| -> Vec<u32> {
+        line.iter()
+            .filter_map(|&index| rows.get(&cells[index]))
+            .flat_map(|geometry| geometry.fragments.iter().map(|f| f.page_index))
+            .collect()
+    };
+    let first_page = lines
+        .first()
+        .and_then(|line| pages(line).into_iter().min())?;
+    let end_page = lines
+        .iter()
+        .filter_map(|line| pages(line).into_iter().max())
+        .max()?;
+    let on_last = lines
+        .iter()
+        .filter(|line| pages(line).contains(&end_page))
+        .count();
+    if end_page == first_page || on_last >= widows {
+        return None;
+    }
+    let from = lines.len().checked_sub(widows).filter(|&from| from > 0)?;
+    let boxes = |line: &[usize]| -> Vec<&blitz_dom::Node> {
+        line.iter()
+            .filter_map(|&index| doc.get_node(cells[index]))
+            .collect()
+    };
+    let top = boxes(&lines[from])
+        .iter()
+        .map(|cell| cell.final_layout.location.y)
+        .fold(f32::INFINITY, f32::min);
+    let bottom = line_bottom(&boxes(lines.last()?));
+    (bottom - top <= page_height_px - band + 1.0).then(|| cells[lines[from][0]])
+}
+
+/// [`fragment_block_subtree`] of a box whose rows need no second walk.
+#[allow(clippy::too_many_arguments)]
+fn fragment_block_box(
     geometry: &mut PaginationGeometryTable,
     flow: Flow<'_>,
     parent_id: usize,
@@ -3790,7 +4053,7 @@ fn fragment_block_subtree_inner(
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
     // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
-    let opportunities = opportunities(
+    let mut opportunities = opportunities(
         flow,
         parent,
         &walk_children,
@@ -3798,6 +4061,12 @@ fn fragment_block_subtree_inner(
         page_height_px,
         depth + 1,
     );
+    if let Some(index) = flow
+        .forced_before
+        .and_then(|cell| walk_children.iter().position(|&id| id == cell))
+    {
+        opportunities[index] = opportunities[index].then(BreakValue::Forced(None));
+    }
     // The lines of the children, by the index of each line's first child,
     // and whether the walk meets them in block flow, where `avoid` between
     // two lines keeps them together ([`kept_after_line`]); a table's rows and
@@ -4876,7 +5145,8 @@ impl Default for LineLimits {
 /// The `orphans` and `widows` of the inline root `node_id`. Both properties
 /// are inherited, so each is the value its nearest element declares, from
 /// the node up through its ancestors (an `inherit` passes on to the
-/// parent), else the initial 2.
+/// parent), else the initial 2. A table's own are none of its cells': on a
+/// table they count rows ([`table_line_limits`]).
 fn line_limits(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -4891,7 +5161,15 @@ fn line_limits(
         if orphans.is_some() && widows.is_some() {
             break;
         }
-        if let Some(props) = column_styles.and_then(|table| table.get(&id)) {
+        // A table's own counts are of its rows ([`table_line_limits`]), not
+        // lines its cells inherit: they pass over it to its parent's.
+        let is_table = doc
+            .get_node(id)
+            .is_some_and(|node| displays(node, DisplayInside::Table));
+        if let Some(props) = column_styles
+            .filter(|_| !is_table)
+            .and_then(|table| table.get(&id))
+        {
             if let (None, Some(LineCount::Lines(count))) = (orphans, props.orphans) {
                 orphans = Some(count);
             }
@@ -4911,6 +5189,30 @@ fn line_limits(
         orphans: lines(orphans, initial.orphans),
         widows: lines(widows, initial.widows),
     }
+}
+
+/// The `orphans` and `widows` a table declares itself, which count its rows,
+/// not lines (an extension of css-break-3 §4.4, which gives a table none of
+/// its own): at least `orphans` rows start on the page where the table
+/// first breaks, else it moves to the next page whole ([`table_leading`]),
+/// and at least `widows` rows, a row split between pages counting as one,
+/// are on its last page ([`fragment_table_rows`]). `None` for a table that
+/// declares neither; a count it leaves out is 1, no constraint.
+fn table_line_limits(
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    table: &blitz_dom::Node,
+) -> Option<LineLimits> {
+    use crate::column_css::LineCount;
+    let props = column_styles?.get(&table.id)?;
+    let count = |count: Option<LineCount>| match count {
+        Some(LineCount::Lines(count)) => Some(usize::try_from(count).unwrap_or(usize::MAX)),
+        _ => None,
+    };
+    let (orphans, widows) = (count(props.orphans), count(props.widows));
+    (orphans.is_some() || widows.is_some()).then(|| LineLimits {
+        orphans: orphans.unwrap_or(1),
+        widows: widows.unwrap_or(1),
+    })
 }
 
 /// The line a fragment of an inline root breaks before, when lines
@@ -7204,6 +7506,7 @@ mod tests {
                 used_page_names: None,
                 running_store: None,
                 breaks: &BreakCache::default(),
+                forced_before: None,
             },
             parent_id,
             600.0,                // parent_w
@@ -7284,6 +7587,7 @@ mod tests {
                 used_page_names: None,
                 running_store: None,
                 breaks: &BreakCache::default(),
+                forced_before: None,
             },
             table_id,
             200.0,
@@ -8447,6 +8751,104 @@ mod tests {
             ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
             [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]]
         );
+    }
+
+    /// A table of `rows` rows `r1`, `r2`, ... of 80 px cells, under the
+    /// table style `style`, after a `spacer` px block, on pages `page` px
+    /// tall.
+    fn counted_rows_pass(
+        style: &str,
+        rows: usize,
+        spacer: u32,
+        page: f32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let rows = (1..=rows)
+            .map(|n| format!(r#"<tr><td id="r{n}">{n}</td></tr>"#))
+            .collect::<String>();
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              td {{ box-sizing: border-box; height: 80px; padding: 0; }}
+            </style></head><body><div style="height: {spacer}px"></div>
+            <table style="{style}"><tbody>{rows}</tbody></table></body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry = super::run_pass_with_break_styles(doc.deref_mut(), page.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    /// A table's `widows` count rows: at least that many are on its last
+    /// page. Sixty 80 px rows after a 100 px block on 400 px pages fill
+    /// three rows of the first page and five of each after it, leaving
+    /// rows 59 and 60 on the last; under `widows: 5` it opens on row 56,
+    /// rows 54 and 55 ending the page before.
+    #[test]
+    fn a_tables_widows_count_rows() {
+        let opening = |style: &str| {
+            let (doc, geometry) = counted_rows_pass(style, 60, 100, 400.0);
+            ["r55", "r56", "r59"].map(|id| placements(&doc, &geometry, id))
+        };
+        assert_eq!(
+            opening(""),
+            [vec![(11, 80.0)], vec![(11, 160.0)], vec![(12, 0.0)]]
+        );
+        assert_eq!(
+            opening("widows: 5"),
+            [vec![(11, 80.0)], vec![(12, 0.0)], vec![(12, 240.0)]]
+        );
+    }
+
+    /// A table's `orphans` count rows: at least that many start on the page
+    /// where it first breaks, else it moves to the next page whole. After a
+    /// 150 px block on 300 px pages, one 80 px row fits: `orphans: 2` moves
+    /// the table, as two rows need 160 px; `orphans: 9`, more rows than a
+    /// page holds, moves it too, and it breaks where the next page ends.
+    #[test]
+    fn a_tables_orphans_move_it_whole() {
+        let first = |style: &str| {
+            let (doc, geometry) = counted_rows_pass(style, 6, 150, 300.0);
+            ["r1", "r4", "r5"].map(|id| placements(&doc, &geometry, id))
+        };
+        assert_eq!(
+            first(""),
+            [vec![(0, 150.0)], vec![(1, 160.0)], vec![(2, 0.0)]]
+        );
+        assert_eq!(
+            first("orphans: 2"),
+            [vec![(1, 0.0)], vec![(2, 0.0)], vec![(2, 80.0)]]
+        );
+        assert_eq!(
+            first("orphans: 9"),
+            [vec![(1, 0.0)], vec![(2, 0.0)], vec![(2, 80.0)]]
+        );
+    }
+
+    /// A table's `orphans` and `widows` are no line counts of its cells:
+    /// a paragraph in a cell takes the counts of the table's parent, not
+    /// the table's. Six 20 px lines with three of them fitting the page
+    /// split 3 + 3 under the initial counts; the table's `widows: 4` made
+    /// them 2 + 4.
+    #[test]
+    fn a_tables_line_counts_are_not_its_cells() {
+        let html = r#"<!doctype html><html><head><style>
+            html, body { margin: 0; padding: 0; font-family: 'Noto Sans'; }
+            table { border-spacing: 0; } td { padding: 0; }
+            p { margin: 0; line-height: 20px; }
+            </style></head><body><div style="height: 40px"></div>
+            <table style="widows: 4"><tr><td><p id="p">1<br>2<br>3<br>4<br>5<br>6</p></td></tr></table>
+            </body></html>"#;
+        let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
+        let (mut doc, _, _) =
+            blitz_adapter::parse_html_with_local_resources(html, 200.0, 10000, &fonts, false, None);
+        blitz_adapter::resolve(&mut doc);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        let p = find_by_id(&doc, "p").unwrap();
+        assert_eq!(line_partition(&geometry, p), (vec![0, 1], vec![0, 3, 6]));
     }
 
     /// A table on 100 px pages whose cells are padded 10 px above and below,
