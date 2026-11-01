@@ -1446,6 +1446,16 @@ struct RowState {
 }
 
 impl RowState {
+    /// Starts the row again where a forced break before its first cell put
+    /// the cursor: its cells start, and it ends at least, on the new page.
+    fn restart(&mut self, cursor: &PageCursor) {
+        self.start = cursor.mark();
+        self.started_on_occupied_strip = false;
+        self.max_end_page = cursor.page_index;
+        self.max_end_cursor_y = cursor.cursor_y;
+        self.max_end_has_content = cursor.page_has_content;
+    }
+
     /// Records where a cell of the row ended, when it is past every other,
     /// and whether the row placed content on its last page.
     fn reach(&mut self, cursor: &PageCursor) {
@@ -3479,6 +3489,9 @@ fn fragment_block_subtree_inner(
                 // on the new page — apply origin rebase eagerly.
                 cursor.page_taffy_origin = this_top_in_parent;
                 (origin_pending_target_y, origin_pending_same_row) = (None, None);
+                if let Some(rs) = row_state.as_mut() {
+                    rs.restart(&cursor);
+                }
             } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
                 cursor.move_to_side(doc, opportunity.side());
             }
@@ -3537,6 +3550,10 @@ fn fragment_block_subtree_inner(
             let margin = adjoining_top_margin(doc, child).max(0.0);
             cursor.page_taffy_origin = this_top_in_parent - margin;
             child_page_y = margin;
+            // A row that the break opens starts on the new page.
+            if let Some(rs) = row_state.as_mut() {
+                rs.restart(&cursor);
+            }
         } else if !suppress_page_check && cursor.page_index > 0 && cursor.at_page_top() {
             cursor.move_to_side(doc, opportunity.side());
         }

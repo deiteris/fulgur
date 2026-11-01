@@ -177,8 +177,10 @@ fn repeated_table_header_renders_with_clip_link_and_tags() {
     }
 }
 
-/// A nested table whose last row forces a break after it closes with a
-/// zero-height fragment on the page the break opens. Without a paint
+/// A nested table whose last row, empty and zero-height, follows a row that
+/// forces a break after it closes with a zero-height fragment on the page
+/// the break opens (a break after the table's own last row is the table's,
+/// and leaves it whole). Without a paint
 /// guard, `table_box_size` falls back to the full layout box for that
 /// slice and the inner table's red frame leaks onto the page that holds
 /// none of its rows.
@@ -200,6 +202,7 @@ fn a_zero_height_slice_of_a_split_nested_table_paints_no_frame() {
     <table id="inner"><tbody>
       <tr><td class="row">A</td></tr>
       <tr><td class="row" style="break-after: page">B</td></tr>
+      <tr><td style="height: 0"></td></tr>
     </tbody></table>
     <div id="after"></div>
   </td></tr></tbody></table>

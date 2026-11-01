@@ -68,7 +68,6 @@
 46 PlacedOnce b0 0  # rows side by side
 47 PlacedOnce b3 1  # page cursor
 48 PlacedOnce b0 0  # page cursor
-51 PastFoot b0 2  # page cursor
 51 PastFoot b15 5  # table walker
 51 PlacedOnce b0 0  # page cursor
 51 PlacedOnce b12 3  # table walker
@@ -133,7 +132,6 @@
 107 Encloses b11 0  # table walker
 107 Encloses b7 0  # table walker
 107 Encloses b9 0  # table walker
-107 PastFoot b1 1  # page cursor
 107 PastFoot b11 0  # table walker
 107 PastFoot b18 2  # table walker
 107 PastFoot b7 0  # table walker
