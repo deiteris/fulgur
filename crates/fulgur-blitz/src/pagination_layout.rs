@@ -1100,75 +1100,120 @@ fn break_props<'a>(
     styles.get(&node.id)
 }
 
-/// The `break-before` of `node` as its parent's walk meets it: its own,
-/// then its first line's ([`flow_lines`]), which a container takes on, as no
-/// class A opportunity parts the two (css-break-3 §3.1).
+/// The breaks of a box as its parent's walk meets it, and the class A
+/// opportunities of a walk over its children: computed together, once a
+/// pass and page height ([`box_breaks`]), as each reads its children's.
+struct BoxBreaks {
+    /// Its own `break-before`, then its first line's ([`flow_lines`]),
+    /// which a container takes on, as no class A opportunity parts the two
+    /// (css-break-3 §3.1).
+    before: BreakValue,
+    /// Its last line's `break-after`, which a container takes on, then its
+    /// own.
+    after: BreakValue,
+    /// A forced break opportunity lies inside it ([`forced_inside`]).
+    forced_inside: bool,
+    /// The opportunities of a walk over its children ([`walk_children_of`],
+    /// [`opportunities`]), with page names compared unless
+    /// [`page_names_suppressed`]. `None` for a box whose children the walk
+    /// does not meet one by one ([`has_flow_children`]).
+    opportunities: Option<Vec<BreakValue>>,
+}
+
+/// The breaks of `node` on pages `page_height_px` tall ([`BoxBreaks`]),
+/// computed on first ask and kept for the pass.
+fn box_breaks(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> std::rc::Rc<BoxBreaks> {
+    let key = (node.id, page_height_px.to_bits());
+    if let Some(breaks) = flow.pass.breaks.borrow().get(&key).cloned() {
+        return breaks;
+    }
+    let breaks = std::rc::Rc::new(compute_box_breaks(flow, node, page_height_px, depth));
+    flow.pass.breaks.borrow_mut().insert(key, breaks.clone());
+    breaks
+}
+
+/// [`box_breaks`], computed.
+fn compute_box_breaks(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> BoxBreaks {
+    let props = break_props(flow, node);
+    let (own_before, own_after) = (BreakValue::own_before(props), BreakValue::own_after(props));
+    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
+        return BoxBreaks {
+            before: own_before,
+            after: own_after,
+            forced_inside: false,
+            opportunities: None,
+        };
+    }
+    let children = walk_children_of(node);
+    let lines = flow_lines(flow, node, &children);
+    let edge = |line: Option<&Vec<usize>>, after: bool| {
+        line.map(|line| line_break(flow, &children, line, after, page_height_px, depth + 1))
+    };
+    let before = edge(lines.first(), false).map_or(own_before, |first| own_before.then(first));
+    let after = edge(lines.last(), true).map_or(own_after, |last| last.then(own_after));
+    let suppress = page_names_suppressed(flow.doc, node);
+    let values = opportunities(flow, node, &children, suppress, page_height_px, depth + 1);
+    let forced_inside = values.iter().copied().any(BreakValue::is_forced)
+        || children
+            .iter()
+            .filter_map(|&id| flow.doc.get_node(id))
+            .filter(|&child| is_flow_child(flow, child))
+            .any(|child| forced_inside(flow, child, page_height_px, depth + 1));
+    BoxBreaks {
+        before,
+        after,
+        forced_inside,
+        opportunities: Some(values),
+    }
+}
+
+/// The `break-before` of `node` as its parent's walk meets it
+/// ([`BoxBreaks::before`]).
 fn break_before_of(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    BreakCache::get(&flow.pass.breaks.before, node, page_height_px, || {
-        break_before_uncached(flow, node, page_height_px, depth)
-    })
+    box_breaks(flow, node, page_height_px, depth).before
 }
 
-/// [`break_before_of`], computed.
-fn break_before_uncached(
-    flow: Flow<'_>,
-    node: &blitz_dom::Node,
-    page_height_px: f32,
-    depth: usize,
-) -> BreakValue {
-    let own = BreakValue::own_before(break_props(flow, node));
-    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
-        return own;
-    }
-    let children = walk_children_of(node);
-    flow_lines(flow, node, &children)
-        .first()
-        .map_or(own, |line| {
-            own.then(line_break(
-                flow,
-                &children,
-                line,
-                false,
-                page_height_px,
-                depth + 1,
-            ))
-        })
-}
-
-/// The `break-after` of `node` as its parent's walk meets it: its last
-/// line's, which a container takes on, then its own.
+/// The `break-after` of `node` as its parent's walk meets it
+/// ([`BoxBreaks::after`]).
 fn break_after_of(
     flow: Flow<'_>,
     node: &blitz_dom::Node,
     page_height_px: f32,
     depth: usize,
 ) -> BreakValue {
-    BreakCache::get(&flow.pass.breaks.after, node, page_height_px, || {
-        break_after_uncached(flow, node, page_height_px, depth)
-    })
+    box_breaks(flow, node, page_height_px, depth).after
 }
 
-/// [`break_after_of`], computed.
-fn break_after_uncached(
+/// The opportunities of a walk over the children of `parent`
+/// ([`BoxBreaks::opportunities`]), at `depth` below the walk's.
+fn walk_opportunities(
     flow: Flow<'_>,
-    node: &blitz_dom::Node,
+    parent: &blitz_dom::Node,
     page_height_px: f32,
     depth: usize,
-) -> BreakValue {
-    let own = BreakValue::own_after(break_props(flow, node));
-    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
-        return own;
-    }
-    let children = walk_children_of(node);
-    flow_lines(flow, node, &children)
-        .last()
-        .map_or(own, |line| {
-            line_break(flow, &children, line, true, page_height_px, depth + 1).then(own)
+) -> Vec<BreakValue> {
+    box_breaks(flow, parent, page_height_px, depth)
+        .opportunities
+        .clone()
+        .unwrap_or_else(|| {
+            let children = walk_children_of(parent);
+            let suppress = page_names_suppressed(flow.doc, parent);
+            opportunities(flow, parent, &children, suppress, page_height_px, depth + 1)
         })
 }
 
@@ -1272,31 +1317,7 @@ fn forced_inside(
     page_height_px: f32,
     depth: usize,
 ) -> bool {
-    BreakCache::get(&flow.pass.breaks.forced, node, page_height_px, || {
-        forced_inside_uncached(flow, node, page_height_px, depth)
-    })
-}
-
-/// [`forced_inside`], computed.
-fn forced_inside_uncached(
-    flow: Flow<'_>,
-    node: &blitz_dom::Node,
-    page_height_px: f32,
-    depth: usize,
-) -> bool {
-    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
-        return false;
-    }
-    let children = walk_children_of(node);
-    let suppress = page_names_suppressed(flow.doc, node);
-    opportunities(flow, node, &children, suppress, page_height_px, depth + 1)
-        .into_iter()
-        .any(BreakValue::is_forced)
-        || children
-            .iter()
-            .filter_map(|&id| flow.doc.get_node(id))
-            .filter(|&child| is_flow_child(flow, child))
-            .any(|child| forced_inside(flow, child, page_height_px, depth + 1))
+    box_breaks(flow, node, page_height_px, depth).forced_inside
 }
 
 /// Whether the walk meets the children of `parent` one below the other: a
@@ -1414,14 +1435,7 @@ fn kept_after_box(
     else {
         return 0.0;
     };
-    let values = opportunities(
-        flow,
-        parent,
-        &children,
-        page_names_suppressed(doc, parent),
-        page_height_px,
-        depth + 1,
-    );
+    let values = walk_opportunities(flow, parent, page_height_px, depth);
     kept_after_line(
         flow,
         parent,
@@ -3131,11 +3145,12 @@ struct Flow<'a> {
     forced_before: Option<usize>,
 }
 
-/// What a pass computes once and every walk of it reads: the break values
-/// of its boxes, and the rows of its tables' row groups.
+/// What a pass computes once and every walk of it reads: the breaks of its
+/// boxes ([`box_breaks`]), and the rows of its tables' row groups.
 #[derive(Default)]
 struct Pass {
-    breaks: BreakCache,
+    /// The breaks of each box asked about, by node and page height.
+    breaks: std::cell::RefCell<BTreeMap<(usize, u32), std::rc::Rc<BoxBreaks>>>,
     /// The rows of each row group asked about, by the group's node.
     rows: std::cell::RefCell<BTreeMap<usize, std::rc::Rc<RowGroup>>>,
 }
@@ -3204,35 +3219,6 @@ impl RowGroup {
             reach,
             spanned,
         }
-    }
-}
-
-/// The break values of the boxes a pass has asked about, by node and page
-/// height ([`break_before_of`], [`break_after_of`], [`forced_inside`]): each
-/// reads its box's lines, and every walk and every level asks again.
-#[derive(Default)]
-struct BreakCache {
-    before: std::cell::RefCell<BTreeMap<(usize, u32), BreakValue>>,
-    after: std::cell::RefCell<BTreeMap<(usize, u32), BreakValue>>,
-    forced: std::cell::RefCell<BTreeMap<(usize, u32), bool>>,
-}
-
-impl BreakCache {
-    /// The value `table` holds for `node` on pages `page_height_px` tall,
-    /// computed once by `compute`.
-    fn get<T: Copy>(
-        table: &std::cell::RefCell<BTreeMap<(usize, u32), T>>,
-        node: &blitz_dom::Node,
-        page_height_px: f32,
-        compute: impl FnOnce() -> T,
-    ) -> T {
-        let key = (node.id, page_height_px.to_bits());
-        if let Some(&value) = table.borrow().get(&key) {
-            return value;
-        }
-        let value = compute();
-        table.borrow_mut().insert(key, value);
-        value
     }
 }
 
@@ -4197,14 +4183,18 @@ fn fragment_block_subtree_inner(
     // The class A break opportunity before each child: the value of the
     // previous sibling's `break-after` and this one's `break-before`, and of a
     // change of used page name between them (fulgur-uebl, CSS Page 3 §5.3).
-    let mut opportunities = opportunities(
-        flow,
-        parent,
-        &walk_children,
-        suppress_page_check,
-        page_height_px,
-        depth + 1,
-    );
+    let mut opportunities = if header.is_some() {
+        opportunities(
+            flow,
+            parent,
+            &walk_children,
+            suppress_page_check,
+            page_height_px,
+            depth + 1,
+        )
+    } else {
+        walk_opportunities(flow, parent, page_height_px, depth)
+    };
     if let Some(index) = flow
         .forced_before
         .and_then(|cell| walk_children.iter().position(|&id| id == cell))
