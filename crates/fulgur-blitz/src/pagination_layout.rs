@@ -1479,20 +1479,25 @@ fn kept_after_box(
     )
 }
 
-/// The top margin of `node` that adjoins its top edge, which a forced break
-/// before it keeps (css-break-3 §5.2): its own `margin-top`, collapsed (CSS
+/// The top margin of `node` that adjoins its top edge and that a break
+/// before it, `forced` or not, keeps: its own `margin-top`, collapsed (CSS
 /// 2.1 §8.3.1) with those of the first in-flow boxes whose margins the
 /// layout collapsed through its top, down through empty boxes: a first child
 /// the layout placed at its parent's content edge (unrounded, as a hairline
 /// edge rounds to zero) gave the parent its margin; one placed below it keeps
-/// its margin inside. The largest positive margin and the most negative add
-/// up, each read from the computed style. Taffy's `final_layout.margin` is
-/// no measure of it: Blitz folds a floated first child's margin into its
-/// parent's there.
-fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
+/// its margin inside. Each box's margin counts only where its `margin-break`
+/// keeps it ([`keeps_margin`]). The largest positive margin and the most
+/// negative add up, each read from the computed style. Taffy's
+/// `final_layout.margin` is no measure of it: Blitz folds a floated first
+/// child's margin into its parent's there.
+fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) -> f32 {
     use ::style::values::computed::Length;
     use ::style::values::generics::length::GenericMargin;
+    let doc = flow.doc;
     let own = |node: &blitz_dom::Node| {
+        if !keeps_margin(flow, node, forced) {
+            return 0.0;
+        }
         let basis = node
             .layout_parent
             .get()
@@ -1550,6 +1555,34 @@ fn adjoining_top_margin(doc: &BaseDocument, node: &blitz_dom::Node) -> f32 {
         current = child;
     }
     positive + negative
+}
+
+/// Whether a break before `node`, `forced` or not, keeps the node's own top
+/// margin, by its `margin-break` (css-break-4 §5.2): `auto` keeps it after a
+/// forced break only, `keep` after any break, `discard` after none.
+fn keeps_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) -> bool {
+    use crate::column_css::MarginBreak;
+    match break_props(flow, node).and_then(|props| props.margin_break) {
+        None | Some(MarginBreak::Auto) => forced,
+        Some(MarginBreak::Keep) => true,
+        Some(MarginBreak::Discard) => false,
+    }
+}
+
+/// Moves `child`, whose top in its parent's layout is `top`, to the top of
+/// the next page at an unforced break ([`PageCursor::move_before`]), and
+/// returns its y there: below the top margin a break keeps
+/// ([`adjoining_top_margin`]), zero unless its `margin-break` is `keep`.
+fn move_on(
+    cursor: &mut PageCursor,
+    geometry: &mut PaginationGeometryTable,
+    flow: Flow<'_>,
+    child: &blitz_dom::Node,
+    top: f32,
+) -> f32 {
+    let margin = adjoining_top_margin(flow, child, false).max(0.0);
+    cursor.move_before(geometry, top - margin, false);
+    margin
 }
 
 /// Whether `node`, which the layout gives no height, holds a line all the
@@ -4440,7 +4473,7 @@ fn fragment_block_subtree_inner(
             // break and keeps those after it: the child starts its own top
             // margin below the page top ([`adjoining_top_margin`]), the gap
             // to the box before it dropped.
-            let margin = adjoining_top_margin(doc, child).max(0.0);
+            let margin = adjoining_top_margin(flow, child, true).max(0.0);
             cursor.break_before(
                 geometry,
                 doc,
@@ -4597,8 +4630,8 @@ fn fragment_block_subtree_inner(
                     }
                     BoxKind::Monolithic(_) | BoxKind::InlineRoot { .. } => {
                         if !cursor.at_page_top() && fits(run, page_height_px) {
-                            cursor.move_before(geometry, this_top_in_parent, false);
-                            child_page_y = 0.0;
+                            child_page_y =
+                                move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
                         }
                     }
                 }
@@ -4655,8 +4688,7 @@ fn fragment_block_subtree_inner(
                 // whatever comes after it onto a spurious extra page
                 // (confirmed regression in examples/break-inside via PR
                 // #741).
-                cursor.move_before(geometry, this_top_in_parent, false);
-                child_page_y = 0.0;
+                child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
             }
             // codex P1: start from `child_page_y` (this child's own
             // rebased page-local y), not the parent's running
@@ -4749,8 +4781,7 @@ fn fragment_block_subtree_inner(
                 depth + 1,
             );
             if lead.moves_on(page_height_px) && !(cursor.at_page_top() && lead.relaxes) {
-                cursor.move_before(geometry, this_top_in_parent, false);
-                child_page_y = 0.0;
+                child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
             }
         }
         if needs_recursion {
@@ -4921,8 +4952,7 @@ fn fragment_block_subtree_inner(
         {
             // Forced to a fresh page: the current child lands at its top,
             // and sequential siblings continue from this point.
-            cursor.move_before(geometry, this_top_in_parent, false);
-            child_page_y = 0.0;
+            child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
         }
         cursor.entered_below_content = false;
 
@@ -12903,6 +12933,93 @@ h2 { string-set: chapter-title content(text); }
                 expected,
                 "{section}"
             );
+        }
+    }
+
+    /// The top margin of the box an unforced break puts at the top of the next
+    /// page, by its `margin-break` (css-break-4 §5.2): `auto` truncates it to
+    /// zero, as does `discard`, and `keep` keeps it below the page top. So for
+    /// a box placed whole, a paragraph that moves before it splits, a box
+    /// entered that moves before its first child, and a box kept whole that
+    /// moves with the run its `break-after: avoid` starts; and a margin that
+    /// collapses through the top of a box from its first child (15px) is kept
+    /// when each box it collapses from keeps its own.
+    #[test]
+    fn margin_break_decides_the_top_margin_after_an_unforced_break() {
+        let page_y = |body: &str, id: &str| {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0; line-height: 20px">{body}</body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            placements(&doc, &geom, id)
+        };
+        for (value, kept) in [("", 0.0), ("auto", 0.0), ("keep", 10.0), ("discard", 0.0)] {
+            let mb = format!("margin-break: {value}");
+            let cases = [
+                (
+                    "placed whole",
+                    format!(
+                        r#"<div style="height: 70px"></div><div id="b" style="height: 40px; margin-top: 10px; {mb}"></div>"#
+                    ),
+                ),
+                (
+                    "paragraph",
+                    format!(
+                        r#"<div style="height: 70px"></div><p id="b" style="margin: 10px 0 0; {mb}">a<br>b<br>c</p>"#
+                    ),
+                ),
+                (
+                    "entered",
+                    format!(
+                        r#"<div style="height: 70px"></div><div id="b" style="margin-top: 10px; {mb}"><div style="height: 30px"></div><div style="height: 30px"></div></div>"#
+                    ),
+                ),
+                (
+                    "kept run",
+                    format!(
+                        r#"<div style="height: 50px"></div><div id="b" style="height: 20px; margin-top: 10px; break-inside: avoid; break-after: avoid; {mb}"></div><div style="height: 30px"></div>"#
+                    ),
+                ),
+            ];
+            for (case, body) in cases {
+                assert_eq!(page_y(&body, "b"), [(1, kept)], "{case}, {value}");
+            }
+            let collapsed = format!(
+                r#"<div style="height: 70px"></div><section id="s" style="{mb}"><div id="h" style="height: 40px; margin-top: 15px; {mb}"></div></section>"#
+            );
+            let kept = kept * 1.5;
+            assert_eq!(page_y(&collapsed, "s"), [(1, kept)], "section, {value}");
+            assert_eq!(page_y(&collapsed, "h"), [(1, kept)], "its child, {value}");
+        }
+    }
+
+    /// The top margin of the box after a forced break, by its `margin-break`
+    /// (css-break-4 §5.2): `auto` and `keep` keep it below the page top,
+    /// `discard` truncates it to zero, after a `break-before` and after a
+    /// `break-after`.
+    #[test]
+    fn margin_break_decides_the_top_margin_after_a_forced_break() {
+        for (value, kept) in [("auto", 10.0), ("keep", 10.0), ("discard", 0.0)] {
+            for (before, after) in [("break-before: page", ""), ("", "break-after: page")] {
+                let html = format!(
+                    r#"<html><body style="margin: 0; padding: 0">
+                      <div style="height: 40px; margin-bottom: 30px; {after}"></div>
+                      <div id="b" style="height: 20px; margin-top: 10px; margin-break: {value}; {before}"></div>
+                    </body></html>"#
+                );
+                let mut doc = parse(&html, 600.0);
+                let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+                let geom =
+                    super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+                assert_eq!(
+                    placements(&doc, &geom, "b"),
+                    [(1, kept)],
+                    "{value} {before}{after}"
+                );
+            }
         }
     }
 
