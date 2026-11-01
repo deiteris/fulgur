@@ -3862,7 +3862,7 @@ fn fragment_block_subtree_inner(
         let relaxes_kept = cursor.at_page_top()
             && matches!(kind, BoxKind::Monolithic(Whole::Kept))
             && !child.children.is_empty()
-            && child_page_y + extent(flow, child, depth + 1) > page_height_px;
+            && child_page_y + extent(flow, child, depth + 1) > page_height_px + 1.0;
         let needs_recursion = enter_for_kept_run
             || relaxes_kept
             || enters(flow, child, &kind, available_strip, page_height_px);
@@ -4058,7 +4058,7 @@ fn fragment_block_subtree_inner(
         // left below a top edge is sliced from where it stands instead
         // (css-break-3 §4.4), in a table cell too.
         let slices_at_top = cursor.at_page_top()
-            && child_page_y + child_h > page_height_px
+            && child_page_y + child_h > page_height_px + 1.0
             && slices_at_a_page_top(child)
             && slices_where_it_is(doc, child, true);
         if !slices_at_top
@@ -13293,6 +13293,16 @@ h2 { string-set: chapter-title content(text); }
             r#"<div style="padding-top: 10px"><div id="k" style="height: 120px"></div></div>"#,
         );
         assert_eq!(placements(&doc, &geometry, "k")[0], (1, 10.0));
+    }
+
+    /// A box at the top of a page that overruns the room left by less than
+    /// the walk's 1 px tolerance for a box that fits (a length rounded to
+    /// whole pixels, a 220pt block on a 220pt page) is placed whole, not
+    /// sliced into a sliver on a page of its own.
+    #[test]
+    fn a_box_at_the_page_top_within_the_fit_tolerance_is_not_sliced() {
+        let (doc, geometry) = after_a_forced_break(r#"<div id="k" style="height: 100.6px"></div>"#);
+        assert_eq!(placements(&doc, &geometry, "k"), [(1, 0.0)]);
     }
 
     /// A table row at the top of a page, below its table's top border,
