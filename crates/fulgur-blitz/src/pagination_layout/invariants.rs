@@ -33,6 +33,13 @@
 //! it, with that case's geometry. `FRAGMENT_INVARIANT_REACH=1` counts the
 //! default seeds whose breaks the walker takes at an `avoid` boundary,
 //! between table rows, and inside one ([`reach`]).
+//!
+//! `invariants.geometry.txt` beside it records the fragments the walker
+//! gives every default case ([`geometry_text`]), so that a change to the
+//! walker that keeps every violation as it was still shows where it moves
+//! a fragment. The test fails on any line that differs, naming the first
+//! ones; `FRAGMENT_GEOMETRY_UPDATE=1` rewrites it and still fails, so no
+//! rewrite passes unread.
 
 use super::*;
 use crate::blitz_adapter;
@@ -54,6 +61,9 @@ const EPS: f32 = 0.5;
 
 /// The golden of today's violations.
 const KNOWN: &str = include_str!("invariants.known.txt");
+
+/// The golden of the default cases' fragments.
+const GEOMETRY: &str = include_str!("invariants.geometry.txt");
 
 /// The fragmenter's invariants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2429,5 +2439,58 @@ fn generated_box_trees_keep_the_fragmenter_invariants() {
         report.is_empty(),
         "the violations differ from invariants.known.txt:\n{report}\
          FRAGMENT_INVARIANT_SEED=<seed> prints a case and its smallest failing shapes"
+    );
+}
+
+/// The fragments of the default cases, each under a line naming its seed
+/// and page height ([`geometry_text`]).
+fn generated_geometry() -> String {
+    let mut text = String::new();
+    for seed in 0..CASES {
+        let (roots, page) = case_of(seed);
+        let case = Case::new(&roots);
+        let (doc, geometry) = layout(&case, f32::from(page));
+        let _ = writeln!(text, "== seed {seed}, page {page} px");
+        text.push_str(&geometry_text(&geometry, &doc));
+    }
+    text
+}
+
+#[test]
+fn generated_box_trees_keep_their_geometry() {
+    let found = generated_geometry();
+    // The golden is checked out with the host's line endings.
+    let known = GEOMETRY.replace("\r\n", "\n");
+    let mut report = String::new();
+    let mut seed = "";
+    let mut shown = 0;
+    for (old, new) in known.lines().zip(found.lines()) {
+        if new.starts_with("== seed") {
+            seed = new;
+        }
+        if old != new && shown < 20 {
+            let _ = writeln!(report, "{seed}\n  - {old}\n  + {new}");
+            shown += 1;
+        }
+    }
+    let (old_lines, new_lines) = (known.lines().count(), found.lines().count());
+    if old_lines != new_lines {
+        let _ = writeln!(report, "{old_lines} lines recorded, {new_lines} found");
+    }
+    if std::env::var_os("FRAGMENT_GEOMETRY_UPDATE").is_some() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/pagination_layout/invariants.geometry.txt"
+        );
+        std::fs::write(path, &found).expect("write the golden");
+        assert!(
+            report.is_empty(),
+            "rewrote {path}; review each fragment it moved:\n{report}"
+        );
+        return;
+    }
+    assert!(
+        report.is_empty(),
+        "the generated cases' fragments differ from invariants.geometry.txt:\n{report}"
     );
 }
