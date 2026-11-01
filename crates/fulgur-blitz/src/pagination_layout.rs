@@ -2729,12 +2729,12 @@ fn table_leading(
 
 /// The leading unit of the rows of `table` among `cells`, its body's, from
 /// the first row's top with `room` px left below it, when the table's
-/// `orphans` keep more than one row start together ([`table_line_limits`]):
-/// its first `orphans` rows, the last of them by its own leading unit, or
+/// row `orphans` keep more than one row start together ([`table_line_limits`]):
+/// its first row `orphans` rows, the last of them by its own leading unit, or
 /// all its rows when it has no more. The unit is held together by
-/// `orphans` alone, so it is relaxed at a page top, and it is no taller
+/// row `orphans` alone, so it is relaxed at a page top, and it is no taller
 /// than a page: a table whose rows that fit a page are fewer than its
-/// `orphans` moves on whole once, and breaks where it stands there.
+/// row `orphans` moves on whole once, and breaks where it stands there.
 fn orphan_rows(
     flow: Flow<'_>,
     table: &blitz_dom::Node,
@@ -3079,7 +3079,7 @@ struct Flow<'a> {
     running_store: Option<&'a crate::gcpm::running::RunningElementStore>,
     breaks: &'a BreakCache,
     /// The first cell of a table row before which the walk takes a forced
-    /// break, for its table's `widows` ([`fragment_table_rows`]).
+    /// break, for its table's row `widows` ([`fragment_table_rows`]).
     forced_before: Option<usize>,
 }
 
@@ -3169,7 +3169,8 @@ fn fragment_block_subtree(
     )
 }
 
-/// Fragments the table `table_id` whose `widows` keep `widows` rows on its
+/// Fragments the table `table_id` whose row `widows`
+/// (`-fulgur-table-widows`) keep that many rows on its
 /// last page ([`table_line_limits`]): it is walked once, and when its last
 /// page holds fewer rows (a row split between pages counting as one), a
 /// second time with a forced break before the row that leaves `widows` on
@@ -5170,8 +5171,7 @@ impl Default for LineLimits {
 /// The `orphans` and `widows` of the inline root `node_id`. Both properties
 /// are inherited, so each is the value its nearest element declares, from
 /// the node up through its ancestors (an `inherit` passes on to the
-/// parent), else the initial 2. A table's own are none of its cells': on a
-/// table they count rows ([`table_line_limits`]).
+/// parent), else the initial 2.
 fn line_limits(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -5186,15 +5186,7 @@ fn line_limits(
         if orphans.is_some() && widows.is_some() {
             break;
         }
-        // A table's own counts are of its rows ([`table_line_limits`]), not
-        // lines its cells inherit: they pass over it to its parent's.
-        let is_table = doc
-            .get_node(id)
-            .is_some_and(|node| displays(node, DisplayInside::Table));
-        if let Some(props) = column_styles
-            .filter(|_| !is_table)
-            .and_then(|table| table.get(&id))
-        {
+        if let Some(props) = column_styles.and_then(|table| table.get(&id)) {
             if let (None, Some(LineCount::Lines(count))) = (orphans, props.orphans) {
                 orphans = Some(count);
             }
@@ -5216,24 +5208,23 @@ fn line_limits(
     }
 }
 
-/// The `orphans` and `widows` a table declares itself, which count its rows,
-/// not lines (an extension of css-break-3 §4.4, which gives a table none of
-/// its own): at least `orphans` rows start on the page where the table
-/// first breaks, else it moves to the next page whole ([`table_leading`]),
-/// and at least `widows` rows, a row split between pages counting as one,
-/// are on its last page ([`fragment_table_rows`]). `None` for a table that
-/// declares neither; a count it leaves out is 1, no constraint.
+/// A table's row counts, `-fulgur-table-orphans` and `-fulgur-table-widows`,
+/// as declared on it: at least `orphans` rows start on the page where the
+/// table first breaks, else it moves to the next page whole
+/// ([`table_leading`]), and at least `widows` rows, a row split between
+/// pages counting as one, are on its last page ([`fragment_table_rows`]).
+/// css-break-3 §3.3 gives `orphans` and `widows` to block containers that
+/// hold lines only, which a table's cells inherit as such: these are an
+/// extension of their own. `None` for a table that declares neither; a
+/// count it leaves out is 1, no constraint.
 fn table_line_limits(
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
     table: &blitz_dom::Node,
 ) -> Option<LineLimits> {
-    use crate::column_css::LineCount;
     let props = column_styles?.get(&table.id)?;
-    let count = |count: Option<LineCount>| match count {
-        Some(LineCount::Lines(count)) => Some(usize::try_from(count).unwrap_or(usize::MAX)),
-        _ => None,
-    };
-    let (orphans, widows) = (count(props.orphans), count(props.widows));
+    let count =
+        |count: Option<u32>| count.map(|count| usize::try_from(count).unwrap_or(usize::MAX));
+    let (orphans, widows) = (count(props.table_orphans), count(props.table_widows));
     (orphans.is_some() || widows.is_some()).then(|| LineLimits {
         orphans: orphans.unwrap_or(1),
         widows: widows.unwrap_or(1),
@@ -8857,11 +8848,12 @@ mod tests {
         (doc, geometry)
     }
 
-    /// A table's `widows` count rows: at least that many are on its last
-    /// page. Sixty 80 px rows after a 100 px block on 400 px pages fill
-    /// three rows of the first page and five of each after it, leaving
-    /// rows 59 and 60 on the last; under `widows: 5` it opens on row 56,
-    /// rows 54 and 55 ending the page before.
+    /// A table's `-fulgur-table-widows` counts rows: at least that many are
+    /// on its last page. Sixty 80 px rows after a 100 px block on 400 px
+    /// pages fill three rows of the first page and five of each after it,
+    /// leaving rows 59 and 60 on the last; under `-fulgur-table-widows: 5`
+    /// it opens on row 56, rows 54 and 55 ending the page before. The CSS
+    /// `widows` of the table moves no row.
     #[test]
     fn a_tables_widows_count_rows() {
         let opening = |style: &str| {
@@ -8873,16 +8865,21 @@ mod tests {
             [vec![(11, 80.0)], vec![(11, 160.0)], vec![(12, 0.0)]]
         );
         assert_eq!(
-            opening("widows: 5"),
+            opening("-fulgur-table-widows: 5"),
             [vec![(11, 80.0)], vec![(12, 0.0)], vec![(12, 240.0)]]
+        );
+        assert_eq!(
+            opening("widows: 5"),
+            [vec![(11, 80.0)], vec![(11, 160.0)], vec![(12, 0.0)]]
         );
     }
 
-    /// A table's `orphans` count rows: at least that many start on the page
-    /// where it first breaks, else it moves to the next page whole. After a
-    /// 150 px block on 300 px pages, one 80 px row fits: `orphans: 2` moves
-    /// the table, as two rows need 160 px; `orphans: 9`, more rows than a
-    /// page holds, moves it too, and it breaks where the next page ends.
+    /// A table's `-fulgur-table-orphans` counts rows: at least that many
+    /// start on the page where it first breaks, else it moves to the next
+    /// page whole. After a 150 px block on 300 px pages, one 80 px row fits:
+    /// a count of 2 moves the table, as two rows need 160 px; 9, more rows
+    /// than a page holds, moves it too, and it breaks where the next page
+    /// ends. The CSS `orphans` of the table moves no row.
     #[test]
     fn a_tables_orphans_move_it_whole() {
         let first = |style: &str| {
@@ -8894,38 +8891,53 @@ mod tests {
             [vec![(0, 150.0)], vec![(1, 160.0)], vec![(2, 0.0)]]
         );
         assert_eq!(
-            first("orphans: 2"),
+            first("-fulgur-table-orphans: 2"),
             [vec![(1, 0.0)], vec![(2, 0.0)], vec![(2, 80.0)]]
         );
         assert_eq!(
-            first("orphans: 9"),
+            first("-fulgur-table-orphans: 9"),
             [vec![(1, 0.0)], vec![(2, 0.0)], vec![(2, 80.0)]]
+        );
+        assert_eq!(
+            first("orphans: 2"),
+            [vec![(0, 150.0)], vec![(1, 160.0)], vec![(2, 0.0)]]
         );
     }
 
-    /// A table's `orphans` and `widows` are no line counts of its cells:
-    /// a paragraph in a cell takes the counts of the table's parent, not
-    /// the table's. Six 20 px lines with three of them fitting the page
-    /// split 3 + 3 under the initial counts; the table's `widows: 4` made
-    /// them 2 + 4.
+    /// A table's `orphans` and `widows` are inherited by its cells'
+    /// paragraphs as line counts, as CSS has it (css-break-3 §3.3); its row
+    /// counts are not. Six 20 px lines with three of them fitting the page
+    /// split 3 + 3 under the initial counts and under
+    /// `-fulgur-table-widows: 4`, and 2 + 4 under the table's `widows: 4`.
     #[test]
-    fn a_tables_line_counts_are_not_its_cells() {
-        let html = r#"<!doctype html><html><head><style>
-            html, body { margin: 0; padding: 0; font-family: 'Noto Sans'; }
-            table { border-spacing: 0; } td { padding: 0; }
-            p { margin: 0; line-height: 20px; }
-            </style></head><body><div style="height: 40px"></div>
-            <table style="widows: 4"><tr><td><p id="p">1<br>2<br>3<br>4<br>5<br>6</p></td></tr></table>
-            </body></html>"#;
-        let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
-        let (mut doc, _, _) =
-            blitz_adapter::parse_html_with_local_resources(html, 200.0, 10000, &fonts, false, None);
-        blitz_adapter::resolve(&mut doc);
-        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
-        let geometry =
-            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
-        let p = find_by_id(&doc, "p").unwrap();
-        assert_eq!(line_partition(&geometry, p), (vec![0, 1], vec![0, 3, 6]));
+    fn a_tables_widows_are_its_cells_line_counts_and_its_row_counts_are_not() {
+        let partition = |style: &str| {
+            let html = format!(
+                r#"<!doctype html><html><head><style>
+                html, body {{ margin: 0; padding: 0; font-family: 'Noto Sans'; }}
+                table {{ border-spacing: 0; }} td {{ padding: 0; }}
+                p {{ margin: 0; line-height: 20px; }}
+                </style></head><body><div style="height: 40px"></div>
+                <table style="{style}"><tr><td><p id="p">1<br>2<br>3<br>4<br>5<br>6</p></td></tr></table>
+                </body></html>"#
+            );
+            let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
+            let (mut doc, _, _) = blitz_adapter::parse_html_with_local_resources(
+                &html, 200.0, 10000, &fonts, false, None,
+            );
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geometry =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+            let p = find_by_id(&doc, "p").unwrap();
+            line_partition(&geometry, p)
+        };
+        assert_eq!(partition(""), (vec![0, 1], vec![0, 3, 6]));
+        assert_eq!(partition("widows: 4"), (vec![0, 1], vec![0, 2, 6]));
+        assert_eq!(
+            partition("-fulgur-table-widows: 4"),
+            (vec![0, 1], vec![0, 3, 6])
+        );
     }
 
     /// A table on 100 px pages whose cells are padded 10 px above and below,

@@ -189,6 +189,13 @@ pub struct ColumnStyleProps {
     pub orphans: Option<LineCount>,
     /// `widows`, as [`Self::orphans`].
     pub widows: Option<LineCount>,
+    /// `-fulgur-table-orphans: <integer>`, read on a table: the rows that
+    /// start on the page where it first breaks, at least
+    /// (`pagination_layout::table_line_limits`). Not inherited.
+    pub table_orphans: Option<u32>,
+    /// `-fulgur-table-widows: <integer>`, read on a table: the rows on its
+    /// last page, at least, a row split between pages counting as one.
+    pub table_widows: Option<u32>,
 }
 
 impl ColumnStyleProps {
@@ -227,6 +234,12 @@ impl ColumnStyleProps {
         if other.widows.is_some() {
             self.widows = other.widows;
         }
+        if other.table_orphans.is_some() {
+            self.table_orphans = other.table_orphans;
+        }
+        if other.table_widows.is_some() {
+            self.table_widows = other.table_widows;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -240,6 +253,8 @@ impl ColumnStyleProps {
             && self.header_repeat.is_none()
             && self.orphans.is_none()
             && self.widows.is_none()
+            && self.table_orphans.is_none()
+            && self.table_widows.is_none()
     }
 }
 
@@ -805,6 +820,14 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("widows") {
             if let Ok(v) = input.parse_entirely(parse_line_count_value) {
                 self.props.widows = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-table-orphans") {
+            if let Ok(LineCount::Lines(v)) = input.parse_entirely(parse_line_count_value) {
+                self.props.table_orphans = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-table-widows") {
+            if let Ok(LineCount::Lines(v)) = input.parse_entirely(parse_line_count_value) {
+                self.props.table_widows = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1411,6 +1434,22 @@ mod tests {
             read("orphans: 4; orphans: 0"),
             (Some(LineCount::Lines(4)), None),
             "an invalid value overrides nothing"
+        );
+    }
+
+    #[test]
+    fn parse_table_orphans_and_widows_read_a_positive_integer() {
+        let read = |css: &str| {
+            let props = parse_declaration_block(css);
+            (props.table_orphans, props.table_widows, props.orphans)
+        };
+        assert_eq!(
+            read("-fulgur-table-orphans: 3; -fulgur-table-widows: 5"),
+            (Some(3), Some(5), None)
+        );
+        assert_eq!(
+            read("-fulgur-table-orphans: inherit; -fulgur-table-widows: 0"),
+            (None, None, None)
         );
     }
 
