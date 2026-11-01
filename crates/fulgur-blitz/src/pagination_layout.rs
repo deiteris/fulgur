@@ -1159,6 +1159,131 @@ fn forced_inside(
             .any(|child| forced_inside(flow, child, page_height_px, depth + 1))
 }
 
+/// Whether the walk meets the children of `parent` one below the other: a
+/// block container, not a flex or grid container, a table, or a table row,
+/// whose boxes side by side the walk meets by their rows.
+fn is_block_flow(flow: Flow<'_>, parent: &blitz_dom::Node) -> bool {
+    matches!(structure(flow, parent), BoxKind::BlockFlow)
+}
+
+/// How far below the bottom of line `line` of `children` (of `parent`,
+/// [`flow_lines`]) the boxes after it that the line keeps with it reach,
+/// when the opportunity after the line is `avoid` (css-break-3 §4.4,
+/// [`opportunities`] `values`): the gap, then the next line's leading unit
+/// ([`leading_extent`]), or the whole next box and what it keeps with it in
+/// turn when its unit is the whole box. After the last line, what follows
+/// the parent's bottom edge that the parent keeps with it
+/// ([`kept_after_box`]). Zero when no `avoid` follows the line.
+#[allow(clippy::too_many_arguments)]
+fn kept_after_line(
+    flow: Flow<'_>,
+    parent: &blitz_dom::Node,
+    children: &[usize],
+    lines: &[Vec<usize>],
+    values: &[BreakValue],
+    line: usize,
+    page_height_px: f32,
+    depth: usize,
+) -> f32 {
+    let doc = flow.doc;
+    if depth >= crate::MAX_DOM_DEPTH {
+        return 0.0;
+    }
+    let bottom = lines[line]
+        .iter()
+        .filter_map(|&index| doc.get_node(children[index]))
+        .map(|child| child.final_layout.location.y + child.final_layout.size.height)
+        .fold(0.0_f32, f32::max);
+    let Some(next_line) = lines.get(line + 1) else {
+        let after = kept_after_box(flow, parent, page_height_px, depth + 1);
+        return if after > 0.0 {
+            (parent.final_layout.size.height - bottom).max(0.0) + after
+        } else {
+            0.0
+        };
+    };
+    if values[next_line[0]] != BreakValue::Avoid {
+        return 0.0;
+    }
+    let Some(next) = doc.get_node(children[next_line[0]]) else {
+        return 0.0;
+    };
+    let layout = next.final_layout;
+    let gap = (layout.location.y - bottom).max(0.0);
+    let lead = leading_extent(flow, next, page_height_px, page_height_px, depth + 1);
+    let kept = if lead.extent >= layout.size.height - 0.5 {
+        layout.size.height
+            + kept_after_line(
+                flow,
+                parent,
+                children,
+                lines,
+                values,
+                line + 1,
+                page_height_px,
+                depth + 1,
+            )
+    } else {
+        lead.extent
+    };
+    gap + kept
+}
+
+/// How far below the bottom edge of `node` the boxes after it that it keeps
+/// with it reach ([`kept_after_line`]), in its parent's block flow: zero
+/// for the body, and in a parent the walk does not meet in block flow.
+fn kept_after_box(
+    flow: Flow<'_>,
+    node: &blitz_dom::Node,
+    page_height_px: f32,
+    depth: usize,
+) -> f32 {
+    let doc = flow.doc;
+    let is_body = |node: &blitz_dom::Node| {
+        node.element_data()
+            .is_some_and(|el| el.name.local.as_ref() == "body")
+    };
+    if depth >= crate::MAX_DOM_DEPTH || is_body(node) {
+        return 0.0;
+    }
+    let Some(parent) = node
+        .layout_parent
+        .get()
+        .or(node.parent)
+        .and_then(|id| doc.get_node(id))
+    else {
+        return 0.0;
+    };
+    if !is_block_flow(flow, parent) {
+        return 0.0;
+    }
+    let children = walk_children_of(parent);
+    let lines = flow_lines(flow, &children);
+    let Some(line) = lines
+        .iter()
+        .position(|line| line.iter().any(|&index| children[index] == node.id))
+    else {
+        return 0.0;
+    };
+    let values = opportunities(
+        flow,
+        &children,
+        page_names_suppressed(doc, parent),
+        page_height_px,
+        depth + 1,
+    );
+    kept_after_line(
+        flow,
+        parent,
+        &children,
+        &lines,
+        &values,
+        line,
+        page_height_px,
+        depth + 1,
+    )
+}
+
 /// Whether a header row that skips its table's first page
 /// (`-fulgur-header-repeat: skip-first`) lies below `node`: only the table's
 /// own fragmentation ([`fragment_repeating_table`]) leaves it off that page,
@@ -3020,7 +3145,18 @@ fn fragment_block_subtree_inner(
         page_height_px,
         depth + 1,
     );
-    for (&child_id, &opportunity) in walk_children.iter().zip(&opportunities) {
+    // The lines of the children, by the index of each line's first child,
+    // and whether the walk meets them in block flow, where `avoid` between
+    // two lines keeps them together ([`kept_after_line`]); a table's rows and
+    // a flex or grid container's lines are another walk's.
+    let lines = flow_lines(flow, &walk_children);
+    let mut line_at = vec![None; walk_children.len()];
+    for (number, line) in lines.iter().enumerate() {
+        line_at[line[0]] = Some(number);
+    }
+    let block_flow =
+        children_override.is_none() && !allow_same_row_rebase && is_block_flow(flow, parent);
+    for (index, (&child_id, &opportunity)) in walk_children.iter().zip(&opportunities).enumerate() {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
@@ -3282,6 +3418,45 @@ fn fragment_block_subtree_inner(
         // row kept whole places whole too, and the row's extent, not the
         // cell's, decides whether it moves on.
         let kind = classify(flow, child, page_height_px);
+        // A line followed by an `avoid` keeps the boxes after it that the
+        // opportunity joins it to ([`kept_after_line`], css-break-3 §4.4
+        // rule 1). When the run does not fit the rest of the page, the break
+        // goes at the last opportunity before it that is not `avoid`: a box
+        // the walk places whole that starts the run moves to the next page
+        // when the run fits one, and a block container is entered, so that
+        // the break goes inside it, before the last of its boxes that starts
+        // the run there. A box inside a run (an `avoid` before it) follows
+        // the run's first box. With nothing placed on the page above, or a
+        // run taller than a page, `avoid` is relaxed (rule 4): the walk
+        // breaks where the content reaches the foot.
+        let mut enter_for_kept_run = false;
+        if block_flow
+            && opportunity != BreakValue::Avoid
+            && let Some(line) = line_at[index]
+        {
+            let kept = kept_after_line(
+                flow,
+                parent,
+                &walk_children,
+                &lines,
+                &opportunities,
+                line,
+                page_height_px,
+                depth + 1,
+            );
+            let run = child_h + kept;
+            if kept > 0.0 && child_page_y + run > page_height_px {
+                if matches!(kind, BoxKind::BlockFlow) {
+                    enter_for_kept_run = true;
+                } else if !cursor.at_page_top() && run <= page_height_px + 1.0 {
+                    cursor.close_parent_once(geometry, ParentHeight::Placed);
+                    cursor.advance();
+                    cursor.page_taffy_origin = this_top_in_parent;
+                    child_page_y = 0.0;
+                    cursor.entered_below_content = false;
+                }
+            }
+        }
         let kept_row_bottom = kept_table_row_bottom(doc, column_styles, child, page_height_px);
         // A row none of whose cells can place content in the rest of the
         // page ([`leading_extent`]) moves to the next one whole, leaving no
@@ -3537,7 +3712,8 @@ fn fragment_block_subtree_inner(
         // forced break or a page-name change below it, which are not the
         // unforced break `avoid` concerns itself with (fulgur-2s7p.5), and a
         // transformed box only when it is taller than a page.
-        let needs_recursion = enters(flow, child, &kind, available_strip, page_height_px);
+        let needs_recursion =
+            enter_for_kept_run || enters(flow, child, &kind, available_strip, page_height_px);
         // A box entered after content in its container moves whole to the
         // next page first, and is entered there, when nothing of it places in
         // the rest of the page: its leading unit does not fit
@@ -11309,6 +11485,56 @@ h2 { string-set: chapter-title content(text); }
                 super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
             assert_eq!(page_ys(&doc, &geom, "r"), [(2, 0.0)], "{open}");
         }
+    }
+
+    /// `break-after: avoid` keeps a heading with the box after it
+    /// (css-break-3 §4.4): a heading that fits the page foot, before a block
+    /// that does not, moves to the next page with it, in either spelling
+    /// and from a rule, and so does a run of two headings that avoid a
+    /// break after each. A heading that is the last child of a section
+    /// avoids the break after the section too: the section is entered and
+    /// the break goes before the heading inside it. The walk read no
+    /// `avoid` and broke after the heading.
+    #[test]
+    fn a_heading_with_break_after_avoid_moves_with_its_successor() {
+        let page = |css: &str, body: &str| {
+            let html = format!(
+                r#"<html><head><style>body {{ margin: 0; padding: 0 }}
+                  h1, h2 {{ margin: 0; height: 20px }} p {{ margin: 0; height: 60px }}
+                  {css}</style></head><body>{body}</body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 200.0_f32.as_px(), &table);
+            ["h", "n"].map(|id| page_ys(&doc, &geom, id))
+        };
+        let moved = [vec![(1, 0.0)], vec![(1, 20.0)]];
+        for style in ["break-after: avoid", "page-break-after: avoid"] {
+            let body = format!(
+                r#"<div style="height: 150px"></div><h2 id="h" style="{style}">H</h2><p id="n">N</p>"#
+            );
+            assert_eq!(page("", &body), moved, "{style}");
+        }
+        let flat = r#"<div style="height: 150px"></div><h2 id="h">H</h2><p id="n">N</p>"#;
+        assert_eq!(
+            page("", flat),
+            [vec![(0, 150.0)], vec![(1, 0.0)]],
+            "no avoid"
+        );
+        assert_eq!(
+            page("h2 { break-after: avoid-page }", flat),
+            moved,
+            "a rule"
+        );
+        let run = r#"<div style="height: 130px"></div><h1 id="h">H</h1><h2>H</h2><p id="n">N</p>"#;
+        assert_eq!(
+            page("h1, h2 { break-after: avoid }", run),
+            [vec![(1, 0.0)], vec![(1, 40.0)]],
+            "a run"
+        );
+        let nested = r#"<section><div style="height: 150px"></div><h2 id="h">H</h2></section><p id="n">N</p>"#;
+        assert_eq!(page("h2 { break-after: avoid }", nested), moved, "nested");
     }
 
     /// No break opportunity lies inside an atomic inline (css-break-3 §4.1):

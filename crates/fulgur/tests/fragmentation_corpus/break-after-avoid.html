@@ -1,0 +1,27 @@
+<!-- page: 400 300 -->
+<!doctype html>
+<html><head><style>
+  body { margin: 0; padding: 0; font-family: 'Noto Sans'; font-size: 14px; line-height: 20px }
+  h1, h2, h3 { margin: 10px 0 6px; font-size: 16px; line-height: 20px; break-after: avoid }
+  p { margin: 0 0 8px }
+  .tall { height: 240px }
+</style></head><body>
+  <div class="tall"></div>
+  <h2 id="h1">A heading at the foot</h2>
+  <p id="p1">The paragraph after it does not fit the rest of the page, so the heading moves with it.</p>
+  <p id="p2">Another paragraph.</p>
+  <div style="height: 120px"></div>
+  <h1 id="h2">A run</h1>
+  <h2 id="h3">of headings</h2>
+  <p id="p3">moves to the next page with the paragraph after it.</p>
+  <section>
+    <div style="height: 200px"></div>
+    <h3 id="h4">The last heading of a section</h3>
+  </section>
+  <p id="p4">keeps the paragraph after its section.</p>
+  <h2 id="h5" style="break-after: auto">A heading without avoid</h2>
+  <div class="tall"></div>
+  <div style="height: 30px"></div>
+  <h2 id="h6">A heading before a block taller than a page</h2>
+  <div style="height: 320px"></div>
+</body></html>

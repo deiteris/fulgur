@@ -1,0 +1,20 @@
+html[1]/body[1] page=0 x=0.00 y=0.00 w=400.00 h=1484.00
+html[1]/body[1]/div[1] page=0 x=0.00 y=0.00 w=400.00 h=240.00
+html[1]/body[1]/h2#h1[3] page=1 x=0.00 y=0.00 w=400.00 h=20.00
+html[1]/body[1]/p#p1[5] page=1 x=0.00 y=26.00 w=400.00 h=40.00 lines=0,2
+html[1]/body[1]/p#p2[7] page=1 x=0.00 y=74.00 w=400.00 h=20.00
+html[1]/body[1]/div[9] page=1 x=0.00 y=102.00 w=400.00 h=120.00
+html[1]/body[1]/h1#h2[11] page=2 x=0.00 y=0.00 w=400.00 h=20.00
+html[1]/body[1]/h2#h3[13] page=2 x=0.00 y=30.00 w=400.00 h=20.00
+html[1]/body[1]/p#p3[15] page=2 x=0.00 y=56.00 w=400.00 h=20.00
+html[1]/body[1]/section[17] page=2 x=0.00 y=84.00 w=400.00 h=210.00
+html[1]/body[1]/section[17] page=3 x=0.00 y=0.00 w=400.00 h=20.00
+html[1]/body[1]/section[17]/div[1] page=2 x=0.00 y=84.00 w=400.00 h=200.00
+html[1]/body[1]/section[17]/h3#h4[3] page=3 x=0.00 y=0.00 w=400.00 h=20.00
+html[1]/body[1]/p#p4[19] page=3 x=0.00 y=20.00 w=400.00 h=20.00
+html[1]/body[1]/h2#h5[21] page=3 x=0.00 y=50.00 w=400.00 h=20.00
+html[1]/body[1]/div[23] page=4 x=0.00 y=0.00 w=400.00 h=240.00
+html[1]/body[1]/div[25] page=4 x=0.00 y=240.00 w=400.00 h=30.00
+html[1]/body[1]/h2#h6[27] page=4 x=0.00 y=280.00 w=400.00 h=20.00
+html[1]/body[1]/div[29] page=5 x=0.00 y=0.00 w=400.00 h=300.00
+html[1]/body[1]/div[29] page=6 x=0.00 y=0.00 w=400.00 h=20.00
