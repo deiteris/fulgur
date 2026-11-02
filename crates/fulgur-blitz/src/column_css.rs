@@ -180,6 +180,20 @@ pub enum ContinuationMargin {
     Keep,
 }
 
+/// `-fulgur-list-line-counts`: what a box's own `orphans` and `widows`
+/// count over its children. `none`, the initial value, counts nothing:
+/// css-break-3 §3.3 gives the two properties to a block container's own
+/// line boxes, which a box holding only blocks has none of. `descendants`
+/// counts the lines of its children, and breaks between them: at least
+/// `orphans` of those lines stand on the page where the box first breaks,
+/// and at least `widows` on its last page. Not inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListLineCounts {
+    #[default]
+    None,
+    Descendants,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -269,6 +283,9 @@ pub struct ColumnStyleProps {
     /// `-fulgur-continuation-margin` ([`ContinuationMargin`]); `None` when
     /// the element declares none, which is `none`.
     pub continuation_margin: Option<ContinuationMargin>,
+    /// `-fulgur-list-line-counts` ([`ListLineCounts`]); `None` when the
+    /// element declares none, which is `none`.
+    pub list_line_counts: Option<ListLineCounts>,
 }
 
 impl ColumnStyleProps {
@@ -328,6 +345,9 @@ impl ColumnStyleProps {
         if other.continuation_margin.is_some() {
             self.continuation_margin = other.continuation_margin;
         }
+        if other.list_line_counts.is_some() {
+            self.list_line_counts = other.list_line_counts;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -348,6 +368,7 @@ impl ColumnStyleProps {
             && self.page_foot_clearance.is_none()
             && self.page_foot_margin.is_none()
             && self.continuation_margin.is_none()
+            && self.list_line_counts.is_none()
     }
 }
 
@@ -738,6 +759,19 @@ fn parse_continuation_margin_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-list-line-counts: none | descendants`;
+/// any other value drops the declaration.
+fn parse_list_line_counts_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<ListLineCounts, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "none" => Ok(ListLineCounts::None),
+        "descendants" => Ok(ListLineCounts::Descendants),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// Parse the value side of `margin-break: auto | keep | discard`; any other
 /// value drops the declaration.
 fn parse_margin_break_value<'i>(
@@ -1007,6 +1041,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-continuation-margin") {
             if let Ok(v) = input.parse_entirely(parse_continuation_margin_value) {
                 self.props.continuation_margin = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-list-line-counts") {
+            if let Ok(v) = input.parse_entirely(parse_list_line_counts_value) {
+                self.props.list_line_counts = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1707,6 +1745,23 @@ mod tests {
             [
                 Some(ContinuationMargin::Keep),
                 Some(ContinuationMargin::None),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_line_counts_reads_its_two_keywords() {
+        let read = |css: &str| parse_declaration_block(css).list_line_counts;
+        assert_eq!(
+            [
+                read("-fulgur-list-line-counts: descendants"),
+                read("-fulgur-list-line-counts: NONE"),
+                read("-fulgur-list-line-counts: auto"),
+            ],
+            [
+                Some(ListLineCounts::Descendants),
+                Some(ListLineCounts::None),
                 None,
             ]
         );
