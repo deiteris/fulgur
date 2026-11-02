@@ -9583,6 +9583,63 @@ mod tests {
         );
     }
 
+    /// The row after a split row starts where the split row's remainder
+    /// ends on the next page, not a whole row's height below that page's
+    /// top. On 100 px pages, cells padded 5 px above and below, the first
+    /// row's paragraph of `lines` 20 px lines leaves its last `lines - 4`
+    /// lines on page 1 below the repeated top padding; the next row, a
+    /// one-line paragraph, follows them there. Charging the first row's
+    /// whole height (110 or 130 px) to page 1 would push it to page 2.
+    #[test]
+    fn the_row_after_a_split_row_starts_below_the_split_rows_remainder() {
+        let pass = |lines: usize| {
+            let text = (1..=lines).map(|n| n.to_string()).collect::<Vec<_>>();
+            let html = format!(
+                r#"<!doctype html><html><head><style>
+                html, body {{ margin: 0; padding: 0; font-family: 'Noto Sans'; }}
+                table {{ border-spacing: 0; width: 200px; }} td {{ padding: 5px 0; }}
+                p {{ margin: 0; line-height: 20px; orphans: 1; widows: 1; }}
+                </style></head><body><table><tbody>
+                <tr><td id="split"><p id="lines">{}</p></td><td id="beside">B</td></tr>
+                <tr><td id="next"><p>N</p></td><td></td></tr>
+                </tbody></table></body></html>"#,
+                text.join("<br>")
+            );
+            let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
+            let (mut doc, _, _) = blitz_adapter::parse_html_with_local_resources(
+                &html, 200.0, 10000, &fonts, false, None,
+            );
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geometry =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+            let lines = find_by_id(&doc, "lines").unwrap();
+            (
+                line_partition(&geometry, lines),
+                fragments_of(&doc, &geometry, "split"),
+                placements(&doc, &geometry, "next"),
+            )
+        };
+        assert_eq!(
+            pass(5),
+            (
+                (vec![0, 1], vec![0, 4, 5]),
+                vec![(0, 0.0, 100.0), (1, 0.0, 30.0)],
+                vec![(1, 30.0)]
+            ),
+            "a one-line remainder"
+        );
+        assert_eq!(
+            pass(6),
+            (
+                (vec![0, 1], vec![0, 4, 6]),
+                vec![(0, 0.0, 100.0), (1, 0.0, 50.0)],
+                vec![(1, 50.0)]
+            ),
+            "a two-line remainder"
+        );
+    }
+
     /// A table on 100 px pages whose cells are padded 10 px above and below,
     /// under `head`, after the rows `before`: a row of the cell `cell`
     /// holding ten 20 px blocks `d1` to `d10`, then, when `side`, the cell
