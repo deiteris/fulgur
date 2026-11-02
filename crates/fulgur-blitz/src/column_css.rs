@@ -168,6 +168,18 @@ pub enum PageFootMargin {
     Clearance,
 }
 
+/// `-fulgur-continuation-margin`: where each fragment of a box after its
+/// first starts. `none`, the initial value, starts it at the top of its
+/// container's fragment on that page, as css-break-3 gives a box's top
+/// margin to its first fragment only; `keep` starts it below the box's own
+/// `margin-top`, on every page the box continues on. Not inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContinuationMargin {
+    #[default]
+    None,
+    Keep,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -254,6 +266,9 @@ pub struct ColumnStyleProps {
     /// `-fulgur-page-foot-margin` ([`PageFootMargin`]); `None` when the
     /// element declares none, which is `none`.
     pub page_foot_margin: Option<PageFootMargin>,
+    /// `-fulgur-continuation-margin` ([`ContinuationMargin`]); `None` when
+    /// the element declares none, which is `none`.
+    pub continuation_margin: Option<ContinuationMargin>,
 }
 
 impl ColumnStyleProps {
@@ -310,6 +325,9 @@ impl ColumnStyleProps {
         if other.page_foot_margin.is_some() {
             self.page_foot_margin = other.page_foot_margin;
         }
+        if other.continuation_margin.is_some() {
+            self.continuation_margin = other.continuation_margin;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -329,6 +347,7 @@ impl ColumnStyleProps {
             && self.span_break_inside.is_none()
             && self.page_foot_clearance.is_none()
             && self.page_foot_margin.is_none()
+            && self.continuation_margin.is_none()
     }
 }
 
@@ -706,6 +725,19 @@ fn parse_page_foot_margin_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-continuation-margin: none | keep`; any
+/// other value drops the declaration.
+fn parse_continuation_margin_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<ContinuationMargin, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "none" => Ok(ContinuationMargin::None),
+        "keep" => Ok(ContinuationMargin::Keep),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// Parse the value side of `margin-break: auto | keep | discard`; any other
 /// value drops the declaration.
 fn parse_margin_break_value<'i>(
@@ -971,6 +1003,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-page-foot-margin") {
             if let Ok(v) = input.parse_entirely(parse_page_foot_margin_value) {
                 self.props.page_foot_margin = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-continuation-margin") {
+            if let Ok(v) = input.parse_entirely(parse_continuation_margin_value) {
+                self.props.continuation_margin = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1654,6 +1690,23 @@ mod tests {
                 Some(PageFootMargin::None),
                 Some(PageFootMargin::Page),
                 Some(PageFootMargin::Clearance),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_continuation_margin_reads_its_two_keywords() {
+        let read = |css: &str| parse_declaration_block(css).continuation_margin;
+        assert_eq!(
+            [
+                read("-fulgur-continuation-margin: keep"),
+                read("-fulgur-continuation-margin: NONE"),
+                read("-fulgur-continuation-margin: auto"),
+            ],
+            [
+                Some(ContinuationMargin::Keep),
+                Some(ContinuationMargin::None),
                 None,
             ]
         );
