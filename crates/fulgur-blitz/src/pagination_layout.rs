@@ -1696,6 +1696,69 @@ fn keeps_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) -> bool {
     }
 }
 
+/// The top margin each continued fragment of `node` starts below, on the
+/// pages after its first, by its `-fulgur-continuation-margin`
+/// ([`crate::column_css::ContinuationMargin`]): under `keep`, its own
+/// `margin-top`, not collapsed with its children's, when it leaves room on
+/// a page `page_height_px` tall; otherwise none, as css-break-3 gives the
+/// margin to the first fragment only. A table's row or cell has no margin.
+/// Where a break puts the box's first fragment is [`keeps_margin`]'s.
+fn continuation_margin(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> f32 {
+    use crate::column_css::ContinuationMargin;
+    let declared = flow
+        .column_styles
+        .and_then(|styles| styles.get(&node.id))
+        .and_then(|props| props.continuation_margin);
+    if declared != Some(ContinuationMargin::Keep) || is_table_internal(node) {
+        return 0.0;
+    }
+    let margin = own_margin(flow.doc, node, false);
+    if margin > 0.0 && margin < page_height_px {
+        margin
+    } else {
+        0.0
+    }
+}
+
+/// Runs `walk`, which fragments one box into the table it is given, on a
+/// page strip `margin` shorter whose top is `margin` below each page's top
+/// (the walk subtracts `margin` from its place and its page height): the
+/// box's first page is unchanged, as the strip ends at the page foot, and
+/// on every page it continues on, it and its content start `margin` lower
+/// ([`continuation_margin`]). Returns the page and y the walk ends at.
+fn below_continuation_margin(
+    geometry: &mut PaginationGeometryTable,
+    margin: f32,
+    walk: impl FnOnce(&mut PaginationGeometryTable, f32) -> (u32, f32),
+) -> (u32, f32) {
+    if margin <= 0.0 {
+        return walk(geometry, 0.0);
+    }
+    let mut shifted = PaginationGeometryTable::new();
+    let (page, end) = walk(&mut shifted, margin);
+    for fragment in shifted.values_mut().flat_map(|entry| &mut entry.fragments) {
+        fragment.y = (fragment.y.to_f32() + margin).as_px();
+    }
+    merge_geometry(geometry, shifted);
+    (page, end + margin)
+}
+
+/// Adds the fragments a walk wrote to a table of its own to `geometry`. The
+/// line partition of a node survives only where it had no fragments before.
+fn merge_geometry(geometry: &mut PaginationGeometryTable, walked: PaginationGeometryTable) {
+    for (node_id, source) in walked {
+        let target = geometry.entry(node_id).or_default();
+        if target.fragments.is_empty() {
+            target.line_boundaries = source.line_boundaries;
+        } else {
+            target.line_boundaries.clear();
+        }
+        target.fragments.extend(source.fragments);
+        target.is_repeat |= source.is_repeat;
+        target.lift_px += source.lift_px;
+    }
+}
+
 /// The part of a top `margin` that an unforced break keeps above a unit
 /// `unit` px tall, which moves to the top of the next page to start it
 /// whole: as much as still leaves the unit its page, so a box that fits a
@@ -3685,6 +3748,11 @@ impl RowGroup {
     }
 }
 
+/// Fragments the box `parent_id`, entered by the walk at `cursor_in` on
+/// `page_in`: below its top margin on each page it continues on, under
+/// `-fulgur-continuation-margin: keep` ([`below_continuation_margin`]),
+/// and a table whose rows keep `widows` on its last page walked as
+/// [`fragment_table_rows`] does.
 #[allow(clippy::too_many_arguments)]
 fn fragment_block_subtree(
     geometry: &mut PaginationGeometryTable,
@@ -3701,14 +3769,32 @@ fn fragment_block_subtree(
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
 ) -> (u32, f32) {
-    let widows = flow
-        .doc
-        .get_node(parent_id)
+    let node = flow.doc.get_node(parent_id);
+    let margin = node.map_or(0.0, |node| continuation_margin(flow, node, page_height_px));
+    let widows = node
         .filter(|&node| displays(node, DisplayInside::Table))
         .and_then(|table| table_line_limits(flow.column_styles, table))
         .map_or(1, |limits| limits.widows);
-    if widows < 2 {
-        return fragment_block_box(
+    below_continuation_margin(geometry, margin, |geometry, margin| {
+        let (cursor_in, page_height_px) = (cursor_in - margin, page_height_px - margin);
+        if widows < 2 {
+            return fragment_block_box(
+                geometry,
+                flow,
+                parent_id,
+                parent_w,
+                parent_x_in_body,
+                page_in,
+                cursor_in,
+                page_height_px,
+                depth,
+                entered_below_content,
+                page_has_content,
+                remaining_repeat_budget,
+                lifted,
+            );
+        }
+        fragment_table_rows(
             geometry,
             flow,
             parent_id,
@@ -3722,24 +3808,9 @@ fn fragment_block_subtree(
             page_has_content,
             remaining_repeat_budget,
             lifted,
-        );
-    }
-    fragment_table_rows(
-        geometry,
-        flow,
-        parent_id,
-        parent_w,
-        parent_x_in_body,
-        page_in,
-        cursor_in,
-        page_height_px,
-        depth,
-        entered_below_content,
-        page_has_content,
-        remaining_repeat_budget,
-        lifted,
-        widows,
-    )
+            widows,
+        )
+    })
 }
 
 /// Fragments the table `table_id` whose row `widows`
@@ -3798,17 +3869,7 @@ fn fragment_table_rows(
             },
         );
     }
-    for (node_id, source) in rows {
-        let target = geometry.entry(node_id).or_default();
-        if target.fragments.is_empty() {
-            target.line_boundaries = source.line_boundaries;
-        } else {
-            target.line_boundaries.clear();
-        }
-        target.fragments.extend(source.fragments);
-        target.is_repeat |= source.is_repeat;
-        target.lift_px += source.lift_px;
-    }
+    merge_geometry(geometry, rows);
     end
 }
 
@@ -4019,7 +4080,7 @@ fn fragment_table_cell(
     } else {
         cursor + content_top
     };
-    for (node_id, mut source) in cell_geometry {
+    for (&node_id, source) in &mut cell_geometry {
         for fragment in &mut source.fragments {
             if node_id == cell_id && fragment.page_index > page_in {
                 fragment.height = (fragment.height.to_f32() + content_top).as_px();
@@ -4037,16 +4098,8 @@ fn fragment_table_cell(
         {
             last.height = (end - last.y.to_f32()).max(last.height.to_f32()).as_px();
         }
-        let target = geometry.entry(node_id).or_default();
-        if target.fragments.is_empty() {
-            target.line_boundaries = source.line_boundaries;
-        } else {
-            target.line_boundaries.clear();
-        }
-        target.fragments.extend(source.fragments);
-        target.is_repeat |= source.is_repeat;
-        target.lift_px += source.lift_px;
     }
+    merge_geometry(geometry, cell_geometry);
     (page, end)
 }
 
@@ -5099,23 +5152,40 @@ fn fragment_block_subtree_inner(
             // grid / flex parallel siblings `cursor_y` still holds the
             // previous sibling's row bottom while `child_page_y` is
             // this cell's row-local start (fulgur-u0p0, mirrored from
-            // the recursion branch below).
-            let mut paragraph = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
-            paragraph.page_has_content = cursor.page_has_content;
-            let split_frag_count = fragment_inline_root(
-                geometry,
-                child_id,
-                child_x_in_body,
-                child_w,
-                &mut paragraph,
-                line_metrics,
-                limits,
-                top_inset(child),
-                inline_kept_after,
-            );
-            let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
-            cursor.page_has_content = paragraph.page_has_content;
-            record_inline_root_descendants(geometry, doc, child_id, line_metrics, split_frag_count);
+            // the recursion branch below). Its lines after a break start
+            // below its top margin under `-fulgur-continuation-margin`.
+            let margin = continuation_margin(flow, child, page_height_px);
+            let mut has_content = cursor.page_has_content;
+            let (new_page_index, new_cursor_y) =
+                below_continuation_margin(geometry, margin, |geometry, margin| {
+                    let mut paragraph = PageCursor::new(
+                        cursor.page_index,
+                        child_page_y - margin,
+                        page_height_px - margin,
+                    );
+                    paragraph.page_has_content = has_content;
+                    let split_frag_count = fragment_inline_root(
+                        geometry,
+                        child_id,
+                        child_x_in_body,
+                        child_w,
+                        &mut paragraph,
+                        line_metrics,
+                        limits,
+                        top_inset(child),
+                        inline_kept_after,
+                    );
+                    record_inline_root_descendants(
+                        geometry,
+                        doc,
+                        child_id,
+                        line_metrics,
+                        split_frag_count,
+                    );
+                    has_content = paragraph.page_has_content;
+                    (paragraph.page_index, paragraph.cursor_y)
+                });
+            cursor.page_has_content = has_content;
             // Same shape as the recursion branch's fulgur-oc51 fix
             // below: without a parent fragment per page the split
             // crossed, the parent's own background / border would
@@ -13754,6 +13824,108 @@ h2 { string-set: chapter-title content(text); }
                     [(1, kept)],
                     "{value} {before}{after}"
                 );
+            }
+        }
+    }
+
+    /// The fragments of the element `id` of `body`, below a 10px box, its
+    /// captions moved out of their tables as the engine moves them, on 100px
+    /// pages.
+    fn continued_placements(body: &str, id: &str) -> Vec<(u32, f32)> {
+        use crate::blitz_adapter::DomPass as _;
+        let html = format!(
+            r#"<html><head><style>
+              html, body {{ margin: 0; padding: 0; line-height: 20px }}
+              table {{ border-spacing: 0; width: 100px }}
+              th, td, caption {{ height: 20px; padding: 0 }}
+            </style></head><body><div style="height: 10px"></div>{body}</body></html>"#
+        );
+        let mut doc = blitz_adapter::parse(&html, 600.0, &[]);
+        blitz_adapter::CaptionRestructurePass
+            .apply(&mut doc, &blitz_adapter::PassContext { font_data: &[] });
+        blitz_adapter::resolve(&mut doc);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        placements(&doc, &geom, id)
+    }
+
+    /// Under `-fulgur-continuation-margin: keep`, each continued fragment of
+    /// a table starts below the table's own top margin, and the header it
+    /// repeats with it: a table with a 30px margin, a 20px header, and 20px
+    /// rows repeats the header at 30 on each later page (at 40 on its first,
+    /// below a 10px box); without a header its first row there starts at 30,
+    /// and below a caption too. Under `none` they start at the page top.
+    #[test]
+    fn a_continued_table_fragment_starts_below_its_top_margin() {
+        let rows = (1..=8)
+            .map(|n| format!(r#"<tr><td id="r{n}">{n}</td></tr>"#))
+            .collect::<String>();
+        for (value, top) in [("keep", 30.0), ("none", 0.0), ("", 0.0)] {
+            let style = format!("margin-top: 30px; -fulgur-continuation-margin: {value}");
+            let header = format!(
+                r#"<table style="{style}"><thead><tr><th id="h">H</th></tr></thead><tbody>{rows}</tbody></table>"#
+            );
+            let pages = continued_placements(&header, "h");
+            assert_eq!(pages[0], (0, 40.0), "the first page, {value}");
+            assert!(pages.len() > 2, "{pages:?}");
+            assert!(
+                pages[1..].iter().all(|&(_, y)| y == top),
+                "the repeated header, {value}: {pages:?}"
+            );
+            let plain = format!(r#"<table style="{style}"><tbody>{rows}</tbody></table>"#);
+            assert_eq!(
+                continued_placements(&plain, "r4"),
+                [(1, top)],
+                "the first row of the next page, {value}"
+            );
+            let captioned = format!(
+                r#"<table style="{style}"><caption>C</caption><thead><tr><th id="h">H</th></tr></thead><tbody>{rows}</tbody></table>"#
+            );
+            let pages = continued_placements(&captioned, "h");
+            assert!(pages.len() > 1, "{pages:?}");
+            assert!(
+                pages[1..].iter().all(|&(_, y)| y == top),
+                "below a caption, {value}: {pages:?}"
+            );
+        }
+    }
+
+    /// Under `-fulgur-continuation-margin: keep`, each continued fragment of
+    /// a block container, a paragraph, and a list starts below the box's own
+    /// top margin, its content with it: 20px lines and boxes below a 30px
+    /// margin fill each later page from 30 to 90. Under `none` the continued
+    /// fragments start at the page top.
+    #[test]
+    fn a_continued_block_fragment_starts_below_its_top_margin() {
+        let boxes = r#"<div style="height: 20px"></div>"#.repeat(8);
+        let lines = ["a"; 8].join("<br>");
+        let items = r#"<li style="height: 20px"></li>"#.repeat(8);
+        for (value, expected) in [
+            ("keep", [(0, 40.0), (1, 30.0), (2, 30.0)].as_slice()),
+            ("none", [(0, 40.0), (1, 0.0)].as_slice()),
+        ] {
+            let style = format!("margin-top: 30px; -fulgur-continuation-margin: {value}");
+            let cases = [
+                (
+                    "div",
+                    format!(r#"<div id="b" style="{style}">{boxes}</div>"#),
+                ),
+                (
+                    "p",
+                    format!(
+                        r#"<p id="b" style="margin-bottom: 0; orphans: 1; widows: 1; {style}">{lines}</p>"#
+                    ),
+                ),
+                (
+                    "ul",
+                    format!(
+                        r#"<ul id="b" style="padding: 0; margin-bottom: 0; list-style: none; {style}">{items}</ul>"#
+                    ),
+                ),
+            ];
+            for (case, body) in cases {
+                let pages: Vec<(u32, f32)> = continued_placements(&body, "b");
+                assert_eq!(pages, expected, "{case}, {value}");
             }
         }
     }
