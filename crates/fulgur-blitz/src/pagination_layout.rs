@@ -3381,7 +3381,7 @@ fn children_lines_unit(
         .into_iter()
         .filter_map(|id| flow.doc.get_node(id))
     {
-        let count = content_lines(flow.doc, child, usize::MAX, None, 0);
+        let count = content_lines(flow.doc, child, at_least - before, None, 0);
         if before + count < at_least {
             before += count;
             continue;
@@ -3922,11 +3922,12 @@ fn fragment_block_subtree(
 ) -> (u32, f32) {
     let node = flow.doc.get_node(parent_id);
     let margin = node.map_or(0.0, |node| continuation_margin(flow, node, page_height_px));
-    let counted = node.and_then(|node| counted_limits(flow, node));
-    let widows = counted.map_or(1, |(limits, _)| limits.widows);
+    let counted = node
+        .and_then(|node| counted_limits(flow, node))
+        .filter(|(limits, _)| limits.widows >= 2);
     below_continuation_margin(geometry, margin, |geometry, margin| {
         let (cursor_in, page_height_px) = (cursor_in - margin, page_height_px - margin);
-        let Some((_, counted)) = counted.filter(|_| widows >= 2) else {
+        let Some(counted) = counted else {
             return fragment_block_box(
                 geometry,
                 flow,
@@ -3957,7 +3958,7 @@ fn fragment_block_subtree(
             page_has_content,
             remaining_repeat_budget,
             lifted,
-            (widows, counted),
+            counted,
         )
     })
 }
@@ -3968,8 +3969,8 @@ fn fragment_block_subtree(
 /// once, and when its last page holds fewer, a second time with a forced
 /// break before the row or child that leaves `widows` on it
 /// ([`widows_break`]), when those fit a page and an earlier one stays
-/// before them. Each walk writes to a table of its own, merged once the box
-/// is placed.
+/// before them, with the `orphans` of a box counting lines. Each walk
+/// writes to a table of its own, merged once the box is placed.
 #[allow(clippy::too_many_arguments)]
 fn fragment_with_widows(
     geometry: &mut PaginationGeometryTable,
@@ -3985,7 +3986,7 @@ fn fragment_with_widows(
     page_has_content: &mut bool,
     remaining_repeat_budget: &mut usize,
     lifted: &mut f32,
-    (widows, counted): (usize, Counted),
+    counted: (LineLimits, Counted),
 ) -> (u32, f32) {
     let before = (*page_has_content, *remaining_repeat_budget, *lifted);
     let mut walk = |geometry: &mut PaginationGeometryTable, flow: Flow<'_>| {
@@ -4008,14 +4009,7 @@ fn fragment_with_widows(
     };
     let mut rows = PaginationGeometryTable::new();
     let mut end = walk(&mut rows, flow);
-    if let Some(cell) = widows_break(
-        &rows,
-        flow,
-        parent_id,
-        (widows, counted),
-        page_height_px,
-        depth,
-    ) {
+    if let Some(cell) = widows_break(&rows, flow, parent_id, counted, page_height_px, depth) {
         rows.clear();
         end = walk(
             &mut rows,
@@ -4034,12 +4028,14 @@ fn fragment_with_widows(
 /// what it counts, `counted`, on its last page, as `rows` place them
 /// ([`fragment_with_widows`]); `None` when that page holds as many already,
 /// when the box ends on its first page, when no earlier line would stay
-/// before the break, or when the lines after it do not fit a page.
+/// before the break, when the lines after it do not fit a page, or, for a
+/// box counting lines, when the lines before it on its page would count
+/// fewer than its `orphans`: where both counts cannot hold, `orphans` win.
 fn widows_break(
     rows: &PaginationGeometryTable,
     flow: Flow<'_>,
     parent_id: usize,
-    (widows, counted): (usize, Counted),
+    (limits, counted): (LineLimits, Counted),
     page_height_px: f32,
     depth: usize,
 ) -> Option<usize> {
@@ -4066,17 +4062,21 @@ fn widows_break(
         .iter()
         .filter_map(|line| pages(line).into_iter().max())
         .max()?;
+    if end_page == first_page {
+        return None;
+    }
     let boxes = |line: &[usize]| -> Vec<&blitz_dom::Node> {
         line.iter()
             .filter_map(|&index| doc.get_node(cells[index]))
             .collect()
     };
+    let widows = limits.widows;
     let on_last: usize = lines
         .iter()
         .filter(|line| pages(line).contains(&end_page))
         .map(|line| counted.lines_of(doc, &boxes(line), Some((rows, end_page))))
         .sum();
-    if end_page == first_page || on_last >= widows {
+    if on_last >= widows {
         return None;
     }
     let mut count = 0;
@@ -4084,6 +4084,18 @@ fn widows_break(
         count += counted.lines_of(doc, &boxes(&lines[from]), None);
         count >= widows
     })?;
+    // A box's lines keep its `orphans` before the break, where both counts
+    // cannot hold; a table's row counts leave that question open.
+    if counted == Counted::Lines {
+        let page = pages(&lines[from - 1]).into_iter().max()?;
+        let before: usize = lines[..from]
+            .iter()
+            .map(|line| counted.lines_of(doc, &boxes(line), Some((rows, page))))
+            .sum();
+        if before < limits.orphans {
+            return None;
+        }
+    }
     let top = boxes(&lines[from])
         .iter()
         .map(|cell| cell.final_layout.location.y)
@@ -9878,25 +9890,44 @@ mod tests {
         );
     }
 
-    /// The lines an `ol` styled `style` places on its first page, of eight
-    /// items of `lines` 20 px lines each, below a block that leaves room for
-    /// each of `fits` lines and half another on a 400 px page.
-    fn list_lines_on_the_first_page(style: &str, lines: usize, fits: &[usize]) -> Vec<usize> {
+    /// The lines an `ol` styled `style` places on its first page, of
+    /// `items` items of `lines` 20 px lines each, below a block that leaves
+    /// room for each of `fits` lines and half another on a 400 px page.
+    fn list_lines_on_the_first_page(
+        style: &str,
+        items: usize,
+        lines: usize,
+        fits: &[usize],
+    ) -> Vec<usize> {
         let text = (1..=lines)
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join("<br>");
-        let items = (1..=8)
+        let markup = (1..=items)
             .map(|n| format!(r#"<li id="i{n}">{text}</li>"#))
             .collect::<String>();
+        let holders: Vec<(String, usize)> = (1..=items).map(|n| (format!("i{n}"), lines)).collect();
+        lines_on_the_first_page(style, &markup, &holders, fits)
+    }
+
+    /// The lines an `ol` styled `style` holding `markup` places on its first
+    /// page, below a block that leaves room for each of `fits` 20 px lines
+    /// and half another on a 400 px page: the lines of each of `holders`, an
+    /// inline root's id and its line count, that stand there.
+    fn lines_on_the_first_page(
+        style: &str,
+        markup: &str,
+        holders: &[(String, usize)],
+        fits: &[usize],
+    ) -> Vec<usize> {
         fits.iter()
             .map(|&fit| {
                 let html = format!(
                     r#"<!doctype html><html><head><style>
                     html, body {{ margin: 0; padding: 0; font-family: 'Noto Sans'; }}
-                    ol, li {{ margin: 0; line-height: 20px; }}
+                    ol, li, p {{ margin: 0; line-height: 20px; }}
                     </style></head><body><div style="height: {}px"></div>
-                    <ol style="{style}">{items}</ol></body></html>"#,
+                    <ol style="{style}">{markup}</ol></body></html>"#,
                     390 - 20 * fit
                 );
                 let fonts = [crate::test_fonts::noto_sans_regular_ttf()];
@@ -9907,14 +9938,20 @@ mod tests {
                 let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
                 let geometry =
                     super::run_pass_with_break_styles(doc.deref_mut(), 400.0_f32.as_px(), &styles);
-                (1..=8)
-                    .map(|n| {
-                        let item = find_by_id(&doc, &format!("i{n}")).unwrap();
-                        let entry = &geometry[&item];
-                        match entry.line_boundaries.as_slice() {
-                            [] => usize::from(entry.fragments[0].page_index == 0) * lines,
-                            bounds => bounds[1] * usize::from(entry.fragments[0].page_index == 0),
+                holders
+                    .iter()
+                    .map(|(id, lines)| {
+                        let entry = &geometry[&find_by_id(&doc, id).unwrap()];
+                        if entry.line_boundaries.is_empty() {
+                            return usize::from(entry.fragments[0].page_index == 0) * lines;
                         }
+                        entry
+                            .fragments
+                            .iter()
+                            .zip(entry.line_boundaries.windows(2))
+                            .filter(|(fragment, _)| fragment.page_index == 0)
+                            .map(|(_, bounds)| bounds[1] - bounds[0])
+                            .sum::<usize>()
                     })
                     .sum()
             })
@@ -9933,19 +9970,19 @@ mod tests {
         let counted = "-fulgur-list-line-counts: descendants;";
         let fits = [5, 4, 3, 2];
         assert_eq!(
-            list_lines_on_the_first_page(&format!("{counted} orphans: 4; widows: 1"), 1, &fits),
+            list_lines_on_the_first_page(&format!("{counted} orphans: 4; widows: 1"), 8, 1, &fits),
             [5, 4, 0, 0]
         );
         assert_eq!(
-            list_lines_on_the_first_page("orphans: 4; widows: 1", 1, &fits),
+            list_lines_on_the_first_page("orphans: 4; widows: 1", 8, 1, &fits),
             [5, 4, 3, 2]
         );
         assert_eq!(
-            list_lines_on_the_first_page(&format!("{counted} orphans: 3; widows: 1"), 2, &fits),
+            list_lines_on_the_first_page(&format!("{counted} orphans: 3; widows: 1"), 8, 2, &fits),
             [4, 4, 0, 0]
         );
         assert_eq!(
-            list_lines_on_the_first_page("orphans: 3; widows: 1", 2, &fits),
+            list_lines_on_the_first_page("orphans: 3; widows: 1", 8, 2, &fits),
             [4, 4, 2, 2]
         );
     }
@@ -9963,27 +10000,76 @@ mod tests {
         assert_eq!(
             list_lines_on_the_first_page(
                 &format!("{counted} orphans: 1; widows: 3"),
+                8,
                 1,
                 &[8, 7, 6, 5]
             ),
             [8, 5, 5, 5]
         );
         assert_eq!(
-            list_lines_on_the_first_page("orphans: 1; widows: 3", 1, &[8, 7, 6, 5]),
+            list_lines_on_the_first_page("orphans: 1; widows: 3", 8, 1, &[8, 7, 6, 5]),
             [8, 7, 6, 5]
         );
         assert_eq!(
             list_lines_on_the_first_page(
                 &format!("{counted} orphans: 1; widows: 3"),
+                8,
                 2,
                 &[16, 14, 13]
             ),
             [16, 12, 12]
         );
         assert_eq!(
-            list_lines_on_the_first_page("orphans: 1; widows: 3", 2, &[16, 14, 13]),
+            list_lines_on_the_first_page("orphans: 1; widows: 3", 8, 2, &[16, 14, 13]),
             [16, 14, 12]
         );
+    }
+
+    /// A list's `widows` move a break between its items earlier only while
+    /// its `orphans` still hold before it: when both cannot, `orphans` are
+    /// kept. Three one-line items with room for two under the initial 2 and
+    /// 2 leave two on the first page and one on the next, not one alone at
+    /// the foot.
+    #[test]
+    fn a_lists_widows_give_way_to_its_orphans() {
+        let counted = "-fulgur-list-line-counts: descendants";
+        assert_eq!(list_lines_on_the_first_page(counted, 3, 1, &[2]), [2]);
+    }
+
+    /// The lines a list counts are those of its items' blocks: items of two
+    /// two-line paragraphs, each free to split (`orphans: 1; widows: 1`),
+    /// count four lines each. Under `orphans: 3` with room for two lines the
+    /// list moves whole, its third line being the first of an item's second
+    /// paragraph; with room for three it keeps three. Under `widows: 3`, two
+    /// items with room for seven lines, whose last paragraph splits 1 + 1,
+    /// leave its second item whole for the next page. Without the property
+    /// the paragraphs split wherever the page ends.
+    #[test]
+    fn a_lists_counts_reach_the_lines_of_its_items_blocks() {
+        let counted = "-fulgur-list-line-counts: descendants;";
+        let markup = (1..=2)
+            .map(|n| {
+                format!(
+                    r#"<li><p id="p{n}a" style="orphans: 1; widows: 1">1<br>2</p><p id="p{n}b" style="orphans: 1; widows: 1">3<br>4</p></li>"#
+                )
+            })
+            .collect::<String>();
+        let holders: Vec<(String, usize)> = ["p1a", "p1b", "p2a", "p2b"]
+            .iter()
+            .map(|id| (id.to_string(), 2))
+            .collect();
+        let lines =
+            |style: &str, fits: &[usize]| lines_on_the_first_page(style, &markup, &holders, fits);
+        assert_eq!(
+            lines(&format!("{counted} orphans: 3; widows: 1"), &[2, 3]),
+            [0, 3]
+        );
+        assert_eq!(lines("orphans: 3; widows: 1", &[2, 3]), [2, 3]);
+        assert_eq!(
+            lines(&format!("{counted} orphans: 1; widows: 3"), &[7]),
+            [4]
+        );
+        assert_eq!(lines("orphans: 1; widows: 3", &[7]), [7]);
     }
 
     /// The row after a split row starts where the split row's remainder
