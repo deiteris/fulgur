@@ -138,6 +138,21 @@ pub enum MarginBreak {
     Discard,
 }
 
+/// `-fulgur-span-break-inside`, read on a table: whether the rows a cell
+/// spans may break apart. `auto`, the initial value, breaks them between
+/// and inside rows as other rows: css-tables-3 §6.1 asks a user agent to
+/// keep a row unfragmented only when the cells spanning it span no later
+/// row (and are less than half the fragmentainer high and wide), and calls
+/// the other rows freely fragmentable. `avoid-unsplittable` keeps the rows
+/// a cell spans together, as `break-inside: avoid` would, when no cell of
+/// theirs that spans one row counts two lines or more. Not inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpanBreakInside {
+    #[default]
+    Auto,
+    AvoidUnsplittable,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -212,6 +227,9 @@ pub struct ColumnStyleProps {
     /// `-fulgur-table-widows: <integer>`, read on a table: the rows on its
     /// last page, at least, a row split between pages counting as one.
     pub table_widows: Option<u32>,
+    /// `-fulgur-span-break-inside`, read on a table ([`SpanBreakInside`]);
+    /// `None` when it declares none, which is `auto`.
+    pub span_break_inside: Option<SpanBreakInside>,
 }
 
 impl ColumnStyleProps {
@@ -259,6 +277,9 @@ impl ColumnStyleProps {
         if other.table_widows.is_some() {
             self.table_widows = other.table_widows;
         }
+        if other.span_break_inside.is_some() {
+            self.span_break_inside = other.span_break_inside;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -275,6 +296,7 @@ impl ColumnStyleProps {
             && self.margin_break.is_none()
             && self.table_orphans.is_none()
             && self.table_widows.is_none()
+            && self.span_break_inside.is_none()
     }
 }
 
@@ -613,6 +635,19 @@ fn parse_header_repeat_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-span-break-inside: auto |
+/// avoid-unsplittable`; any other value drops the declaration.
+fn parse_span_break_inside_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<SpanBreakInside, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "auto" => Ok(SpanBreakInside::Auto),
+        "avoid-unsplittable" => Ok(SpanBreakInside::AvoidUnsplittable),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// Parse the value side of `margin-break: auto | keep | discard`; any other
 /// value drops the declaration.
 fn parse_margin_break_value<'i>(
@@ -866,6 +901,10 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-table-widows") {
             if let Ok(LineCount::Lines(v)) = input.parse_entirely(parse_line_count_value) {
                 self.props.table_widows = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-span-break-inside") {
+            if let Ok(v) = input.parse_entirely(parse_span_break_inside_value) {
+                self.props.span_break_inside = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1500,6 +1539,23 @@ mod tests {
         assert_eq!(
             read("-fulgur-table-orphans: inherit; -fulgur-table-widows: 0"),
             (None, None, None)
+        );
+    }
+
+    #[test]
+    fn parse_span_break_inside_reads_its_two_keywords() {
+        let read = |css: &str| parse_declaration_block(css).span_break_inside;
+        assert_eq!(
+            [
+                read("-fulgur-span-break-inside: avoid-unsplittable"),
+                read("-fulgur-span-break-inside: AUTO"),
+                read("-fulgur-span-break-inside: avoid"),
+            ],
+            [
+                Some(SpanBreakInside::AvoidUnsplittable),
+                Some(SpanBreakInside::Auto),
+                None,
+            ]
         );
     }
 
