@@ -1495,7 +1495,7 @@ fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) ->
     use ::style::values::generics::length::GenericMargin;
     let doc = flow.doc;
     let own = |node: &blitz_dom::Node| {
-        if !keeps_margin(flow, node, forced) {
+        if !keeps_margin(flow, node, forced) || is_table_internal(node) {
             return 0.0;
         }
         let basis = node
@@ -1555,6 +1555,24 @@ fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) ->
         current = child;
     }
     positive + negative
+}
+
+/// Whether `node` is a table's row, row group, column, column group, or cell,
+/// which CSS gives no margin (CSS 2.1 §17.5, §17.2), whatever its
+/// `margin-top`.
+fn is_table_internal(node: &blitz_dom::Node) -> bool {
+    node.primary_styles().is_some_and(|styles| {
+        matches!(
+            styles.clone_display().inside(),
+            DisplayInside::TableRowGroup
+                | DisplayInside::TableHeaderGroup
+                | DisplayInside::TableFooterGroup
+                | DisplayInside::TableRow
+                | DisplayInside::TableColumn
+                | DisplayInside::TableColumnGroup
+                | DisplayInside::TableCell
+        )
+    })
 }
 
 /// Whether a break before `node`, `forced` or not, keeps the node's own top
@@ -13136,6 +13154,17 @@ h2 { string-set: chapter-title content(text); }
                 super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
             assert_eq!(placements(&doc, &geom, "i"), [(1, kept)], "{value}");
         }
+    }
+
+    /// A table row that moves to the next page keeps no margin of its cells:
+    /// CSS gives a table's rows and cells none, whatever their `margin-top`.
+    #[test]
+    fn a_table_row_that_moves_keeps_no_cell_margin() {
+        let html = r#"<html><body style="margin: 0; padding: 0"><table style="border-spacing: 0"><tr><td style="height: 60px; padding: 0"></td></tr><tr style="margin-top: 8px; margin-break: keep"><td id="c" style="height: 50px; padding: 0; margin-top: 6px; margin-break: keep"></td></tr></table></body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        assert_eq!(placements(&doc, &geom, "c"), [(1, 0.0)]);
     }
 
     /// The top margin of the box after a forced break, by its `margin-break`
