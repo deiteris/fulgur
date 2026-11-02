@@ -153,6 +153,21 @@ pub enum SpanBreakInside {
     AvoidUnsplittable,
 }
 
+/// `-fulgur-page-foot-margin`: where the bottom margin of a box whose last
+/// fragment ends near the page foot must end. `none`, the initial value,
+/// counts no margin: css-break-3 §5.2 truncates a margin that adjoins an
+/// unforced break. `page` asks the margin box to end by the page content
+/// box's bottom, the page-foot clearance counting toward the margin;
+/// `clearance` asks it to end above the clearance, which the margin adds
+/// to (`-fulgur-page-foot-clearance`). Not inherited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageFootMargin {
+    #[default]
+    None,
+    Page,
+    Clearance,
+}
+
 /// `orphans` or `widows` (CSS Fragmentation 3 §4.4): the fewest lines of a
 /// block container a fragment may hold at the foot of a page (`orphans`) or
 /// at the top of the next (`widows`). Both properties are inherited.
@@ -230,6 +245,15 @@ pub struct ColumnStyleProps {
     /// `-fulgur-span-break-inside`, read on a table ([`SpanBreakInside`]);
     /// `None` when it declares none, which is `auto`.
     pub span_break_inside: Option<SpanBreakInside>,
+    /// `-fulgur-page-foot-clearance: <length>`, in points, read on the root
+    /// element: how far above the page content box's bottom a fragment
+    /// ends, at least, when a break point precedes it
+    /// (`pagination_layout`). Never negative; `None` when the element
+    /// declares none, which is `0`.
+    pub page_foot_clearance: Option<f32>,
+    /// `-fulgur-page-foot-margin` ([`PageFootMargin`]); `None` when the
+    /// element declares none, which is `none`.
+    pub page_foot_margin: Option<PageFootMargin>,
 }
 
 impl ColumnStyleProps {
@@ -280,6 +304,12 @@ impl ColumnStyleProps {
         if other.span_break_inside.is_some() {
             self.span_break_inside = other.span_break_inside;
         }
+        if other.page_foot_clearance.is_some() {
+            self.page_foot_clearance = other.page_foot_clearance;
+        }
+        if other.page_foot_margin.is_some() {
+            self.page_foot_margin = other.page_foot_margin;
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -297,6 +327,8 @@ impl ColumnStyleProps {
             && self.table_orphans.is_none()
             && self.table_widows.is_none()
             && self.span_break_inside.is_none()
+            && self.page_foot_clearance.is_none()
+            && self.page_foot_margin.is_none()
     }
 }
 
@@ -648,6 +680,32 @@ fn parse_span_break_inside_value<'i>(
     }
 }
 
+/// Parse the value side of `-fulgur-page-foot-clearance: <length>`, in
+/// points; a negative length or any other value drops the declaration.
+fn parse_page_foot_clearance_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<f32, ParseError<'i, ()>> {
+    let length = parse_length(input)?;
+    if length < 0.0 {
+        return Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid));
+    }
+    Ok(length)
+}
+
+/// Parse the value side of `-fulgur-page-foot-margin: none | page |
+/// clearance`; any other value drops the declaration.
+fn parse_page_foot_margin_value<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<PageFootMargin, ParseError<'i, ()>> {
+    let ident = input.expect_ident()?.clone();
+    match ident.as_ref().to_ascii_lowercase().as_str() {
+        "none" => Ok(PageFootMargin::None),
+        "page" => Ok(PageFootMargin::Page),
+        "clearance" => Ok(PageFootMargin::Clearance),
+        _ => Err(input.new_error(BasicParseErrorKind::QualifiedRuleInvalid)),
+    }
+}
+
 /// Parse the value side of `margin-break: auto | keep | discard`; any other
 /// value drops the declaration.
 fn parse_margin_break_value<'i>(
@@ -905,6 +963,14 @@ impl<'i, 'a> DeclarationParser<'i> for ColumnDeclParser<'a> {
         } else if name.eq_ignore_ascii_case("-fulgur-span-break-inside") {
             if let Ok(v) = input.parse_entirely(parse_span_break_inside_value) {
                 self.props.span_break_inside = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-page-foot-clearance") {
+            if let Ok(v) = input.parse_entirely(parse_page_foot_clearance_value) {
+                self.props.page_foot_clearance = Some(v);
+            }
+        } else if name.eq_ignore_ascii_case("-fulgur-page-foot-margin") {
+            if let Ok(v) = input.parse_entirely(parse_page_foot_margin_value) {
+                self.props.page_foot_margin = Some(v);
             }
         } else {
             // Unknown property — discard its value tokens silently.
@@ -1554,6 +1620,40 @@ mod tests {
             [
                 Some(SpanBreakInside::AvoidUnsplittable),
                 Some(SpanBreakInside::Auto),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_page_foot_clearance_reads_a_length_that_is_not_negative() {
+        let read = |css: &str| parse_declaration_block(css).page_foot_clearance;
+        assert_eq!(
+            [
+                read("-fulgur-page-foot-clearance: 12pt"),
+                read("-fulgur-page-foot-clearance: 16px"),
+                read("-fulgur-page-foot-clearance: 0"),
+                read("-fulgur-page-foot-clearance: -1pt"),
+                read("-fulgur-page-foot-clearance: auto"),
+            ],
+            [Some(12.0), Some(12.0), Some(0.0), None, None]
+        );
+    }
+
+    #[test]
+    fn parse_page_foot_margin_reads_its_three_keywords() {
+        let read = |css: &str| parse_declaration_block(css).page_foot_margin;
+        assert_eq!(
+            [
+                read("-fulgur-page-foot-margin: none"),
+                read("-fulgur-page-foot-margin: PAGE"),
+                read("-fulgur-page-foot-margin: clearance"),
+                read("-fulgur-page-foot-margin: auto"),
+            ],
+            [
+                Some(PageFootMargin::None),
+                Some(PageFootMargin::Page),
+                Some(PageFootMargin::Clearance),
                 None,
             ]
         );
