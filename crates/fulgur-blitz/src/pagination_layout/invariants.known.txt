@@ -10,10 +10,6 @@
 10 PlacedOnce b5 1 -21px  # line measure: the cell holds its paragraph's lines alone, without the paragraph's padding and border, which run past the foot
 14 PastFoot b6 4  # edge model: a parent's fragment keeps the top margin of the child that moves to the next page, past the foot
 15 PastFoot b5 1  # edge model: a parent's fragment keeps its last child's bottom margin at the break, past the foot
-20 EndsWithLine b12 1  # table walker: the row below a cell spanning it runs on to the foot beside the spanning cell, placed whole
-20 EndsWithLine b14 1  # table walker: the row below a cell spanning it runs on to the foot beside the spanning cell, placed whole
-20 PastFoot b5 1  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
-20 PlacedOnce b12 1 -7px  # edge model: the cell ends without its last child's bottom margin
 23 Encloses b16 6  # rows side by side: a split line's items run on to the page foot below their container's fragment, which ends at their content
 23 Encloses b18 6  # rows side by side: a split line's items run on to the page foot below their container's fragment, which ends at their content
 23 PastFoot b0 1  # edge model: a parent's fragment keeps the top margin of the child that moves to the next page, past the foot
@@ -21,9 +17,6 @@
 34 EndsWithLine b27 5  # rows side by side: an item beside one lifted by a skip-first header row keeps the line's laid-out height, the lift past its line's end
 51 EndsWithLine b6 1  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
 51 EndsWithLine b8 1  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
-57 EndsWithLine b19 1  # table walker: the row below a cell spanning it runs on to the foot beside the spanning cell, placed whole
-57 EndsWithLine b21 1  # table walker: the row below a cell spanning it runs on to the foot beside the spanning cell, placed whole
-57 PastFoot b12 1  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
 64 PastFoot b0 0  # line measure: a paragraph is placed whole by its lines while its bottom padding runs past the foot
 71 EndsWithLine b13 5  # edge model: a margin kept past the foot on the page before leaves the line's rest on the next page longer than its content
 71 EndsWithLine b19 5  # edge model: a margin kept past the foot on the page before leaves the line's rest on the next page longer than its content
@@ -50,14 +43,11 @@
 144 PlacedOnce b24 3 -4px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 152 EndsWithLine b1 1  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
 152 EndsWithLine b3 1  # line measure: a paragraph's fragments leave out its padding and border, so the items beside it run on below its lines
-154 PastFoot b5 0  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
-154 PlacedOnce b0 0 +6px  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
 154 PlacedOnce b7 0 -20px  # edge model: the cell ends without its last child's bottom margin
 162 PlacedOnce b19 1 -7px  # edge model: the cell ends without its last child's bottom margin
 166 PlacedOnce b6 0 -10px  # edge model: the cell ends without its last child's bottom margin
 175 PlacedOnce b3 0 -5px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
-179 PastFoot b5 0  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
-179 PlacedOnce b0 0 +50px  # table walker: a cell spanning two rows is placed whole on its first page while the rows it spans break
+179 PlacedOnce b0 0 +3px  # table walker: the checker joins the rows a cell spans in one line, which starts on two pages once they break apart, so the split first row's repeated cell padding (10 px, less its lost 6 px margin and the table's 1 px bottom edge) is not credited as its growth
 179 PlacedOnce b7 0 -6px  # edge model: the cell ends without its last child's bottom margin
 184 EndsWithLine b3 0  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
 190 PlacedOnce b12 3 -10px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding, border, and margin
@@ -68,5 +58,9 @@
 235 PlacedOnce b10 2 -2px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 236 PlacedOnce b10 4 -3px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 244 PlacedOnce b17 2 -7px  # edge model: the cell ends without its last child's bottom margin
+246 EndsWithLine b13 1  # table walker: the rows of a span group cut at the page foot keep the height the spanning cell's content gave them in the layout, past their own content and the cell's rest
+246 EndsWithLine b15 1  # table walker: the rows of a span group cut at the page foot keep the height the spanning cell's content gave them in the layout, past their own content and the cell's rest
+246 EndsWithLine b6 1  # table walker: the rows of a span group cut at the page foot keep the height the spanning cell's content gave them in the layout, past their own content and the cell's rest
+246 PlacedOnce b0 0 +16px  # table walker: the rows of a span group cut at the page foot keep the height the spanning cell's content gave them in the layout, past their own content and the cell's rest
 253 Encloses b3 0  # floats: a block opened by a float leaves an empty fragment on the page the float moves from
 254 EndsWithLine b10 2  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot

@@ -1059,7 +1059,7 @@ fn line_break(
     };
     let at_edge = flow
         .pass
-        .row_group(flow.doc, row)
+        .row_group(flow, row)
         .is_some_and(|(group, index)| {
             if after {
                 index + 1 == group.rows.len()
@@ -1321,13 +1321,19 @@ fn opportunities(
             }
             previous_page = Some(end);
         }
-        // No opportunity lies between the rows a cell spans.
-        let spanned = flow
+        // No opportunity lies between the rows a cell spans that are kept
+        // together, and no forced one above a row a spanning cell's content
+        // reaches ([`RowGroup`]).
+        let (held, crossed) = flow
             .doc
             .get_node(children[line[0]])
             .and_then(|cell| table_row_of(flow.doc, cell))
-            .is_some_and(|row| spanned_from_above(flow, row));
-        values[line[0]] = if spanned { BreakValue::Auto } else { value };
+            .and_then(|row| flow.pass.row_group(flow, row))
+            .map_or((false, false), |(group, index)| {
+                (group.spanned[index], group.crossed[index])
+            });
+        let dropped = if value.is_forced() { crossed } else { held };
+        values[line[0]] = if dropped { BreakValue::Auto } else { value };
         previous_after = Some(line_break(
             flow,
             children,
@@ -1742,6 +1748,11 @@ impl LineState {
 /// Where a table cell that spans rows ended, which ends the last row it
 /// spans rather than its own ([`reach_line`]).
 struct SpanEnd {
+    /// The cell.
+    id: usize,
+    /// The cells of the rows it spans that the walk closed so far, but
+    /// those that span rows themselves ([`stretch_span`]).
+    cells: Vec<usize>,
     /// The line of the last row the cell spans ([`flow_lines`]).
     last_line: usize,
     page: u32,
@@ -1811,6 +1822,8 @@ fn reach_line(
     match rowspan_of(child) {
         1 => open.reach(cursor.page_index, cursor.cursor_y, cursor.page_has_content),
         rowspan => spans.push(SpanEnd {
+            id: child.id,
+            cells: Vec::new(),
             last_line: open.number + rowspan - 1,
             page: cursor.page_index,
             y: cursor.cursor_y,
@@ -1944,10 +1957,11 @@ fn line_moves_on(
 /// Ends the line `line` of a walk: each of its boxes stretched to the
 /// line's height ([`stretch_line_items`]), the cursor moved below the box
 /// that ends last, on its page, the cells that span rows down to it among
-/// them (`spans`, all that are left when it is the walk's `last` line).
-/// Returns the y at which the next line starts when the line crossed pages:
-/// right below it, the gap above the next line dropped, as below a box that
-/// crossed.
+/// them (`spans`, all that are left when it is the walk's `last` line),
+/// each stretched to the rows it spans ([`stretch_span`]).
+/// Returns the y at which the next line starts when the line crossed pages,
+/// or a spanning cell's content ended it below its own boxes: right below
+/// it, the gap above the next line dropped, as below a box that crossed.
 fn close_line(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
@@ -1957,26 +1971,42 @@ fn close_line(
     cursor: &mut PageCursor,
 ) -> Option<f32> {
     cursor.close_row();
-    spans.retain(|span| {
+    let cells: Vec<usize> = line
+        .items
+        .iter()
+        .copied()
+        .filter(|&id| doc.get_node(id).is_some_and(|node| rowspan_of(node) == 1))
+        .collect();
+    let own_end = (line.max_end_page, line.max_end_cursor_y);
+    let mut ended = Vec::new();
+    spans.retain_mut(|span| {
+        span.cells.extend(&cells);
         let ends = last || span.last_line <= line.number;
         if ends {
             line.reach(span.page, span.y, span.has_content);
+            ended.push((span.id, std::mem::take(&mut span.cells)));
         }
         !ends
     });
     stretch_line_items(geometry, doc, &line, cursor.page_height_px);
-    cursor.after_line(&line)
+    for (id, cells) in ended {
+        stretch_span(geometry, doc, id, &cells, &line, cursor.page_height_px);
+    }
+    let next = cursor.after_line(&line);
+    // A spanning cell whose content ends past its rows, on their last page
+    // too, as when its content moved to the next page, ends them there: the
+    // next line starts below it, not where the layout puts it.
+    let past = line.max_end_page > own_end.0 || line.max_end_cursor_y > own_end.1 + 0.5;
+    next.or(past.then_some(line.max_end_cursor_y))
 }
 
 /// Gives each box of a line that crossed pages, stretched to the line's
 /// height by a taller neighbour (it reaches [`LineState::bottom`]), but a
-/// cell that spans rows, a
+/// cell that spans rows ([`stretch_span`]), a
 /// fragment on every page down to the line's end: cut at the foot of each
 /// page before the line's last, where a box placed whole ran past it, and
 /// on the last page reaching the line's end, as an empty fragment where its
-/// own content ended before. A replaced or transformed box is not cut. The
-/// lines of an inline root are on its first fragments; the added ones hold
-/// none (`line_boundaries`).
+/// own content ended before. A replaced or transformed box is not cut.
 fn stretch_line_items(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
@@ -1999,59 +2029,122 @@ fn stretch_line_items(
         {
             continue;
         }
-        let Some(entry) = geometry.get_mut(&id) else {
-            continue;
-        };
-        let Some(first) = entry.fragments.first().cloned() else {
-            continue;
-        };
-        let lines = entry.line_boundaries.last().copied().or_else(|| {
-            node.element_data()
-                .is_some_and(|el| el.inline_layout_data.is_some())
-                .then(|| collect_inline_line_metrics(node).len())
-        });
-        let before = entry.fragments.len();
-        for page in first.page_index..=end_page {
-            let bottom = if page < end_page {
+        stretch_box(geometry, node, end_page, |page| {
+            if page < end_page {
                 page_height_px
             } else {
                 end_y
-            };
-            if let Some(fragment) = entry
-                .fragments
-                .iter_mut()
-                .rev()
-                .find(|fragment| fragment.page_index == page)
-            {
-                let top = fragment.y.to_f32();
-                let height = if page < end_page {
-                    bottom - top
-                } else {
-                    fragment.height.to_f32().max(bottom - top)
-                };
-                fragment.height = height.max(0.0).as_px();
-            } else {
-                entry.fragments.push(Fragment {
-                    page_index: page,
-                    x: first.x,
-                    y: 0.0_f32.as_px(),
-                    width: first.width,
-                    height: bottom.max(0.0).as_px(),
-                });
             }
+        });
+    }
+}
+
+/// Gives the cell `id` that spans rows, which started on a page before the
+/// end of `line`, the last row it spans, a fragment on every page down to
+/// it: on each page ending with the
+/// lowest of the `cells` of its rows there, or of its own content, cut
+/// where the cell placed whole ran past them, and on the last page reaching
+/// the line's end.
+fn stretch_span(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    id: usize,
+    cells: &[usize],
+    line: &LineState,
+    page_height_px: f32,
+) {
+    let (end_page, end_y) = (line.max_end_page, line.max_end_cursor_y);
+    let Some(node) = doc.get_node(id) else {
+        return;
+    };
+    let Some(first_page) = geometry
+        .get(&id)
+        .and_then(|entry| entry.fragments.first())
+        .map(|fragment| fragment.page_index)
+    else {
+        return;
+    };
+    if first_page >= end_page || is_transformed(node) {
+        return;
+    }
+    let content = walk_children_of(node);
+    let ends: BTreeMap<u32, f32> = (first_page..end_page)
+        .map(|page| {
+            let end = cells
+                .iter()
+                .chain(&content)
+                .filter_map(|id| geometry.get(id))
+                .flat_map(|entry| &entry.fragments)
+                .filter(|fragment| fragment.page_index == page)
+                .map(|fragment| fragment.y.to_f32() + fragment.height.to_f32())
+                .reduce(f32::max);
+            (page, end.unwrap_or(page_height_px))
+        })
+        .collect();
+    stretch_box(geometry, node, end_page, |page| {
+        ends.get(&page).copied().unwrap_or(end_y)
+    });
+}
+
+/// Gives the box `node` a fragment on every page from its first down to
+/// `end_page`, each ending at `bottom` of its page: before the last cut
+/// there, on the last at least there, as an empty fragment where its own
+/// content ended before. The lines of an inline root are on its first
+/// fragments; the added ones hold none (`line_boundaries`).
+fn stretch_box(
+    geometry: &mut PaginationGeometryTable,
+    node: &blitz_dom::Node,
+    end_page: u32,
+    bottom: impl Fn(u32) -> f32,
+) {
+    let Some(entry) = geometry.get_mut(&node.id) else {
+        return;
+    };
+    let Some(first) = entry.fragments.first().cloned() else {
+        return;
+    };
+    let lines = entry.line_boundaries.last().copied().or_else(|| {
+        node.element_data()
+            .is_some_and(|el| el.inline_layout_data.is_some())
+            .then(|| collect_inline_line_metrics(node).len())
+    });
+    let before = entry.fragments.len();
+    for page in first.page_index..=end_page {
+        let bottom = bottom(page);
+        if let Some(fragment) = entry
+            .fragments
+            .iter_mut()
+            .rev()
+            .find(|fragment| fragment.page_index == page)
+        {
+            let top = fragment.y.to_f32();
+            let height = if page < end_page {
+                bottom - top
+            } else {
+                fragment.height.to_f32().max(bottom - top)
+            };
+            fragment.height = height.max(0.0).as_px();
+        } else {
+            entry.fragments.push(Fragment {
+                page_index: page,
+                x: first.x,
+                y: 0.0_f32.as_px(),
+                width: first.width,
+                height: bottom.max(0.0).as_px(),
+            });
         }
-        let added = entry.fragments.len() - before;
-        if added > 0 {
-            entry.fragments.sort_by_key(|fragment| fragment.page_index);
-            if let Some(lines) = lines {
-                if entry.line_boundaries.is_empty() && before == 1 {
-                    entry.line_boundaries = vec![0, lines];
-                }
-                if entry.line_boundaries.len() == before + 1 {
-                    entry
-                        .line_boundaries
-                        .extend(std::iter::repeat_n(lines, added));
-                }
+    }
+    let added = entry.fragments.len() - before;
+    if added > 0 {
+        entry.fragments.sort_by_key(|fragment| fragment.page_index);
+        if let Some(lines) = lines {
+            if entry.line_boundaries.is_empty() && before == 1 {
+                entry.line_boundaries = vec![0, lines];
+            }
+            if entry.line_boundaries.len() == before + 1 {
+                entry
+                    .line_boundaries
+                    .extend(std::iter::repeat_n(lines, added));
             }
         }
     }
@@ -2473,7 +2566,7 @@ fn kept_table_row_bottom(
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    let (group, index) = flow.pass.row_group(doc, row)?;
+    let (group, index) = flow.pass.row_group(flow, row)?;
     let end = group.reach[index];
     if end == index && !avoid {
         return None;
@@ -3033,11 +3126,11 @@ fn slices_at_a_page_top(node: &blitz_dom::Node) -> bool {
         && !is_replaced(node)
 }
 
-/// Whether a cell of an earlier row of `row`'s group spans down to it
-/// ([`RowGroup::spanned`]).
+/// Whether a cell of an earlier row of `row`'s group spans down to it and
+/// keeps it with the row above ([`RowGroup::spanned`]).
 fn spanned_from_above(flow: Flow<'_>, row: &blitz_dom::Node) -> bool {
     flow.pass
-        .row_group(flow.doc, row)
+        .row_group(flow, row)
         .is_some_and(|(group, index)| group.spanned[index])
 }
 
@@ -3293,11 +3386,11 @@ impl Pass {
     /// read once a group ([`group_rows`]).
     fn row_group(
         &self,
-        doc: &BaseDocument,
+        flow: Flow<'_>,
         row: &blitz_dom::Node,
     ) -> Option<(std::rc::Rc<RowGroup>, usize)> {
         let group = memo(&self.rows, row.parent?, || {
-            group_rows(doc, row).map(|(rows, _)| RowGroup::new(doc, &rows))
+            group_rows(flow.doc, row).map(|(rows, _)| RowGroup::new(flow, &rows))
         })?;
         let index = *group.index.get(&row.id)?;
         Some((group, index))
@@ -3311,29 +3404,131 @@ struct RowGroup {
     /// Each row's index in `rows`, by its node.
     index: BTreeMap<usize, usize>,
     /// The last row the cells from each row reach by `rowspan`
-    /// ([`span_end`]).
+    /// ([`span_end`]) in a run of rows kept together ([`Self::spanned`]);
+    /// the row itself elsewhere.
     reach: Vec<usize>,
-    /// Whether a cell of an earlier row spans down to each row (a span
-    /// from the group's first row on, [`span_end`]): the rows a cell spans
-    /// have no break opportunity between them, so none of them but the
-    /// first moves alone ([`line_moves_on`]).
+    /// Whether a cell of an earlier row spans down to each row and the rows
+    /// it spans are kept together: under `-fulgur-span-break-inside:
+    /// avoid-unsplittable` on the table, when no row of the run the spans
+    /// chain ([`span_end`]) holds a cell of two lines or more
+    /// ([`row_splits`]). Then no opportunity lies between it and the row
+    /// above, so it does not move alone ([`line_moves_on`]). Elsewhere the
+    /// rows a cell spans break as other rows do: css-tables-3 §6.1 calls a
+    /// row whose spanning cells span a later row freely fragmentable.
     spanned: Vec<bool>,
+    /// Whether a cell of an earlier row spans down to each row with its
+    /// content ([`span_content_bottom`]): the walk does not cut a spanning
+    /// cell's content at a forced break, so no forced break is taken before
+    /// the row ([`opportunities`]).
+    crossed: Vec<bool>,
+}
+
+/// The bottom of the content of the table cell `cell`, in its table's
+/// coordinates as its layout box is: its last in-flow child's bottom, or
+/// its last line's, else its content box top.
+fn span_content_bottom(doc: &BaseDocument, cell: &blitz_dom::Node) -> f32 {
+    let layout = cell.final_layout;
+    let top = layout.border.top + layout.padding.top;
+    let lines = collect_inline_line_metrics(cell)
+        .last()
+        .map(|&(_, bottom)| top + bottom);
+    let children = walk_children_of(cell)
+        .into_iter()
+        .filter_map(|id| doc.get_node(id))
+        .filter(|child| !leaves_the_flow(child))
+        .map(|child| child.final_layout.location.y + child.final_layout.size.height)
+        .reduce(f32::max);
+    layout.location.y + lines.or(children).unwrap_or(top)
+}
+
+/// The lines of `node`'s content, counted as far as two: an inline root's
+/// lines, a block container's children's, and one for a childless box with
+/// a height, which places as one piece.
+fn content_lines(doc: &BaseDocument, node: &blitz_dom::Node, depth: usize) -> usize {
+    let lines = collect_inline_line_metrics(node).len();
+    if lines > 0 || depth >= crate::MAX_DOM_DEPTH {
+        return lines;
+    }
+    let mut count = 0;
+    for child in walk_children_of(node)
+        .into_iter()
+        .filter_map(|id| doc.get_node(id))
+        .filter(|child| !out_of_flow(child))
+    {
+        count += if child.children.is_empty() {
+            usize::from(child.final_layout.size.height > 0.0)
+        } else {
+            content_lines(doc, child, depth + 1)
+        };
+        if count >= 2 {
+            break;
+        }
+    }
+    count
+}
+
+/// Whether the table row `row` may split: one of its cells that spans no
+/// rows counts two lines or more ([`content_lines`]).
+fn row_splits(doc: &BaseDocument, row: &blitz_dom::Node) -> bool {
+    row_cells(doc, row).any(|cell| rowspan_of(cell) == 1 && content_lines(doc, cell, 0) >= 2)
+}
+
+/// The `-fulgur-span-break-inside` of the table the row group `rows`
+/// belongs to.
+fn span_break_inside(
+    flow: Flow<'_>,
+    rows: &[&blitz_dom::Node],
+) -> crate::column_css::SpanBreakInside {
+    let group = rows.first().and_then(|row| flow.doc.get_node(row.parent?));
+    let table = group.and_then(|group| {
+        if displays(group, DisplayInside::Table) {
+            Some(group)
+        } else {
+            flow.doc.get_node(group.parent?)
+        }
+    });
+    table
+        .and_then(|table| flow.column_styles?.get(&table.id)?.span_break_inside)
+        .unwrap_or_default()
 }
 
 impl RowGroup {
-    fn new(doc: &BaseDocument, rows: &[&blitz_dom::Node]) -> Self {
-        let reach: Vec<usize> = (0..rows.len())
+    fn new(flow: Flow<'_>, rows: &[&blitz_dom::Node]) -> Self {
+        let doc = flow.doc;
+        let span_ends: Vec<usize> = (0..rows.len())
             .map(|from| span_end(doc, rows, from))
             .collect();
+        let keeps =
+            span_break_inside(flow, rows) == crate::column_css::SpanBreakInside::AvoidUnsplittable;
         let mut spanned = vec![false; rows.len()];
+        let mut reach: Vec<usize> = (0..rows.len()).collect();
         let mut start = 0;
         while start < rows.len() {
-            let end = reach[start];
-            for flag in &mut spanned[start + 1..=end] {
-                *flag = true;
+            let end = span_ends[start];
+            if keeps && end > start && !rows[start..=end].iter().any(|row| row_splits(doc, row)) {
+                for flag in &mut spanned[start + 1..=end] {
+                    *flag = true;
+                }
+                reach[start..=end].copy_from_slice(&span_ends[start..=end]);
             }
             start = end + 1;
         }
+        let top = |row: &blitz_dom::Node| {
+            row_cells(doc, row)
+                .map(|cell| cell.final_layout.location.y)
+                .reduce(f32::min)
+        };
+        let crossed = (0..rows.len())
+            .map(|at| {
+                (0..at).filter(|&from| span_ends[from] >= at).any(|from| {
+                    row_cells(doc, rows[from]).any(|cell| {
+                        from + rowspan_of(cell) > at
+                            && top(rows[at])
+                                .is_none_or(|top| span_content_bottom(doc, cell) > top + 0.5)
+                    })
+                })
+            })
+            .collect();
         Self {
             rows: rows.iter().map(|row| row.id).collect(),
             index: rows
@@ -3343,6 +3538,7 @@ impl RowGroup {
                 .collect(),
             reach,
             spanned,
+            crossed,
         }
     }
 }
@@ -4867,14 +5063,13 @@ fn fragment_block_subtree_inner(
             let mut child_lift = 0.0;
             // A box of a line that starts below content on its page is
             // entered so: its first content that does not fit goes on to
-            // the next page, as the line stays for the boxes beside it. Not
-            // a cell that spans rows: the rows it spans are placed beside
-            // it, not after its content.
+            // the next page, as the line stays for the boxes beside it; a
+            // cell that spans rows too, which ends the last row it spans,
+            // whose rows are placed beside it ([`SpanEnd`]).
             let below_content = cursor.entered_below_content
-                || (rowspan_of(child) == 1
-                    && line.as_ref().is_some_and(|open| {
-                        open.start.page_has_content && open.start.page_index == cursor.page_index
-                    }));
+                || line.as_ref().is_some_and(|open| {
+                    open.start.page_has_content && open.start.page_index == cursor.page_index
+                });
             let (np, nc) = fragment_block_subtree(
                 geometry,
                 flow,
@@ -8943,17 +9138,162 @@ mod tests {
         );
     }
 
-    /// No opportunity lies between the rows a cell spans: a forced break
-    /// before the second of them is not taken.
+    /// A forced break between the rows a cell spans is taken below the
+    /// spanning cell's content (`s`, one 20 px line).
+    /// One that the content crosses (a 30 px block over 20 px rows) is not,
+    /// as the walk does not cut a spanning cell's content at a forced break.
     #[test]
-    fn a_forced_break_between_the_rows_a_cell_spans_is_not_taken() {
-        let body = r#"<table><tbody><tr><td id="a">a</td><td rowspan="2">s</td></tr>
-            <tr style="break-before: page"><td id="b">b</td></tr>
-            <tr style="break-before: page"><td id="c">c</td></tr></tbody></table>"#;
-        let (doc, geometry) = row_break_pass(body);
+    fn a_forced_break_between_the_rows_a_cell_spans_is_taken_below_its_content() {
+        let at = |content: &str| {
+            let body = format!(
+                r#"<table><tbody><tr><td id="a">a</td><td rowspan="2">{content}</td></tr>
+                <tr style="break-before: page"><td id="b">b</td></tr>
+                <tr style="break-before: page"><td id="c">c</td></tr></tbody></table>"#
+            );
+            let (doc, geometry) = row_break_pass(&body);
+            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id))
+        };
         assert_eq!(
-            ["a", "b", "c"].map(|id| placements(&doc, &geometry, id)),
-            [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]]
+            [at("s"), at(r#"<div style="height: 30px"></div>"#)],
+            [
+                [vec![(0, 0.0)], vec![(1, 0.0)], vec![(2, 0.0)]],
+                [vec![(0, 0.0)], vec![(0, 20.0)], vec![(1, 0.0)]],
+            ]
+        );
+    }
+
+    /// A table after a `spacer` px block, on 100 px pages, under the table
+    /// style `style`, of one row group: a cell `s` of `span` 20 px lines
+    /// that spans a row for each of `rows`, beside a cell `a`, `b`, ... of
+    /// that many 20 px lines. Cells take `orphans: 1; widows: 1`, as text
+    /// in a cell splits anywhere.
+    fn span_group_pass(
+        style: &str,
+        rows: &[usize],
+        span: usize,
+        spacer: u32,
+    ) -> (blitz_html::HtmlDocument, PaginationGeometryTable) {
+        let lines = |n: usize, text: &str| vec![text; n].join("<br>");
+        let cells: Vec<String> = rows
+            .iter()
+            .zip(["a", "b", "c", "d"])
+            .map(|(&n, id)| format!(r#"<td id="{id}">{}</td>"#, lines(n, id)))
+            .collect();
+        let body = cells
+            .iter()
+            .enumerate()
+            .map(|(k, cell)| {
+                let s = (k == 0).then(|| {
+                    format!(
+                        r#"<td id="s" rowspan="{}">{}</td>"#,
+                        rows.len(),
+                        lines(span, "s")
+                    )
+                });
+                format!("<tr>{}{cell}</tr>", s.unwrap_or_default())
+            })
+            .collect::<String>();
+        let html = format!(
+            r#"<!doctype html>
+            <html><head><style>
+              html, body {{ margin: 0; padding: 0; }}
+              table {{ margin: 0; border-spacing: 0; width: 100px; }}
+              td {{ padding: 0; line-height: 20px; orphans: 1; widows: 1; vertical-align: top; }}
+            </style></head><body><div style="height: {spacer}px"></div>
+            <table style="{style}"><tbody>{body}</tbody></table></body></html>"#
+        );
+        let mut doc = parse(&html, 200.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geometry =
+            super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        (doc, geometry)
+    }
+
+    const KEEP_UNSPLITTABLE: &str = "-fulgur-span-break-inside: avoid-unsplittable";
+
+    /// Rows of one line each that a one-line cell spans, from y 70: freely
+    /// fragmentable by default (css-tables-3 §6.1 keeps unfragmented only
+    /// rows that no cell spans past), they break between them,
+    /// and the spanning cell's box goes on beside `b`; under
+    /// `avoid-unsplittable` they move to the next page together, though the
+    /// spanning cell's content fits above the break.
+    #[test]
+    fn rows_of_one_line_that_a_cell_spans_break_apart_unless_kept() {
+        let at = |style| {
+            let (doc, geometry) = span_group_pass(style, &[1, 1], 1, 70);
+            (
+                ["a", "b"].map(|id| placements(&doc, &geometry, id)),
+                placements(&doc, &geometry, "s"),
+            )
+        };
+        assert_eq!(
+            [at(""), at(KEEP_UNSPLITTABLE)],
+            [
+                ([vec![(0, 70.0)], vec![(1, 0.0)]], vec![(0, 70.0), (1, 0.0)]),
+                ([vec![(1, 0.0)], vec![(1, 20.0)]], vec![(1, 0.0)]),
+            ]
+        );
+    }
+
+    /// Rows of one line each that a cell of four lines spans, grown to 40 px
+    /// each, from y 50: by default they break between them, and the
+    /// spanning cell's lines with them, two on each page; under
+    /// `avoid-unsplittable` they move to the next page together.
+    #[test]
+    fn a_tall_cell_spanning_rows_of_one_line_breaks_by_lines_unless_kept() {
+        let at = |style| {
+            let (doc, geometry) = span_group_pass(style, &[1, 1], 4, 50);
+            let s = find_by_id(&doc, "s").unwrap();
+            (
+                ["a", "b"].map(|id| placements(&doc, &geometry, id)),
+                line_partition(&geometry, s),
+            )
+        };
+        assert_eq!(
+            [at(""), at(KEEP_UNSPLITTABLE)],
+            [
+                (
+                    [vec![(0, 50.0)], vec![(1, 0.0)]],
+                    (vec![0, 1], vec![0, 2, 4])
+                ),
+                ([vec![(1, 0.0)], vec![(1, 40.0)]], (vec![1], vec![])),
+            ]
+        );
+    }
+
+    /// Rows of two lines that a cell of three lines spans, from y 50, break
+    /// between them under `avoid-unsplittable` too: a row that can split
+    /// between its lines leaves its rows freely fragmentable. The spanning
+    /// cell breaks by its lines at the same place, two on the first page.
+    #[test]
+    fn rows_of_two_lines_that_a_cell_spans_break_between_them_though_kept() {
+        let (doc, geometry) = span_group_pass(KEEP_UNSPLITTABLE, &[2, 2], 3, 50);
+        let s = find_by_id(&doc, "s").unwrap();
+        assert_eq!(
+            (
+                ["a", "b"].map(|id| placements(&doc, &geometry, id)),
+                line_partition(&geometry, s),
+            ),
+            (
+                [vec![(0, 50.0)], vec![(1, 0.0)]],
+                (vec![0, 1], vec![0, 2, 3])
+            )
+        );
+    }
+
+    /// Rows of two lines that a cell of three lines spans, from y 70, break
+    /// inside the first row under `avoid-unsplittable`: one line of `a` and
+    /// of `s` stays on the first page.
+    #[test]
+    fn rows_of_two_lines_that_a_cell_spans_break_inside_a_row_though_kept() {
+        let (doc, geometry) = span_group_pass(KEEP_UNSPLITTABLE, &[2, 2], 3, 70);
+        let (a, s) = (
+            find_by_id(&doc, "a").unwrap(),
+            find_by_id(&doc, "s").unwrap(),
+        );
+        assert_eq!(
+            (line_partition(&geometry, a), line_partition(&geometry, s)),
+            ((vec![0, 1], vec![0, 1, 2]), (vec![0, 1], vec![0, 1, 3]))
         );
     }
 
@@ -15049,27 +15389,48 @@ h2 { string-set: chapter-title content(text); }
 
     /// A cell spanning rows reaches the rows its `rowspan` counts, within
     /// its row group; a cell of a row reached so spans on in turn, and a
-    /// row of cells one row tall reaches none.
+    /// row of cells one row tall reaches none. Under
+    /// `-fulgur-span-break-inside: avoid-unsplittable` the rows so chained
+    /// are kept together unless one of them holds a cell of two lines
+    /// (`r3`'s `f`, which frees the chain of `r3` to `r5`); by default none
+    /// are.
     #[test]
     fn a_rows_span_reaches_the_rows_its_cells_span_within_its_group() {
-        let html = r#"<html><body><table><tbody>
-            <tr id="r0"><td rowspan="2">a</td><td>b</td></tr><tr id="r1"><td>c</td></tr>
-            <tr id="r2"><td>d</td></tr>
-            <tr id="r3"><td rowspan="2">e</td><td>f</td></tr>
-            <tr id="r4"><td rowspan="2">g</td></tr><tr id="r5"><td>h</td></tr>
-            <tr id="r6"><td rowspan="9">i</td></tr><tr id="r7"><td>j</td></tr>
-            </tbody></table></body></html>"#;
-        let doc = parse(html, 400.0);
-        let row = doc.get_node(find_by_id(&doc, "r0").unwrap()).unwrap();
-        let (rows, _) = super::group_rows(&doc, row).unwrap();
-        let ends: Vec<usize> = (0..rows.len())
-            .map(|from| super::span_end(&doc, &rows, from))
-            .collect();
-        assert_eq!(ends, [1, 1, 2, 5, 5, 5, 7, 7]);
-        let spanned = super::RowGroup::new(&doc, &rows).spanned;
+        let spanned = |style: &str| {
+            let html = format!(
+                r#"<html><body><table style="{style}"><tbody>
+                <tr id="r0"><td rowspan="2">a</td><td>b</td></tr><tr id="r1"><td>c</td></tr>
+                <tr id="r2"><td>d</td></tr>
+                <tr id="r3"><td rowspan="2">e</td><td>f<br>f</td></tr>
+                <tr id="r4"><td rowspan="2">g</td></tr><tr id="r5"><td>h</td></tr>
+                <tr id="r6"><td rowspan="9">i</td></tr><tr id="r7"><td>j</td></tr>
+                </tbody></table></body></html>"#
+            );
+            let doc = parse(&html, 400.0);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let pass = super::Pass::default();
+            let flow = super::Flow {
+                doc: &doc,
+                column_styles: Some(&styles),
+                used_page_names: None,
+                running_store: None,
+                pass: &pass,
+                forced_before: None,
+            };
+            let row = doc.get_node(find_by_id(&doc, "r0").unwrap()).unwrap();
+            let (rows, _) = super::group_rows(&doc, row).unwrap();
+            let ends: Vec<usize> = (0..rows.len())
+                .map(|from| super::span_end(&doc, &rows, from))
+                .collect();
+            assert_eq!(ends, [1, 1, 2, 5, 5, 5, 7, 7]);
+            super::RowGroup::new(flow, &rows).spanned
+        };
         assert_eq!(
-            spanned,
-            [false, true, false, false, true, true, false, true]
+            [spanned(KEEP_UNSPLITTABLE), spanned("")],
+            [
+                [false, true, false, false, false, false, false, true],
+                [false; 8],
+            ]
         );
     }
 
