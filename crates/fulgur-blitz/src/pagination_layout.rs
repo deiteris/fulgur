@@ -473,6 +473,7 @@ impl<'a> PaginationLayoutTree<'a> {
             });
 
         let pass = Pass::default();
+        let foot_clearance = page_foot_clearance(self.doc, self.column_styles, self.page_height_px);
         let flow = Flow {
             doc: self.doc,
             column_styles: self.column_styles,
@@ -480,6 +481,7 @@ impl<'a> PaginationLayoutTree<'a> {
             running_store: self.running_store,
             pass: &pass,
             forced_before: None,
+            foot_clearance,
         };
         let mut remaining_repeat_budget = crate::MAX_SUBTREE_PAGE_FRAGMENTS;
         fragment_block_subtree_inner(
@@ -490,7 +492,7 @@ impl<'a> PaginationLayoutTree<'a> {
             body_x,
             0,
             0.0,
-            self.page_height_px,
+            self.page_height_px - foot_clearance,
             0,
             None,
             false,
@@ -502,6 +504,25 @@ impl<'a> PaginationLayoutTree<'a> {
     }
 }
 
+/// The page-foot clearance, in px, of pages `page_height_px` tall: the
+/// root element's `-fulgur-page-foot-clearance`, zero when it declares none
+/// or one that leaves no room on the page.
+fn page_foot_clearance(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    page_height_px: f32,
+) -> f32 {
+    let declared = column_styles
+        .and_then(|styles| styles.get(&doc.root_element().id))
+        .and_then(|props| props.page_foot_clearance)
+        .map_or(0.0, |pt| pt.as_pt().in_px().to_f32());
+    if declared < page_height_px {
+        declared
+    } else {
+        0.0
+    }
+}
+
 /// How far past the page foot a box may reach and still fit the page. Stylo
 /// and Taffy round some lengths to whole CSS pixels (a 220pt spacer, 293.33
 /// px, lays out 294 px tall), while the page height is not rounded, so a box
@@ -509,7 +530,8 @@ impl<'a> PaginationLayoutTree<'a> {
 const FIT_SLACK_PX: f32 = 1.0;
 
 /// Whether `extent` px fit a page strip `page_height_px` tall, within
-/// [`FIT_SLACK_PX`]: the fits the walk measures against a page.
+/// [`FIT_SLACK_PX`]: the fits the walk measures against a page. The strip
+/// is the page less its foot clearance ([`Flow::foot_clearance`]).
 fn fits(extent: f32, page_height_px: f32) -> bool {
     extent <= page_height_px + FIT_SLACK_PX
 }
@@ -1370,15 +1392,47 @@ fn is_block_flow(flow: Flow<'_>, parent: &blitz_dom::Node) -> bool {
 }
 
 /// How far below the bottom of line `line` of `children` (of `parent`,
+/// [`flow_lines`]) what the line keeps with it on its page reaches: the
+/// bottom margins of its boxes at the page foot ([`foot_margin`]), and the
+/// boxes after it that an `avoid` joins it to ([`kept_run_after_line`]).
+#[allow(clippy::too_many_arguments)]
+fn kept_after_line(
+    flow: Flow<'_>,
+    parent: &blitz_dom::Node,
+    children: &[usize],
+    lines: &[Vec<usize>],
+    values: &[BreakValue],
+    line: usize,
+    page_height_px: f32,
+    depth: usize,
+) -> f32 {
+    let margins = lines[line]
+        .iter()
+        .filter_map(|&index| flow.doc.get_node(children[index]))
+        .map(|child| foot_margin(flow, child))
+        .fold(0.0_f32, f32::max);
+    margins.max(kept_run_after_line(
+        flow,
+        parent,
+        children,
+        lines,
+        values,
+        line,
+        page_height_px,
+        depth,
+    ))
+}
+
+/// How far below the bottom of line `line` of `children` (of `parent`,
 /// [`flow_lines`]) the boxes after it that the line keeps with it reach,
 /// when the opportunity after the line is `avoid` (css-break-3 §4.4,
 /// [`opportunities`] `values`): the gap, then the next line's leading unit
 /// ([`leading_extent`]), or the whole next box and what it keeps with it in
-/// turn when its unit is the whole box. After the last line, what follows
-/// the parent's bottom edge that the parent keeps with it
-/// ([`kept_after_box`]). Zero when no `avoid` follows the line.
+/// turn when its unit is the whole box ([`kept_after_line`]). After the last
+/// line, what follows the parent's bottom edge that the parent keeps with
+/// it ([`kept_after_box`]). Zero when no `avoid` follows the line.
 #[allow(clippy::too_many_arguments)]
-fn kept_after_line(
+fn kept_run_after_line(
     flow: Flow<'_>,
     parent: &blitz_dom::Node,
     children: &[usize],
@@ -1497,31 +1551,12 @@ fn kept_after_box(
 /// `final_layout.margin` is no measure of it: Blitz folds a floated first
 /// child's margin into its parent's there.
 fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) -> f32 {
-    use ::style::values::computed::Length;
-    use ::style::values::generics::length::GenericMargin;
     let doc = flow.doc;
     let own = |node: &blitz_dom::Node| {
         if !keeps_margin(flow, node, forced) || is_table_internal(node) {
             return 0.0;
         }
-        let basis = node
-            .layout_parent
-            .get()
-            .or(node.parent)
-            .and_then(|id| doc.get_node(id))
-            .map_or(0.0, |parent| {
-                let layout = parent.final_layout;
-                layout.size.width
-                    - layout.padding.left
-                    - layout.padding.right
-                    - layout.border.left
-                    - layout.border.right
-            });
-        node.primary_styles()
-            .map_or(0.0, |styles| match &styles.get_margin().margin_top {
-                GenericMargin::LengthPercentage(lp) => lp.resolve(Length::new(basis)).px(),
-                _ => 0.0,
-            })
+        own_margin(doc, node, false)
     };
     let (mut positive, mut negative) = (0.0_f32, 0.0_f32);
     let mut add = |margin: f32| {
@@ -1561,6 +1596,67 @@ fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) ->
         current = child;
     }
     positive + negative
+}
+
+/// The computed `margin-top` of `node`, or its `margin-bottom` when
+/// `bottom`, in px: a percentage resolves against the width of its
+/// containing block's content box, and `auto` is zero.
+fn own_margin(doc: &BaseDocument, node: &blitz_dom::Node, bottom: bool) -> f32 {
+    use ::style::values::computed::Length;
+    use ::style::values::generics::length::GenericMargin;
+    let basis = node
+        .layout_parent
+        .get()
+        .or(node.parent)
+        .and_then(|id| doc.get_node(id))
+        .map_or(0.0, |parent| {
+            let layout = parent.final_layout;
+            layout.size.width
+                - layout.padding.left
+                - layout.padding.right
+                - layout.border.left
+                - layout.border.right
+        });
+    node.primary_styles().map_or(0.0, |styles| {
+        let margins = styles.get_margin();
+        let margin = if bottom {
+            &margins.margin_bottom
+        } else {
+            &margins.margin_top
+        };
+        match margin {
+            GenericMargin::LengthPercentage(lp) => lp.resolve(Length::new(basis)).px(),
+            _ => 0.0,
+        }
+    })
+}
+
+/// What the bottom margin of `node` keeps below its bottom edge where the
+/// box ends near the page foot, by its `-fulgur-page-foot-margin`
+/// ([`crate::column_css::PageFootMargin`]): under `page`, the part of the
+/// margin beyond the page-foot clearance, which the walk's page strip
+/// leaves free already, so that the margin box ends by the page foot; under
+/// `clearance`, the whole margin, so that it ends above the clearance;
+/// otherwise nothing, as css-break-3 §5.2 truncates the margin at the break.
+/// A table's row or cell has no margin.
+fn foot_margin(flow: Flow<'_>, node: &blitz_dom::Node) -> f32 {
+    use crate::column_css::PageFootMargin;
+    let declared = flow
+        .column_styles
+        .and_then(|styles| styles.get(&node.id))
+        .and_then(|props| props.page_foot_margin);
+    let margin = || {
+        if is_table_internal(node) {
+            0.0
+        } else {
+            own_margin(flow.doc, node, true).max(0.0)
+        }
+    };
+    match declared {
+        None | Some(PageFootMargin::None) => 0.0,
+        Some(PageFootMargin::Page) => (margin() - flow.foot_clearance).max(0.0),
+        Some(PageFootMargin::Clearance) => margin(),
+    }
 }
 
 /// Whether `node` is a table's row, row group, column, column group, or cell,
@@ -3365,6 +3461,22 @@ struct Flow<'a> {
     /// The first cell of a table row before which the walk takes a forced
     /// break, for its table's row `widows` ([`fragment_table_rows`]).
     forced_before: Option<usize>,
+    /// How far above the page foot a fragment ends, at least, where a break
+    /// point precedes it, in px (`-fulgur-page-foot-clearance` on the root
+    /// element, [`page_foot_clearance`]). The walk fills a page strip this
+    /// much shorter than the page, so that every fit it measures leaves it
+    /// free; only a box taller than the page itself is sliced at the page
+    /// foot ([`Flow::page_foot`]).
+    foot_clearance: f32,
+}
+
+impl Flow<'_> {
+    /// The foot of the page whose strip, above the page-foot clearance, is
+    /// `page_height_px` tall: where the walk slices a box taller than the
+    /// page.
+    fn page_foot(&self, page_height_px: f32) -> f32 {
+        page_height_px + self.foot_clearance
+    }
 }
 
 /// What a pass computes once and its walks read: the breaks of its boxes
@@ -5186,9 +5298,12 @@ fn fragment_block_subtree_inner(
         // alone ([`line_moves_on`]).
         // A childless box at the top of a page that does not fit the room
         // left below a top edge is sliced from where it stands instead
-        // (css-break-3 §4.4), in a table cell too.
+        // (css-break-3 §4.4), in a table cell too. Slices are cut at the
+        // page foot, below the page-foot clearance: a box that a break
+        // cannot move ends there whole when it fits the page.
+        let page_foot = flow.page_foot(page_height_px);
         let slices_at_top = cursor.at_page_top()
-            && overflows(child_page_y + child_h, page_height_px)
+            && overflows(child_page_y + child_h, page_foot)
             && slices_at_a_page_top(child)
             && slices_where_it_is(doc, child, true);
         // A box of a line placed whole that crosses the page foot, neither
@@ -5197,8 +5312,8 @@ fn fragment_block_subtree_inner(
         // stretched to the line's height also reaches the line's end when
         // the line closes ([`stretch_line_items`]).
         let slices_in_line = in_line
-            && overflows(child_page_y + child_h, page_height_px)
-            && child_page_y < page_height_px
+            && overflows(child_page_y + child_h, page_foot)
+            && child_page_y < page_foot
             && !is_transformed(child)
             && !is_replaced(child)
             && slices_where_it_is(doc, child, true);
@@ -5258,16 +5373,16 @@ fn fragment_block_subtree_inner(
         if slices_at_top
             || slices_in_line
             || (!is_transformed(child)
-                && overflows(child_h, page_height_px)
-                && child_page_y < page_height_px
+                && overflows(child_h, page_foot)
+                && child_page_y < page_foot
                 && slices_where_it_is(doc, child, true))
         {
             // The slices are placed from the child's own place on the page,
             // and the walk then goes on from the last one, as after an
             // inline root that split.
-            let mut slices = PageCursor::new(cursor.page_index, child_page_y, page_height_px);
+            let mut slices = PageCursor::new(cursor.page_index, child_page_y, page_foot);
             slices.page_has_content = cursor.page_has_content;
-            let first_slice_h = (page_height_px - child_page_y).min(child_h);
+            let first_slice_h = (page_foot - child_page_y).min(child_h);
             geometry
                 .entry(child_id)
                 .or_default()
@@ -5315,8 +5430,8 @@ fn fragment_block_subtree_inner(
             // (the removed `is_replaced_content`) let such a node amplify a
             // few bytes of HTML into ~`MAX_PAGES` blank pages (a validated
             // high-severity DoS).
-            let collapse_childless = page_height_px > 0.0
-                && (remaining / page_height_px).ceil() > crate::MAX_PAGES as f32
+            let collapse_childless = page_foot > 0.0
+                && (remaining / page_foot).ceil() > crate::MAX_PAGES as f32
                 && !subtree_has_rendered_content(doc, child_id, 0);
             if collapse_childless {
                 // fulgur-c8re (Codex P1 on PR #575): bound the OCCUPIED
@@ -5346,7 +5461,7 @@ fn fragment_block_subtree_inner(
                 // `remaining` is `+inf`); content past the cap is truncated.
                 while remaining > 0.0 && slices.page_index < crate::MAX_PAGES {
                     slices.advance();
-                    last_slice_h = remaining.min(page_height_px);
+                    last_slice_h = remaining.min(page_foot);
                     geometry
                         .entry(child_id)
                         .or_default()
@@ -7854,6 +7969,7 @@ mod tests {
                 running_store: None,
                 pass: &Pass::default(),
                 forced_before: None,
+                foot_clearance: 0.0,
             },
             parent_id,
             600.0,                // parent_w
@@ -7935,6 +8051,7 @@ mod tests {
                 running_store: None,
                 pass: &Pass::default(),
                 forced_before: None,
+                foot_clearance: 0.0,
             },
             table_id,
             200.0,
@@ -13534,6 +13651,142 @@ h2 { string-set: chapter-title content(text); }
         }
     }
 
+    /// The fragments of `body` on 100px pages, under `root`'s style, of the
+    /// element `id`.
+    fn foot_placements(root: &str, body: &str, id: &str) -> Vec<(u32, f32)> {
+        let html = format!(
+            r#"<html style="{root}"><body style="margin: 0; padding: 0; line-height: 20px">{body}</body></html>"#
+        );
+        let mut doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        placements(&doc, &geom, id)
+    }
+
+    /// With `-fulgur-page-foot-clearance` on the root, a fragment that a break
+    /// point precedes ends that far above the page foot or higher, at any
+    /// depth: a box placed whole, a paragraph's line, and a table row. One
+    /// that would end closer moves to the next page: with 16px on a 100px
+    /// page, a box ending at 84 stays and one ending at 85 moves. Without the
+    /// property the page foot is the limit.
+    #[test]
+    fn a_fragment_ends_above_the_page_foot_clearance() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let pages = |root: &str, body: &str, id: &str| -> Vec<u32> {
+            foot_placements(root, body, id)
+                .iter()
+                .map(|&(page, _)| page)
+                .collect()
+        };
+        let boxes = |filler: u32| {
+            format!(
+                r#"<div style="height: {filler}px"></div><div id="b" style="height: 10px"></div>"#
+            )
+        };
+        assert_eq!(pages(clearance, &boxes(74), "b"), [0], "ends at 84");
+        assert_eq!(pages(clearance, &boxes(75), "b"), [1], "ends at 85");
+        assert_eq!(pages("", &boxes(90), "b"), [0], "no clearance");
+        let nested = |filler: u32| {
+            format!(
+                r#"<section><div style="height: {filler}px"></div><div><div id="b" style="height: 10px"></div></div></section>"#
+            )
+        };
+        assert_eq!(pages(clearance, &nested(74), "b"), [0], "nested, at 84");
+        assert_eq!(pages(clearance, &nested(75), "b"), [1], "nested, at 85");
+        let lines = r#"<div style="height: 30px"></div><p id="p" style="margin: 0; orphans: 1; widows: 1">a<br>b<br>c</p>"#;
+        assert_eq!(
+            foot_placements(clearance, lines, "p"),
+            [(0, 30.0), (1, 0.0)],
+            "the line ending at 90 moves"
+        );
+        assert_eq!(foot_placements("", lines, "p"), [(0, 30.0)]);
+        let rows = r#"<table style="border-spacing: 0"><tr><td style="height: 70px; padding: 0"></td></tr><tr><td id="c" style="height: 20px; padding: 0"></td></tr></table>"#;
+        assert_eq!(pages(clearance, rows, "c"), [1], "the row ending at 90");
+        assert_eq!(pages("", rows, "c"), [0]);
+    }
+
+    /// The page-foot clearance holds only where a break point precedes the
+    /// fragment: a box at the top of a page taller than the room above the
+    /// clearance stays there whole, neither moved nor sliced, and what
+    /// follows it moves on; a box taller than the page is sliced at the page
+    /// foot, as without the property.
+    #[test]
+    fn a_box_at_a_page_top_may_end_in_the_page_foot_clearance() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let body =
+            r#"<div id="t" style="height: 95px"></div><div id="n" style="height: 5px"></div>"#;
+        assert_eq!(foot_placements(clearance, body, "t"), [(0, 0.0)]);
+        assert_eq!(foot_placements(clearance, body, "n"), [(1, 0.0)]);
+        let tall = r#"<div id="t" style="height: 150px"></div>"#;
+        assert_eq!(
+            foot_placements(clearance, tall, "t"),
+            foot_placements("", tall, "t"),
+            "sliced at the page foot"
+        );
+    }
+
+    /// Under `-fulgur-page-foot-margin: page`, a paragraph's margin box ends
+    /// by the page foot, its bottom margin taking the page-foot clearance
+    /// in: with 16px on a 100px page, a 32px margin lets the paragraph end
+    /// at 68, not 69, and a 12px margin, inside the clearance, leaves the
+    /// limit at 84. Of a paragraph of several lines, the last line moves.
+    /// Without the property the margin is not counted.
+    #[test]
+    fn a_paragraph_margin_must_fit_above_the_page_foot() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let page = "-fulgur-page-foot-margin: page";
+        let page_of = |filler: u32, margin: u32, foot: &str| {
+            let body = format!(
+                r#"<div style="height: {filler}px"></div><p id="p" style="margin: 0 0 {margin}px; {foot}">a</p>"#
+            );
+            foot_placements(clearance, &body, "p")[0].0
+        };
+        assert_eq!(
+            [page_of(48, 32, page), page_of(49, 32, page)],
+            [0, 1],
+            "a 32px margin"
+        );
+        assert_eq!(
+            [page_of(64, 12, page), page_of(65, 12, page)],
+            [0, 1],
+            "a 12px margin"
+        );
+        assert_eq!(page_of(64, 32, ""), 0, "not counted");
+        let lines = format!(
+            r#"<div style="height: 9px"></div><p id="p" style="margin: 0 0 32px; orphans: 1; widows: 1; {page}">a<br>b<br>c</p>"#
+        );
+        assert_eq!(
+            foot_placements(clearance, &lines, "p"),
+            [(0, 9.0), (1, 0.0)],
+            "the last line, ending at 69"
+        );
+    }
+
+    /// Under `-fulgur-page-foot-margin: clearance`, a list's margin box ends
+    /// above the page-foot clearance, its bottom margin adding to it: with
+    /// 16px on a 100px page and a 12px margin, its last item ends at 72 at
+    /// most, and moves alone when it would end at 73. Without the property
+    /// the margin is not counted.
+    #[test]
+    fn a_list_margin_adds_to_the_page_foot_clearance() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let list = |filler: u32, items: u32, foot: &str| {
+            let item = r#"<li style="height: 20px"></li>"#.repeat(items as usize - 1);
+            format!(
+                r#"<div style="height: {filler}px"></div><ul style="margin: 0 0 12px; padding: 0; list-style: none; {foot}">{item}<li id="i" style="height: 20px"></li></ul>"#
+            )
+        };
+        let foot = "-fulgur-page-foot-margin: clearance";
+        let pages = |body: &str| foot_placements(clearance, body, "i")[0].0;
+        assert_eq!(
+            [pages(&list(52, 1, foot)), pages(&list(53, 1, foot))],
+            [0, 1]
+        );
+        assert_eq!(pages(&list(33, 2, foot)), 1, "the second item, at 73");
+        assert_eq!(pages(&list(32, 2, foot)), 0, "the second item, at 72");
+        assert_eq!(pages(&list(64, 1, "")), 0, "not counted");
+    }
+
     /// A forced break is taken only where content precedes it on the page
     /// (css-break-3 §3.1 and css-page-3 §5 leave a break at the start of a
     /// page that holds nothing without effect, and the WPT references let such
@@ -15416,6 +15669,7 @@ h2 { string-set: chapter-title content(text); }
                 running_store: None,
                 pass: &pass,
                 forced_before: None,
+                foot_clearance: 0.0,
             };
             let row = doc.get_node(find_by_id(&doc, "r0").unwrap()).unwrap();
             let (rows, _) = super::group_rows(&doc, row).unwrap();
