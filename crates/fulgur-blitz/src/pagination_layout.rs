@@ -959,9 +959,10 @@ fn walk_children_of(node: &blitz_dom::Node) -> Vec<usize> {
 /// Whether the walk never enters `node` for its children nor splits it, at
 /// any room: a childless or replaced box, a transformed box that fits a page
 /// (it paints as one shape, CSS Transforms §6.1), an atomic inline, or a box
-/// in an orthogonal flow (CSS Writing Modes 4 §9).
-fn is_atomic(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px: f32) -> bool {
-    let fits_page = fits(node.final_layout.size.height, page_height_px);
+/// in an orthogonal flow (CSS Writing Modes 4 §9). `page_foot_px` is the
+/// height of the whole page ([`Flow::page_foot`]).
+fn is_atomic(doc: &BaseDocument, node: &blitz_dom::Node, page_foot_px: f32) -> bool {
+    let fits_page = fits(node.final_layout.size.height, page_foot_px);
     let orthogonal = node
         .parent
         .and_then(|id| doc.get_node(id))
@@ -985,9 +986,10 @@ fn is_unspanned_multicol(doc: &BaseDocument, node: &blitz_dom::Node) -> bool {
 /// Whether the walk meets the boxes of `node` one by one, with class A
 /// opportunities between them (css-break-3 §4.1): it is neither atomic
 /// ([`is_atomic`]), nor a multicol container it does not enter, nor an
-/// inline root, whose breaks lie between its lines.
-fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_height_px: f32) -> bool {
-    !is_atomic(doc, node, page_height_px)
+/// inline root, whose breaks lie between its lines. `page_foot_px` as
+/// [`is_atomic`]'s.
+fn has_flow_children(doc: &BaseDocument, node: &blitz_dom::Node, page_foot_px: f32) -> bool {
+    !is_atomic(doc, node, page_foot_px)
         && !is_unspanned_multicol(doc, node)
         && (is_transformed(node)
             || node
@@ -1196,7 +1198,9 @@ fn compute_box_breaks(
 ) -> BoxBreaks {
     let props = break_props(flow, node);
     let (own_before, own_after) = (BreakValue::own_before(props), BreakValue::own_after(props));
-    if depth >= crate::MAX_DOM_DEPTH || !has_flow_children(flow.doc, node, page_height_px) {
+    if depth >= crate::MAX_DOM_DEPTH
+        || !has_flow_children(flow.doc, node, flow.page_foot(page_height_px))
+    {
         return BoxBreaks {
             before: own_before,
             after: own_after,
@@ -2020,7 +2024,7 @@ fn line_moves_on(
         }
         let lead = leading_extent(flow, row, room, page_height_px, 0);
         return if at_page_top {
-            lead.moves_on(page_height_px) && !lead.relaxes
+            lead.moves_on(flow.page_foot(page_height_px)) && !lead.relaxes
         } else {
             !lead.places
         };
@@ -2045,9 +2049,10 @@ fn line_moves_on(
                 BoxKind::Monolithic(Whole::Atomic)
             ) && !slices_at_a_page_top(item)
                 && offset + height > room
-                && fits(offset + height, page_height_px)
+                && flow.fits_page(offset + height, page_height_px)
         });
-    monolithic_overflow || (lead.moves_on(page_height_px) && !(at_page_top && lead.relaxes))
+    monolithic_overflow
+        || (lead.moves_on(flow.page_foot(page_height_px)) && !(at_page_top && lead.relaxes))
 }
 
 /// Ends the line `line` of a walk: each of its boxes stretched to the
@@ -2321,6 +2326,10 @@ struct PageCursor {
     page_has_content: bool,
     /// The height of the page strip the walk fills.
     page_height_px: f32,
+    /// The page's foot, below the strip's by the page-foot clearance
+    /// ([`Flow::page_foot`]): where the parent's fragment on a page a child
+    /// crossed ends, as a child taller than a page is sliced there.
+    page_foot_px: f32,
     parent: Option<ParentSink>,
 }
 
@@ -2336,6 +2345,7 @@ impl PageCursor {
             entered_below_content: false,
             page_has_content: false,
             page_height_px,
+            page_foot_px: page_height_px,
             parent: None,
         }
     }
@@ -2529,7 +2539,7 @@ impl PageCursor {
     fn parent_height(&self, height: ParentHeight) -> f32 {
         match height {
             ParentHeight::Placed => self.cursor_y - self.page_start_y,
-            ParentHeight::ToFoot => (self.page_height_px - self.page_start_y).max(0.0),
+            ParentHeight::ToFoot => (self.page_foot_px - self.page_start_y).max(0.0),
             ParentHeight::Measured(height) => height,
         }
     }
@@ -2614,7 +2624,7 @@ impl PageCursor {
         }
     }
 
-    /// Gives the parent a full-strip fragment on each page after this one
+    /// Gives the parent a full-page fragment on each page after this one
     /// and before `end_page`, which a child crossed, once per open row.
     fn fill_parent_pages(&mut self, geometry: &mut PaginationGeometryTable, end_page: u32) {
         for page_index in (self.page_index + 1)..end_page {
@@ -2624,7 +2634,7 @@ impl PageCursor {
                 .and_then(|parent| parent.row_pages.as_mut())
                 .is_none_or(|pages| pages.insert(page_index));
             if first {
-                self.push_parent(geometry, page_index, 0.0, self.page_height_px);
+                self.push_parent(geometry, page_index, 0.0, self.page_foot_px);
             }
         }
     }
@@ -2676,7 +2686,8 @@ fn kept_table_row_bottom(
             (layout.location.y, layout.location.y + layout.size.height)
         })
         .reduce(|(top, bottom), (y, end)| (top.min(y), bottom.max(end)))?;
-    fits(bottom - top, page_height_px).then_some(bottom)
+    flow.fits_page(bottom - top, page_height_px)
+        .then_some(bottom)
 }
 
 /// What a box is to the fragmenter: whether the walk places it whole,
@@ -2730,7 +2741,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
     // wrapped in an anonymous block, a flex or grid item blockified), and the
     // engine's style system computes every `writing-mode` as `horizontal-tb`,
     // so no test can build one.
-    if is_atomic(doc, node, page_height_px) {
+    if is_atomic(doc, node, flow.page_foot(page_height_px)) {
         return BoxKind::Monolithic(Whole::Atomic);
     }
     let avoid = !displays(node, DisplayInside::TableRow)
@@ -2740,7 +2751,7 @@ fn classify(flow: Flow<'_>, node: &blitz_dom::Node, page_height_px: f32) -> BoxK
                 Some(crate::draw_primitives::BreakInside::Avoid)
             )
         });
-    if (avoid && fits(extent(flow, node, 0), page_height_px))
+    if (avoid && flow.fits_page(extent(flow, node, 0), page_height_px))
         || kept_table_row_bottom(flow, node, page_height_px).is_some()
     {
         return BoxKind::Monolithic(Whole::Kept);
@@ -2884,10 +2895,11 @@ impl Leading {
 
     /// Whether the box this leads moves to the next page whole instead of
     /// starting here: nothing of it places in the room, and its unit fits
-    /// an empty page of `page_height_px`. A unit taller than a page has to
-    /// start somewhere, and moving it would leave a blank page behind.
-    fn moves_on(&self, page_height_px: f32) -> bool {
-        !self.places && fits(self.extent, page_height_px)
+    /// an empty page, `page_foot_px` tall ([`Flow::page_foot`]). A unit
+    /// taller than a page has to start somewhere, and moving it would leave
+    /// a blank page behind.
+    fn moves_on(&self, page_foot_px: f32) -> bool {
+        !self.places && fits(self.extent, page_foot_px)
     }
 }
 
@@ -2958,7 +2970,7 @@ fn leading_of(
         BoxKind::Monolithic(Whole::Atomic) => whole,
         BoxKind::InlineRoot { lines, .. } if lines.len() <= 1 => whole,
         BoxKind::InlineRoot { lines, limits } => {
-            let lead = inline_leading(lines, *limits, room);
+            let lead = inline_leading(lines, *limits, top_inset(node), room);
             Leading {
                 places: lead.places || height <= room,
                 relaxes: true,
@@ -3064,17 +3076,27 @@ fn tracks_leading(
 /// at a page foot, the first `orphans` when `widows` lines remain after
 /// them, else every line ([`split_point`], by which
 /// [`fragment_inline_root`] splits it, so the two cannot disagree). The
-/// lines are measured from the first; the root's own padding is outside
-/// them, as the split places them.
-fn inline_leading(lines: &[(f32, f32)], limits: LineLimits, room: f32) -> Leading {
+/// lines are measured from the first, below the root's top border and
+/// padding, `inset` ([`top_inset`]), which each of its fragments paints
+/// above its lines.
+fn inline_leading(lines: &[(f32, f32)], limits: LineLimits, inset: f32, room: f32) -> Leading {
     let Some(&(first_top, _)) = lines.first() else {
         return Leading::whole(0.0, room);
     };
     let unit_lines = (1..lines.len())
         .find(|&fit| split_point(fit, 0, lines.len(), limits).is_some())
         .unwrap_or(lines.len());
-    let extent = lines[unit_lines - 1].1 - first_top;
+    let extent = inset + lines[unit_lines - 1].1 - first_top;
     Leading::whole(extent, room)
+}
+
+/// The top border and padding of `node`, above its content: the renderer
+/// paints an inline root's lines that far below the top of each of its
+/// fragments, while its line boxes are measured from its content's top
+/// ([`collect_inline_line_metrics`]).
+fn top_inset(node: &blitz_dom::Node) -> f32 {
+    let layout = node.final_layout;
+    layout.border.top + layout.padding.top
 }
 
 /// The leading unit of `table` ([`leading_extent`]): its top edge and its
@@ -3477,6 +3499,14 @@ impl Flow<'_> {
     fn page_foot(&self, page_height_px: f32) -> f32 {
         page_height_px + self.foot_clearance
     }
+
+    /// Whether `extent` px fit a whole page whose strip is `page_height_px`
+    /// tall ([`fits`] to its foot): what a box needs to move to the next page
+    /// whole, where it stands at the top and may end in the page-foot
+    /// clearance, rather than split as a box taller than a page.
+    fn fits_page(&self, extent: f32, page_height_px: f32) -> bool {
+        fits(extent, self.page_foot(page_height_px))
+    }
 }
 
 /// What a pass computes once and its walks read: the breaks of its boxes
@@ -3836,7 +3866,8 @@ fn widows_row(
         .map(|cell| cell.final_layout.location.y)
         .fold(f32::INFINITY, f32::min);
     let bottom = line_bottom(&boxes(lines.last()?));
-    fits(bottom - top, page_height_px - band).then(|| cells[lines[from][0]])
+    flow.fits_page(bottom - top, page_height_px - band)
+        .then(|| cells[lines[from][0]])
 }
 
 /// [`fragment_block_subtree`] of a box whose rows need no second walk.
@@ -4524,6 +4555,7 @@ fn fragment_block_subtree_inner(
         entered_below_content,
         page_has_content: *page_has_content,
         page_height_px,
+        page_foot_px: flow.page_foot(page_height_px),
         // The root's one fragment is recorded before its walk.
         parent: (!root).then_some(ParentSink {
             id: parent_id,
@@ -4869,7 +4901,7 @@ fn fragment_block_subtree_inner(
                 && after_content
                 && !cursor.at_page_top()
                 && line_y + height + kept > page_height_px
-                && fits(height + kept, page_height_px);
+                && flow.fits_page(height + kept, page_height_px);
             if run_moves
                 || line_moves_on(
                     flow,
@@ -4976,15 +5008,16 @@ fn fragment_block_subtree_inner(
                     // after it, not those between its lines
                     // ([`fragment_inline_root`]).
                     BoxKind::InlineRoot { lines, limits } if lines.len() > 1 => {
-                        let below = (child_h - lines[lines.len() - 1].1).max(0.0) + kept;
+                        let below =
+                            (child_h - top_inset(child) - lines[lines.len() - 1].1).max(0.0) + kept;
                         let first = lines.len().saturating_sub(limits.widows.max(1));
                         let trailing = lines[lines.len() - 1].1 - lines[first].0;
-                        if fits(trailing + below, page_height_px) {
+                        if flow.fits_page(trailing + below, page_height_px) {
                             inline_kept_after = below;
                         }
                     }
                     BoxKind::Monolithic(_) | BoxKind::InlineRoot { .. } => {
-                        if !cursor.at_page_top() && fits(run, page_height_px) {
+                        if !cursor.at_page_top() && flow.fits_page(run, page_height_px) {
                             child_page_y = move_on(
                                 &mut cursor,
                                 geometry,
@@ -5040,7 +5073,13 @@ fn fragment_block_subtree_inner(
             if !in_line
                 && cursor.holds_placed()
                 && !cursor.at_page_top()
-                && !inline_leading(line_metrics, limits, page_height_px - child_page_y).places
+                && !inline_leading(
+                    line_metrics,
+                    limits,
+                    top_inset(child),
+                    page_height_px - child_page_y,
+                )
+                .places
             {
                 // The parent's fragment ends at the content placed on the
                 // page (plain block flow, e.g. a `break-inside:avoid` block
@@ -5049,7 +5088,7 @@ fn fragment_block_subtree_inner(
                 // whatever comes after it onto a spurious extra page
                 // (confirmed regression in examples/break-inside via PR
                 // #741). The paragraph's leading lines start the next page.
-                let lead = inline_leading(line_metrics, limits, page_height_px);
+                let lead = inline_leading(line_metrics, limits, top_inset(child), page_height_px);
                 let unit = lead.extent + line_metrics.first().map_or(0.0, |line| line.0);
                 child_page_y =
                     move_on(&mut cursor, geometry, flow, child, this_top_in_parent, unit);
@@ -5071,6 +5110,7 @@ fn fragment_block_subtree_inner(
                 &mut paragraph,
                 line_metrics,
                 limits,
+                top_inset(child),
                 inline_kept_after,
             );
             let (new_page_index, new_cursor_y) = (paragraph.page_index, paragraph.cursor_y);
@@ -5116,13 +5156,14 @@ fn fragment_block_subtree_inner(
         // At the top of a page, below a top edge, a box kept whole that does
         // not fit the room left is entered: `avoid` is relaxed (css-break-3
         // §4.4), and the box splits between its children, rather than move
-        // and leave the edge alone on the page.
+        // and leave the edge alone on the page. No break point precedes it,
+        // so the room reaches the page foot, below the page-foot clearance.
         let relaxes_kept = cursor.at_page_top()
             && matches!(kind, BoxKind::Monolithic(Whole::Kept))
             && !child.children.is_empty()
             && overflows(
                 child_page_y + extent(flow, child, depth + 1),
-                page_height_px,
+                flow.page_foot(page_height_px),
             );
         let needs_recursion = enter_for_kept_run
             || relaxes_kept
@@ -5144,7 +5185,9 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 depth + 1,
             );
-            if lead.moves_on(page_height_px) && !(cursor.at_page_top() && lead.relaxes) {
+            if lead.moves_on(flow.page_foot(page_height_px))
+                && !(cursor.at_page_top() && lead.relaxes)
+            {
                 child_page_y = move_on(
                     &mut cursor,
                     geometry,
@@ -5320,7 +5363,7 @@ fn fragment_block_subtree_inner(
         if !in_line
             && !slices_at_top
             && cursor.break_point_before(child_page_y)
-            && (!cursor.at_page_top() || fits(child_h, page_height_px))
+            && (!cursor.at_page_top() || flow.fits_page(child_h, page_height_px))
             && child_page_y + child_h > page_height_px
         {
             // Forced to a fresh page: the current child lands at its top,
@@ -5734,6 +5777,10 @@ fn split_point(fit: usize, start: usize, total: usize, limits: LineLimits) -> Op
 ///   ending on a partial page leave room for a following sibling).
 /// - `line_boundaries` records the first line of each fragment and ends
 ///   with the total line count.
+///
+/// The renderer paints each fragment's lines `inset` below its top, below
+/// the root's top border and padding ([`top_inset`]), so a line fits where
+/// it ends on the page that much lower.
 #[allow(clippy::too_many_arguments)]
 fn fragment_inline_root(
     geometry: &mut PaginationGeometryTable,
@@ -5743,6 +5790,7 @@ fn fragment_inline_root(
     cursor: &mut PageCursor,
     line_metrics: &[(f32, f32)],
     limits: LineLimits,
+    inset: f32,
     kept_after: f32,
 ) -> usize {
     if line_metrics.is_empty() {
@@ -5758,7 +5806,8 @@ fn fragment_inline_root(
     let mut i = 0usize;
     while i < total_lines {
         let frag_top_local = line_metrics[fragment_start_idx].0;
-        let projected_bottom_in_body = cursor.cursor_y + (line_metrics[i].1 - frag_top_local);
+        let projected_bottom_in_body =
+            cursor.cursor_y + inset + (line_metrics[i].1 - frag_top_local);
 
         // codex P1: also refuse to break once the next fragment would land
         // on `MAX_PAGES` — the same bound the oversized-block re-slice loop
@@ -7856,6 +7905,7 @@ mod tests {
             &mut cursor,
             lines,
             limits,
+            0.0,
             0.0,
         );
         (cursor.page_index, cursor.cursor_y, emitted)
@@ -13725,6 +13775,97 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
+    /// The `(page, y, height)` of each fragment of the element `id` of
+    /// `body` on 100px pages, under `root`'s style.
+    fn foot_fragments(root: &str, body: &str, id: &str) -> Vec<(u32, f32, f32)> {
+        let html = format!(
+            r#"<html style="{root}"><body style="margin: 0; padding: 0; line-height: 20px">{body}</body></html>"#
+        );
+        let mut doc = parse(&html, 600.0);
+        let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        let node_id = find_by_id(&doc, id).unwrap();
+        geom.get(&node_id).map_or_else(Vec::new, |g| {
+            g.fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32(), f.height.to_f32()))
+                .collect()
+        })
+    }
+
+    /// A box that fits the page but not the room above the page-foot
+    /// clearance (90px: 16px off a 100px page leaves 84) still fits a page:
+    /// after content it moves whole to the next page and ends there in the
+    /// clearance, as at any page top, instead of splitting as a box taller
+    /// than a page would: a box kept whole by `break-inside: avoid`, a table
+    /// row kept whole, a transformed box, and a block whose leading unit,
+    /// its first child, is that tall (its 5px second child goes on to the
+    /// page after, leaving no empty fragment of the block behind).
+    #[test]
+    fn a_box_only_taller_than_the_room_above_the_clearance_moves_whole() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let halves = r#"<div style="height: 45px"></div><div style="height: 45px"></div>"#;
+        let moved = vec![(1, 0.0)];
+        let cases = [
+            (
+                "kept whole",
+                format!(
+                    r#"<div style="height: 20px"></div><div id="b" style="break-inside: avoid">{halves}</div>"#
+                ),
+            ),
+            (
+                "a kept row",
+                format!(
+                    r#"<div style="height: 20px"></div><table style="border-spacing: 0"><tr style="break-inside: avoid"><td id="b" style="padding: 0">{halves}</td></tr></table>"#
+                ),
+            ),
+            (
+                "transformed",
+                format!(
+                    r#"<div style="height: 20px"></div><div id="b" style="transform: translateX(1px)">{halves}</div>"#
+                ),
+            ),
+            (
+                "a leading unit",
+                r#"<div style="height: 20px"></div><div id="b"><div style="height: 90px"></div><div style="height: 5px"></div></div>"#
+                    .to_string(),
+            ),
+        ];
+        let placed = |body: &str| -> Vec<(u32, f32)> {
+            foot_fragments(clearance, body, "b")
+                .iter()
+                .map(|&(page, y, _)| (page, y))
+                .collect()
+        };
+        assert_eq!(
+            cases.map(|(case, body)| (case, placed(&body))),
+            [
+                ("kept whole", moved.clone()),
+                ("a kept row", moved.clone()),
+                ("transformed", moved),
+                ("a leading unit", vec![(1, 0.0), (2, 0.0)]),
+            ]
+        );
+    }
+
+    /// A parent's fragment on a page that its child crossed reaches the page
+    /// foot, below the page-foot clearance, where the child's slice ends: a
+    /// 250px box in a section is cut at 100 on each page, and so is the
+    /// section.
+    #[test]
+    fn a_parent_reaches_the_page_foot_where_its_child_is_sliced() {
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let body = r#"<section id="s"><div id="t" style="height: 250px"></div></section>"#;
+        let ends = |id: &str| -> Vec<f32> {
+            foot_fragments(clearance, body, id)
+                .iter()
+                .map(|&(_, y, height)| y + height)
+                .collect()
+        };
+        assert_eq!(ends("t"), [100.0, 100.0, 50.0], "the slices");
+        assert_eq!(ends("s"), ends("t"), "the section");
+    }
+
     /// Under `-fulgur-page-foot-margin: page`, a paragraph's margin box ends
     /// by the page foot, its bottom margin taking the page-foot clearance
     /// in: with 16px on a 100px page, a 32px margin lets the paragraph end
@@ -13785,6 +13926,46 @@ h2 { string-set: chapter-title content(text); }
         assert_eq!(pages(&list(33, 2, foot)), 1, "the second item, at 73");
         assert_eq!(pages(&list(32, 2, foot)), 0, "the second item, at 72");
         assert_eq!(pages(&list(64, 1, "")), 0, "not counted");
+    }
+
+    /// The lines of a box that holds its text directly, a table cell here,
+    /// are painted below its top padding on each of its fragments, so they
+    /// fit a page only with that padding: three 20px lines in a cell with
+    /// 6px of padding, starting at 20, end at 46, 66, and 86, and the third
+    /// goes to the next page under a 16px page-foot clearance on a 100px
+    /// page, as the lines of a paragraph in a cell do; at 36 with no
+    /// clearance, the third would end at 102, past the page foot.
+    #[test]
+    fn a_cells_own_lines_fit_the_page_below_its_top_padding() {
+        let lines_on_first_page = |root: &str, filler: u32, cell: &str| {
+            let html = format!(
+                r#"<html style="{root}"><body style="margin: 0; padding: 0; line-height: 20px"><div style="height: {filler}px"></div><table style="border-spacing: 0"><tr>{cell}</tr></table></body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            let id = find_by_id(&doc, "c").unwrap();
+            geom[&id].line_boundaries.get(1).copied()
+        };
+        let clearance = "-fulgur-page-foot-clearance: 16px";
+        let own = r#"<td id="c" style="padding: 6px 0; orphans: 1; widows: 1">a<br>b<br>c</td>"#;
+        let paragraph = r#"<td style="padding: 6px 0"><p id="c" style="margin: 0; orphans: 1; widows: 1">a<br>b<br>c</p></td>"#;
+        assert_eq!(
+            lines_on_first_page(clearance, 20, paragraph),
+            Some(2),
+            "the paragraph's control"
+        );
+        assert_eq!(
+            lines_on_first_page(clearance, 20, own),
+            Some(2),
+            "own lines"
+        );
+        assert_eq!(
+            lines_on_first_page("", 36, own),
+            Some(2),
+            "at the page foot"
+        );
     }
 
     /// A forced break is taken only where content precedes it on the page
@@ -16485,7 +16666,7 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 20.0, (i + 1) as f32 * 20.0))
             .collect();
         let lead = |orphans, widows, room| {
-            super::inline_leading(&lines, super::LineLimits { orphans, widows }, room)
+            super::inline_leading(&lines, super::LineLimits { orphans, widows }, 0.0, room)
         };
         assert!(lead(1, 1, 110.0).places, "5 + 1");
         assert!(lead(2, 2, 110.0).places, "4 + 2");

@@ -7,7 +7,7 @@
 8 EndsWithLine b3 2  # edge model: a bottom margin crossing the page foot runs on to the next page as empty item fragments, not truncated at the break
 8 EndsWithLine b5 2  # edge model: a bottom margin crossing the page foot runs on to the next page as empty item fragments, not truncated at the break
 10 HeaderAlone b0 0  # table walker: a first row that places nothing in a captioned table does not move its table to the next page
-10 PlacedOnce b5 1 -21px  # line measure: the cell holds its paragraph's lines alone, without the paragraph's padding and border, which run past the foot
+10 PlacedOnce b5 1 -15px  # line measure: the cell holds its paragraph's top edge and lines, without the paragraph's bottom padding and border, which run past the foot
 14 PastFoot b6 4  # edge model: a parent's fragment keeps the top margin of the child that moves to the next page, past the foot
 15 PastFoot b5 1  # edge model: a parent's fragment keeps its last child's bottom margin at the break, past the foot
 23 Encloses b16 6  # rows side by side: a split line's items run on to the page foot below their container's fragment, which ends at their content
@@ -17,7 +17,6 @@
 34 EndsWithLine b27 5  # rows side by side: an item beside one lifted by a skip-first header row keeps the line's laid-out height, the lift past its line's end
 51 EndsWithLine b6 1  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
 51 EndsWithLine b8 1  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
-64 PastFoot b0 0  # line measure: a paragraph is placed whole by its lines while its bottom padding runs past the foot
 71 EndsWithLine b13 5  # edge model: a margin kept past the foot on the page before leaves the line's rest on the next page longer than its content
 71 EndsWithLine b19 5  # edge model: a margin kept past the foot on the page before leaves the line's rest on the next page longer than its content
 71 PastFoot b14 4  # edge model: a parent's fragment keeps its last child's bottom margin at the break, past the foot
@@ -26,8 +25,6 @@
 89 Encloses b11 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
 89 Encloses b7 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
 89 Encloses b9 0  # table walker: a split row's cells run on to the page foot below their table's fragment, which ends at their content
-91 EndsWithLine b3 2  # line measure: a paragraph whose top edge its line measure leaves out runs past the foot, and its line's rest follows on the next page
-91 EndsWithLine b5 2  # line measure: a paragraph whose top edge its line measure leaves out runs past the foot, and its line's rest follows on the next page
 95 EndsWithLine b18 11  # rows side by side: content moved whole to the next page leaves its item's fragment, empty, stretched to the foot
 95 PlacedOnce b10 3 -4px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 100 PlacedOnce b9 0 -9px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding, border, and margin
@@ -54,7 +51,7 @@
 194 PlacedOnce b28 1 -6px  # line measure: the cell ends at its paragraph's lines, without the paragraph's padding and border
 205 EndsWithLine b10 2  # side break: a forced side break in an item leaves the line's items empty fragments on the blank page
 207 PlacedOnce b19 9 -7px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
-217 PlacedOnce b22 9 -16px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
+217 PlacedOnce b22 9 -7px  # edge model: the cell ends at the page foot, its bottom padding and its child's bottom margin left on no page
 235 PlacedOnce b10 2 -2px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 236 PlacedOnce b10 4 -3px  # line measure: the cell ends at its paragraph's lines, without the paragraph's bottom padding and border
 244 PlacedOnce b17 2 -7px  # edge model: the cell ends without its last child's bottom margin
