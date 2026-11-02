@@ -1562,25 +1562,43 @@ fn adjoining_top_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) ->
 /// forced break only, `keep` after any break, `discard` after none.
 fn keeps_margin(flow: Flow<'_>, node: &blitz_dom::Node, forced: bool) -> bool {
     use crate::column_css::MarginBreak;
-    match break_props(flow, node).and_then(|props| props.margin_break) {
+    // The box's own, not its break values' box ([`break_props`]): a table's
+    // margin is the table's, inside the box around it and its caption.
+    let own = flow.column_styles.and_then(|styles| styles.get(&node.id));
+    match own.and_then(|props| props.margin_break) {
         None | Some(MarginBreak::Auto) => forced,
         Some(MarginBreak::Keep) => true,
         Some(MarginBreak::Discard) => false,
     }
 }
 
+/// The part of a top `margin` that an unforced break keeps above a unit
+/// `unit` px tall, which moves to the top of the next page to start it
+/// whole: as much as still leaves the unit its page, so a box that fits a
+/// page never runs past its foot for its margin.
+fn kept_margin(margin: f32, unit: f32, page_height_px: f32) -> f32 {
+    margin.max(0.0).min((page_height_px - unit).max(0.0))
+}
+
 /// Moves `child`, whose top in its parent's layout is `top`, to the top of
 /// the next page at an unforced break ([`PageCursor::move_before`]), and
 /// returns its y there: below the top margin a break keeps
-/// ([`adjoining_top_margin`]), zero unless its `margin-break` is `keep`.
+/// ([`adjoining_top_margin`], zero unless a `margin-break` is `keep`), as
+/// far as the leading `unit` of the child still fits below it
+/// ([`kept_margin`]).
 fn move_on(
     cursor: &mut PageCursor,
     geometry: &mut PaginationGeometryTable,
     flow: Flow<'_>,
     child: &blitz_dom::Node,
     top: f32,
+    unit: f32,
 ) -> f32 {
-    let margin = adjoining_top_margin(flow, child, false).max(0.0);
+    let margin = kept_margin(
+        adjoining_top_margin(flow, child, false),
+        unit,
+        cursor.page_height_px,
+    );
     cursor.move_before(geometry, top - margin, false);
     margin
 }
@@ -4541,8 +4559,19 @@ fn fragment_block_subtree_inner(
                 // A table's first row leaves nothing of the table behind.
                 let leaves_nothing =
                     displays(parent, DisplayInside::Table) && !cursor.holds_placed();
-                cursor.move_before(geometry, top, leaves_nothing);
-                child_page_y = this_top_in_parent - top;
+                // The line keeps the highest top margin its boxes keep above
+                // it, as far as the line still fits its page ([`kept_margin`]).
+                let above = items
+                    .iter()
+                    .map(|item| {
+                        adjoining_top_margin(flow, item, false)
+                            - (item.final_layout.location.y - top)
+                    })
+                    .fold(0.0, f32::max);
+                let unit = height + if run_moves { kept } else { 0.0 };
+                let margin = kept_margin(above, unit, page_height_px);
+                cursor.move_before(geometry, top - margin, leaves_nothing);
+                child_page_y = this_top_in_parent - top + margin;
             }
             line = Some(LineState {
                 number,
@@ -4630,8 +4659,14 @@ fn fragment_block_subtree_inner(
                     }
                     BoxKind::Monolithic(_) | BoxKind::InlineRoot { .. } => {
                         if !cursor.at_page_top() && fits(run, page_height_px) {
-                            child_page_y =
-                                move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
+                            child_page_y = move_on(
+                                &mut cursor,
+                                geometry,
+                                flow,
+                                child,
+                                this_top_in_parent,
+                                run,
+                            );
                         }
                     }
                 }
@@ -4687,8 +4722,11 @@ fn fragment_block_subtree_inner(
                 // the parent's background far past its content and pushes
                 // whatever comes after it onto a spurious extra page
                 // (confirmed regression in examples/break-inside via PR
-                // #741).
-                child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
+                // #741). The paragraph's leading lines start the next page.
+                let lead = inline_leading(line_metrics, limits, page_height_px);
+                let unit = lead.extent + line_metrics.first().map_or(0.0, |line| line.0);
+                child_page_y =
+                    move_on(&mut cursor, geometry, flow, child, this_top_in_parent, unit);
             }
             // codex P1: start from `child_page_y` (this child's own
             // rebased page-local y), not the parent's running
@@ -4781,7 +4819,14 @@ fn fragment_block_subtree_inner(
                 depth + 1,
             );
             if lead.moves_on(page_height_px) && !(cursor.at_page_top() && lead.relaxes) {
-                child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
+                child_page_y = move_on(
+                    &mut cursor,
+                    geometry,
+                    flow,
+                    child,
+                    this_top_in_parent,
+                    lead.extent,
+                );
             }
         }
         if needs_recursion {
@@ -4952,7 +4997,14 @@ fn fragment_block_subtree_inner(
         {
             // Forced to a fresh page: the current child lands at its top,
             // and sequential siblings continue from this point.
-            child_page_y = move_on(&mut cursor, geometry, flow, child, this_top_in_parent);
+            child_page_y = move_on(
+                &mut cursor,
+                geometry,
+                flow,
+                child,
+                this_top_in_parent,
+                child_h,
+            );
         }
         cursor.entered_below_content = false;
 
@@ -12993,6 +13045,96 @@ h2 { string-set: chapter-title content(text); }
             let kept = kept * 1.5;
             assert_eq!(page_y(&collapsed, "s"), [(1, kept)], "section, {value}");
             assert_eq!(page_y(&collapsed, "h"), [(1, kept)], "its child, {value}");
+        }
+    }
+
+    /// `margin-break` is each box's own, where margins collapse at a break:
+    /// a section that keeps its 5px under a heading that does not keeps 5px,
+    /// and a heading that keeps its 15px under a section that does not keeps
+    /// 15px; a table below its bottom caption keeps its own, though the walk
+    /// reads the table's break values on the box around it and its caption.
+    #[test]
+    fn margin_break_is_each_collapsed_boxs_own() {
+        let page_y = |body: &str, id: &str| {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0; line-height: 20px">{body}</body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            placements(&doc, &geom, id)
+        };
+        let nested = |section: &str, heading: &str| {
+            page_y(
+                &format!(
+                    r#"<div style="height: 70px"></div><section id="s" style="margin-top: 5px; margin-break: {section}"><div style="height: 40px; margin-top: 15px; margin-break: {heading}"></div></section>"#
+                ),
+                "s",
+            )
+        };
+        assert_eq!(
+            nested("keep", "auto"),
+            [(1, 5.0)],
+            "the section keeps its own"
+        );
+        assert_eq!(
+            nested("auto", "keep"),
+            [(1, 15.0)],
+            "the heading keeps its own"
+        );
+        for (value, kept) in [("auto", 0.0), ("keep", 10.0)] {
+            use crate::blitz_adapter::DomPass as _;
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0; line-height: 20px"><div style="height: 70px"></div><table id="t" style="margin-top: 10px; margin-break: {value}; caption-side: bottom; border-spacing: 0"><caption>c</caption><tr><td style="height: 30px; padding: 0"></td></tr></table></body></html>"#
+            );
+            let mut doc = blitz_adapter::parse(&html, 600.0, &[]);
+            blitz_adapter::CaptionRestructurePass
+                .apply(&mut doc, &blitz_adapter::PassContext { font_data: &[] });
+            blitz_adapter::resolve(&mut doc);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+            assert_eq!(
+                placements(&doc, &geom, "t"),
+                [(1, kept)],
+                "a table above its caption, {value}"
+            );
+        }
+    }
+
+    /// A margin a break keeps is kept as far as the box after it still fits a
+    /// page below it: a box kept whole 95px tall keeps 5px of its 10px, not
+    /// running past the foot; one that fits with its margin keeps it whole.
+    #[test]
+    fn a_kept_margin_leaves_the_box_after_the_break_its_page() {
+        let page_y = |height: u32| {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0"><div style="height: 50px"></div><div id="b" style="height: {height}px; margin-top: 10px; margin-break: keep; break-inside: avoid"></div></body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            placements(&doc, &geom, "b")
+        };
+        assert_eq!(page_y(95), [(1, 5.0)], "5px short of a page");
+        assert_eq!(page_y(80), [(1, 10.0)], "room for the margin");
+    }
+
+    /// A line of a flex container that moves to the next page keeps the top
+    /// margin of an item that keeps its own, as a block keeps it.
+    #[test]
+    fn a_flex_line_that_moves_keeps_its_items_kept_margin() {
+        for (value, kept) in [("auto", 0.0), ("keep", 10.0)] {
+            let html = format!(
+                r#"<html><body style="margin: 0; padding: 0"><div style="display: flex; flex-wrap: wrap"><div style="width: 100%; height: 60px"></div><div id="i" style="width: 100%; height: 40px; margin-top: 10px; margin-break: {value}"></div></div></body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let table = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let geom =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+            assert_eq!(placements(&doc, &geom, "i"), [(1, kept)], "{value}");
         }
     }
 
